@@ -26,7 +26,16 @@ secrets*.json
 # Runtime state and artifacts
 var/
 logs/
+handoffs/
+evidence/
+artifacts/
 *.log
+*.jsonl
+review_result.json
+*_request.json
+*_request.md
+*_response.json
+*_response.md
 *.db
 *.db-*
 *.db-shm
