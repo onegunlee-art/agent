@@ -73,9 +73,11 @@ class Review:
     id: str
     work_order_id: str
     status: str
+    binding_status: str
     json_path: Path
     markdown_path: Path
     request_hash: str
+    request_markdown_sha256: str | None
 
 
 @dataclass(frozen=True)

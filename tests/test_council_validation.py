@@ -54,9 +54,7 @@ def test_council_conflict_creates_inbox_without_majority_fact(tmp_path: Path) ->
             payload = fake.response(idea)
             if fake.role == "cmo":
                 payload = deepcopy(payload)
-                payload["contract_contribution"]["do_nothing_option"] = (
-                    "A conflicting deterministic alternative."
-                )
+                payload["contract_contribution"]["decision_level"] = "FP_FULL"
             response = tmp_path / f"{fake.role}.json"
             atomic_write_json(response, payload)
             company.ingest_council_response(

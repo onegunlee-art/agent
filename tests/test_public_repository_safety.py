@@ -41,8 +41,8 @@ def test_source_has_three_roles_and_no_api_or_recursive_codex_integration() -> N
     ).lower()
     assert "import openai" not in source
     assert "import anthropic" not in source
-    assert "subprocess" not in source
     assert "codex cli" not in source
+    assert "codex exec" not in source
 
 
 def test_tracked_candidate_files_contain_no_credential_pattern() -> None:

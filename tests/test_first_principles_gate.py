@@ -7,6 +7,14 @@ import pytest
 from company_os.first_principles import FirstPrinciplesGate
 
 
+TRUSTED_EVIDENCE_REFS = frozenset({"source-evidence-1"})
+
+
+def validate_contract(contract: dict, **kwargs):
+    kwargs.setdefault("trusted_evidence_refs", TRUSTED_EVIDENCE_REFS)
+    return FirstPrinciplesGate().validate(contract, **kwargs)
+
+
 def valid_standard_contract() -> dict:
     return {
         "decision_level": "FP_STANDARD",
@@ -137,8 +145,8 @@ def valid_lite_contract() -> dict:
     }
 
 
-def violation_codes(contract: dict) -> set[str]:
-    return {item.code for item in FirstPrinciplesGate().validate(contract).violations}
+def violation_codes(contract: dict, **kwargs) -> set[str]:
+    return {item.code for item in validate_contract(contract, **kwargs).violations}
 
 
 @pytest.mark.parametrize(
@@ -203,7 +211,7 @@ def test_gate_rejects_invalid_standard_contract(mutate, expected_code: str) -> N
     contract = deepcopy(valid_standard_contract())
     mutate(contract)
 
-    result = FirstPrinciplesGate().validate(contract)
+    result = validate_contract(contract)
 
     assert result.passed is False
     assert expected_code in {item.code for item in result.violations}
@@ -301,7 +309,7 @@ def test_gate_rejects_governance_check_missing_required_field(
     contract = valid_standard_contract()
     contract[section].pop(required_field)
 
-    result = FirstPrinciplesGate().validate(contract)
+    result = validate_contract(contract)
 
     assert result.passed is False
     assert expected_code in {item.code for item in result.violations}
@@ -323,7 +331,7 @@ def test_gate_rejects_missing_governance_check(
     contract = valid_standard_contract()
     contract.pop(section)
 
-    result = FirstPrinciplesGate().validate(contract)
+    result = validate_contract(contract)
 
     assert result.passed is False
     assert expected_code in {item.code for item in result.violations}
@@ -335,7 +343,7 @@ def test_gate_rejects_decision_basis_without_claim_id(decision_level: str) -> No
     contract["decision_level"] = decision_level
     contract["decision_basis"] = [{"type": "FACT"}]
 
-    result = FirstPrinciplesGate().validate(contract)
+    result = validate_contract(contract)
 
     assert result.passed is False
     assert "DECISION_BASIS_CLAIM_ID_REQUIRED" in {
@@ -349,7 +357,7 @@ def test_gate_rejects_decision_basis_referencing_removed_claim() -> None:
         claim for claim in contract["claims"] if claim["id"] != "fact-1"
     ]
 
-    result = FirstPrinciplesGate().validate(contract)
+    result = validate_contract(contract)
 
     assert result.passed is False
     assert "DECISION_BASIS_CLAIM_NOT_FOUND" in {
@@ -361,7 +369,7 @@ def test_gate_rejects_decision_basis_with_wrong_claim_classification() -> None:
     contract = valid_standard_contract()
     contract["decision_basis"][0]["type"] = "ASSUMPTION"
 
-    result = FirstPrinciplesGate().validate(contract)
+    result = validate_contract(contract)
 
     assert result.passed is False
     assert "DECISION_BASIS_CLASSIFICATION_CONFLICT" in {
@@ -373,7 +381,7 @@ def test_gate_rejects_fact_basis_when_source_evidence_is_removed() -> None:
     contract = valid_standard_contract()
     contract["claims"][0]["evidence_refs"] = []
 
-    result = FirstPrinciplesGate().validate(contract)
+    result = validate_contract(contract)
 
     assert result.passed is False
     codes = {item.code for item in result.violations}
@@ -406,7 +414,7 @@ def test_gate_rejects_fact_supported_only_by_non_evidence_source_types(
     contract = valid_standard_contract()
     contract["claims"][0]["source_types"] = source_types
 
-    result = FirstPrinciplesGate().validate(contract)
+    result = validate_contract(contract)
 
     assert result.passed is False
     codes = {item.code for item in result.violations}
@@ -414,21 +422,23 @@ def test_gate_rejects_fact_supported_only_by_non_evidence_source_types(
     assert "DECISION_BASIS_FACT_WITHOUT_EVIDENCE" in codes
 
 
-def test_gate_accepts_fact_with_traceable_source_alongside_model_opinion() -> None:
+def test_gate_rejects_fact_with_mixed_trusted_and_untrusted_source_types() -> None:
     contract = valid_standard_contract()
     contract["claims"][0]["source_types"] = [
         "MODEL_OPINION",
         "SYNTHETIC_FIXTURE",
     ]
 
-    result = FirstPrinciplesGate().validate(contract)
+    result = validate_contract(contract)
 
-    assert result.passed is True
-    assert result.violations == ()
+    assert result.passed is False
+    assert "FACT_SOURCE_NOT_EVIDENCE" in {
+        item.code for item in result.violations
+    }
 
 
 def test_gate_accepts_complete_lite_contract() -> None:
-    result = FirstPrinciplesGate().validate(valid_lite_contract())
+    result = validate_contract(valid_lite_contract())
 
     assert result.passed is True
     assert result.violations == ()
@@ -450,7 +460,7 @@ def test_gate_rejects_lite_contract_missing_governance_section(
     contract = valid_lite_contract()
     contract.pop(section)
 
-    result = FirstPrinciplesGate().validate(contract)
+    result = validate_contract(contract)
 
     assert result.passed is False
     assert expected_code in {item.code for item in result.violations}
@@ -532,14 +542,110 @@ def test_gate_rejects_lite_governance_check_missing_required_field(
     contract = valid_lite_contract()
     contract[section].pop(required_field)
 
-    result = FirstPrinciplesGate().validate(contract)
+    result = validate_contract(contract)
 
     assert result.passed is False
     assert expected_code in {item.code for item in result.violations}
 
 
 def test_gate_accepts_complete_standard_contract() -> None:
-    result = FirstPrinciplesGate().validate(valid_standard_contract())
+    result = validate_contract(valid_standard_contract())
+
+    assert result.passed is True
+    assert result.violations == ()
+
+
+@pytest.mark.parametrize(
+    "source_type",
+    [
+        "SYNTHETIC_FIXTURE",
+        "PRIMARY_SOURCE",
+        "OFFICIAL_RECORD",
+        "MEASURED_OBSERVATION",
+        "VERIFIED_ARTIFACT",
+        "USER_SUPPLIED_DOCUMENT",
+    ],
+)
+def test_gate_accepts_allowlisted_fact_source_type(source_type: str) -> None:
+    contract = valid_standard_contract()
+    contract["claims"][0]["source_types"] = [source_type]
+
+    result = validate_contract(contract)
+
+    assert result.passed is True
+    assert result.violations == ()
+
+
+def test_gate_rejects_arbitrary_fact_source_type() -> None:
+    contract = valid_standard_contract()
+    contract["claims"][0]["source_types"] = ["ARBITRARY_MODEL_LABEL"]
+
+    result = validate_contract(contract)
+
+    assert result.passed is False
+    assert "FACT_SOURCE_NOT_EVIDENCE" in {
+        item.code for item in result.violations
+    }
+
+
+def test_gate_rejects_fact_with_nonexistent_evidence_reference() -> None:
+    contract = valid_standard_contract()
+    contract["claims"][0]["evidence_refs"] = ["evidence-that-does-not-exist"]
+
+    result = validate_contract(contract)
+
+    assert result.passed is False
+    codes = {item.code for item in result.violations}
+    assert "FACT_EVIDENCE_NOT_TRUSTED" in codes
+    assert "DECISION_BASIS_FACT_WITHOUT_EVIDENCE" in codes
+
+
+def test_gate_rejects_lite_contract_below_external_minimum_level() -> None:
+    result = validate_contract(
+        valid_lite_contract(),
+        min_decision_level="FP_FULL",
+    )
+
+    assert result.passed is False
+    assert "DECISION_LEVEL_BELOW_MINIMUM" in {
+        item.code for item in result.violations
+    }
+
+
+def test_gate_ignores_self_declared_ceo_approval_without_external_authority() -> None:
+    contract = valid_standard_contract()
+    contract.update(
+        decision_level="FP_FULL",
+        rights_and_authority_basis="Synthetic fixture owned by this test.",
+        worst_realistic_loss="Loss of a disposable temporary file.",
+        reversibility_assessment="Fully reversible.",
+        specialist_review_status="NOT_REQUIRED_FOR_SYNTHETIC_FIXTURE",
+        evidence_pack=["source-evidence-1"],
+        explicit_ceo_approval=True,
+        ceo_approval={"status": "APPROVED", "approved_by": "CEO"},
+    )
+
+    result = validate_contract(contract, ceo_approved=False)
+
+    assert result.passed is False
+    assert "FP_FULL_CEO_APPROVAL_REQUIRED" in {
+        item.code for item in result.violations
+    }
+
+
+def test_gate_accepts_complete_full_contract_with_external_ceo_approval() -> None:
+    contract = valid_standard_contract()
+    contract.update(
+        decision_level="FP_FULL",
+        rights_and_authority_basis="Synthetic fixture owned by this test.",
+        worst_realistic_loss="Loss of a disposable temporary file.",
+        reversibility_assessment="Fully reversible.",
+        specialist_review_status="NOT_REQUIRED_FOR_SYNTHETIC_FIXTURE",
+        evidence_pack=["source-evidence-1"],
+        explicit_ceo_approval=False,
+    )
+
+    result = validate_contract(contract, ceo_approved=True)
 
     assert result.passed is True
     assert result.violations == ()

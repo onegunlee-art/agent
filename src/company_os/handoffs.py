@@ -19,10 +19,24 @@ REVIEWER_METADATA = {
     "authentication_mode": "Claude subscription",
 }
 
+REVIEW_REQUEST_TITLE = "Claude Opus ReviewRequest"
+
 
 def markdown_document(title: str, payload: dict[str, Any]) -> str:
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)
     return f"# {title}\n\n```json\n{serialized}\n```\n"
+
+
+def review_request_markdown(payload: dict[str, Any]) -> str:
+    """Render the one canonical human-facing ReviewRequest document."""
+
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    return f"# {REVIEW_REQUEST_TITLE}\n\n```json\n{serialized}\n```\n"
 
 
 def require_fields(
@@ -79,6 +93,10 @@ def validate_review_result(
     *,
     request_id: str,
     request_hash: str,
+    request_schema_version: int | None = None,
+    source_commit: str | None = None,
+    source_tree_sha256: str | None = None,
+    allow_fake_reviewer: bool = False,
 ) -> None:
     require_fields(
         payload,
@@ -93,17 +111,38 @@ def validate_review_result(
         ),
         context="ReviewResult",
     )
-    if payload["schema_version"] != 1:
+    if payload["schema_version"] not in {1, 2}:
         raise ValidationError("Unsupported ReviewResult schema_version")
+    if (
+        request_schema_version is not None
+        and payload["schema_version"] != request_schema_version
+    ):
+        raise ValidationError(
+            "ReviewResult schema_version does not match ReviewRequest"
+        )
+    if source_commit is not None or source_tree_sha256 is not None:
+        require_fields(
+            payload,
+            ("reviewed_commit", "reviewed_tree_sha256"),
+            context="ReviewResult",
+        )
+        if payload.get("reviewed_commit") != source_commit:
+            raise ValidationError("ReviewResult reviewed commit does not match")
+        if payload.get("reviewed_tree_sha256") != source_tree_sha256:
+            raise ValidationError("ReviewResult reviewed tree SHA-256 does not match")
     if payload["review_request_id"] != request_id:
         raise ValidationError("ReviewResult request id does not match")
     if payload["review_request_hash"] != request_hash:
         raise ValidationError("ReviewResult request hash does not match")
     if payload["verdict"] not in {"PASS", "CHANGES_REQUIRED"}:
         raise ValidationError("ReviewResult verdict is invalid")
-    if payload["source"] not in {"user_supplied", "fake_reviewer"}:
+    allowed_sources = {"user_supplied"}
+    if allow_fake_reviewer is True:
+        allowed_sources.add("fake_reviewer")
+    if payload["source"] not in allowed_sources:
+        expected_sources = " or ".join(sorted(allowed_sources))
         raise ValidationError(
-            "ReviewResult source must be user_supplied or fake_reviewer"
+            f"ReviewResult source must be {expected_sources}"
         )
     if not isinstance(payload["findings"], list):
         raise ValidationError("ReviewResult findings must be a list")
@@ -125,5 +164,10 @@ def validate_review_result(
             raise ValidationError(
                 f"ReviewResult required_changes[{index}] requires id and description"
             )
+    change_ids = [change["id"] for change in payload["required_changes"]]
+    if len(change_ids) != len(set(change_ids)):
+        raise ValidationError("ReviewResult required_change ids must be unique")
     if payload["verdict"] == "CHANGES_REQUIRED" and not payload["required_changes"]:
         raise ValidationError("CHANGES_REQUIRED must include required_changes")
+    if payload["verdict"] == "PASS" and payload["required_changes"]:
+        raise ValidationError("PASS must not include required_changes")

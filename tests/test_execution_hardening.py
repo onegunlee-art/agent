@@ -4,13 +4,15 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 
+import pytest
+
 from company_os.application import CompanyOS, ExistingArtifactExecutor
 from company_os.errors import ValidationError
 from company_os.fakes import FakeExecutor, FakeReviewer
 from company_os.models import ExecutionOutput
 from company_os.utils import atomic_write_text
 
-from .helpers import build_venture
+from .helpers import CleanSourceSnapshotter, build_venture
 
 
 class UnrelatedArtifactExecutor:
@@ -162,10 +164,14 @@ def test_concurrent_execute_allows_exactly_one_passing_transition(
         second_company.close()
 
 
-def test_repair_replay_with_the_same_key_returns_the_original_run(
+def test_repair_without_manifest_cannot_create_a_second_run(
     tmp_path: Path,
 ) -> None:
-    with CompanyOS(tmp_path) as company:
+    with CompanyOS(
+        tmp_path,
+        source_snapshotter=CleanSourceSnapshotter(),
+        allow_test_reviewers=True,
+    ) as company:
         _, _, _, work_order = build_venture(company, "repair-replay-hardening")
         company.execute_work_order(
             work_order.id,
@@ -179,16 +185,12 @@ def test_repair_replay_with_the_same_key_returns_the_original_run(
         review_result = FakeReviewer().write_result(company.root, review)
         company.ingest_review_result(review.id, review_result)
 
-        repaired = company.repair_once(
-            work_order.id,
-            executor=FakeExecutor(),
-            idempotency_key="repair-replay-same-key",
-        )
-        replayed = company.repair_once(
-            work_order.id,
-            executor=FakeExecutor(),
-            idempotency_key="repair-replay-same-key",
-        )
+        with pytest.raises(ValidationError, match="repair manifest"):
+            company.repair_once(
+                work_order.id,
+                executor=FakeExecutor(),
+                idempotency_key="repair-replay-same-key",
+            )
 
         repair_events = [
             event
@@ -197,8 +199,6 @@ def test_repair_replay_with_the_same_key_returns_the_original_run(
         ]
         runs = company.runs_for_work_order(work_order.id)
 
-        assert repaired.status == "PASS"
-        assert replayed.id == repaired.id
-        assert company.work_order(work_order.id).status == "REPAIRED_VERIFIED"
-        assert len(runs) == 2
-        assert len(repair_events) == 1
+        assert company.work_order(work_order.id).status == "REPAIR_REQUIRED"
+        assert len(runs) == 1
+        assert len(repair_events) == 0

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-from .utils import atomic_write_json, read_json, sha256_file
+from .utils import atomic_write_json, payload_hash, read_json, sha256_file
 
 
 @dataclass(frozen=True)
@@ -21,13 +21,19 @@ def write_exact_text_verifier(
     *,
     artifact_relative_path: str,
     expected_content: str,
+    contract_binding: Mapping[str, Any] | None = None,
 ) -> str:
+    binding = dict(contract_binding or {})
     spec = {
         "schema_version": 1,
         "kind": "EXACT_TEXT",
+        "verification_scope": "SYNTHETIC_ONLY",
+        "verifier_semantics": "EXACT_TEXT_FIXTURE_ONLY",
         "artifact_relative_path": artifact_relative_path,
         "expected_content": expected_content,
         "encoding": "utf-8",
+        "contract_binding": binding,
+        "contract_binding_sha256": payload_hash(binding),
     }
     atomic_write_json(path, spec)
     return sha256_file(path)

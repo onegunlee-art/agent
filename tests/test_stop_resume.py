@@ -8,7 +8,7 @@ from company_os.application import CompanyOS
 from company_os.errors import CompanyStoppedError
 from company_os.fakes import FakeExecutor
 
-from .helpers import build_venture
+from .helpers import CleanSourceSnapshotter, build_venture
 
 
 class NeverExecute:
@@ -19,7 +19,8 @@ class NeverExecute:
 
 
 def test_stop_persists_and_resume_continues_after_completed_run(tmp_path: Path) -> None:
-    company = CompanyOS(root=tmp_path)
+    snapshotter = CleanSourceSnapshotter()
+    company = CompanyOS(root=tmp_path, source_snapshotter=snapshotter)
     company.initialize()
     _, _, _, work_order = build_venture(company, "synthetic-resume")
 
@@ -33,7 +34,7 @@ def test_stop_persists_and_resume_continues_after_completed_run(tmp_path: Path) 
         )
     company.close()
 
-    restarted = CompanyOS(root=tmp_path)
+    restarted = CompanyOS(root=tmp_path, source_snapshotter=snapshotter)
     restarted.initialize()
     assert restarted.is_stopped() is True
     restarted.resume()
@@ -45,7 +46,7 @@ def test_stop_persists_and_resume_continues_after_completed_run(tmp_path: Path) 
     assert run.status == "PASS"
     restarted.close()
 
-    after_crash = CompanyOS(root=tmp_path)
+    after_crash = CompanyOS(root=tmp_path, source_snapshotter=snapshotter)
     after_crash.initialize()
     review = after_crash.resume_work_order(work_order.id, executor=NeverExecute())
 

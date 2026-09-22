@@ -31,6 +31,11 @@ class GateResult:
 
 
 _DECISION_LEVELS: Final = frozenset({"FP_LITE", "FP_STANDARD", "FP_FULL"})
+_DECISION_LEVEL_RANK: Final = {
+    "FP_LITE": 1,
+    "FP_STANDARD": 2,
+    "FP_FULL": 3,
+}
 _CLAIM_TYPES: Final = frozenset(
     {
         "OBSERVATION",
@@ -45,14 +50,14 @@ _CLAIM_TYPES: Final = frozenset(
         "DECISION",
     }
 )
-_NON_EVIDENTIARY_FACT_SOURCE_TYPES: Final = frozenset(
+_TRUSTED_FACT_SOURCE_TYPES: Final = frozenset(
     {
-        "MODEL_OPINION",
-        "EXECUTIVE_OPINION",
-        "CEO_INTUITION",
-        "UNCITED_INTERNET",
-        "INDUSTRY_CONVENTION",
-        "COMMON_PRACTICE",
+        "SYNTHETIC_FIXTURE",
+        "PRIMARY_SOURCE",
+        "OFFICIAL_RECORD",
+        "MEASURED_OBSERVATION",
+        "VERIFIED_ARTIFACT",
+        "USER_SUPPLIED_DOCUMENT",
     }
 )
 _METRIC_FIELDS: Final = ("name", "formula", "unit", "time_window", "data_source")
@@ -129,7 +134,14 @@ class _ClaimProvenance:
 class FirstPrinciplesGate:
     """Validate first-principles records without making truth judgements."""
 
-    def validate(self, contract: Mapping[str, Any]) -> GateResult:
+    def validate(
+        self,
+        contract: Mapping[str, Any],
+        *,
+        min_decision_level: str = "FP_LITE",
+        trusted_evidence_refs: frozenset[str] = frozenset(),
+        ceo_approved: bool = False,
+    ) -> GateResult:
         """Return all structurally detectable violations in a stable order.
 
         Validation is intentionally pure: ``contract`` is never mutated and no
@@ -145,6 +157,26 @@ class FirstPrinciplesGate:
                 "The contract must be a mapping.",
             )
             return GateResult(passed=False, violations=tuple(violations))
+
+        normalized_minimum = (
+            min_decision_level.strip()
+            if isinstance(min_decision_level, str)
+            else min_decision_level
+        )
+        if normalized_minimum not in _DECISION_LEVELS:
+            self._add(
+                violations,
+                "MIN_DECISION_LEVEL_INVALID",
+                "min_decision_level",
+                "The minimum decision level must be FP_LITE, FP_STANDARD, or FP_FULL.",
+            )
+            return GateResult(passed=False, violations=tuple(violations))
+
+        trusted_refs = frozenset(
+            reference.strip()
+            for reference in trusted_evidence_refs
+            if _non_empty_text(reference)
+        )
 
         raw_level = contract.get("decision_level")
         if not _non_empty_text(raw_level):
@@ -166,19 +198,28 @@ class FirstPrinciplesGate:
             )
             return GateResult(passed=False, violations=tuple(violations))
 
+        if _DECISION_LEVEL_RANK[level] < _DECISION_LEVEL_RANK[normalized_minimum]:
+            self._add(
+                violations,
+                "DECISION_LEVEL_BELOW_MINIMUM",
+                "decision_level",
+                f"{level} is below the required minimum {normalized_minimum}.",
+            )
+
         self._validate_governance_checks(contract, violations)
         if level == "FP_LITE":
-            self._validate_lite(contract, violations)
+            self._validate_lite(contract, trusted_refs, violations)
         else:
-            self._validate_standard(contract, violations)
+            self._validate_standard(contract, trusted_refs, violations)
             if level == "FP_FULL":
-                self._validate_full(contract, violations)
+                self._validate_full(contract, ceo_approved, violations)
 
         return GateResult(passed=not violations, violations=tuple(violations))
 
     def _validate_lite(
         self,
         contract: Mapping[str, Any],
+        trusted_evidence_refs: frozenset[str],
         violations: list[Violation],
     ) -> None:
         objective = contract.get("observable_objective")
@@ -231,6 +272,22 @@ class FirstPrinciplesGate:
                             field,
                             "A FACT requires at least one Evidence reference.",
                         )
+                    elif not _evidence_references_are_trusted(
+                        fact.get("evidence_refs"), trusted_evidence_refs
+                    ):
+                        self._add(
+                            violations,
+                            "FACT_EVIDENCE_NOT_TRUSTED",
+                            f"{field}.evidence_refs",
+                            "Every FACT Evidence reference must resolve to trusted Evidence.",
+                        )
+                    if not _fact_source_types_allowed(fact.get("source_types")):
+                        self._add(
+                            violations,
+                            "FACT_SOURCE_NOT_EVIDENCE",
+                            f"{field}.source_types",
+                            "Every FACT source type must be in the trusted allowlist.",
+                        )
                 elif not _non_empty_text(fact):
                     self._add(
                         violations,
@@ -257,11 +314,16 @@ class FirstPrinciplesGate:
     def _validate_standard(
         self,
         contract: Mapping[str, Any],
+        trusted_evidence_refs: frozenset[str],
         violations: list[Violation],
     ) -> dict[str, set[str]]:
         self._validate_observable_problem(contract, violations)
         self._validate_metric(contract, violations)
-        claim_index, claim_provenance = self._validate_claims(contract, violations)
+        claim_index, claim_provenance = self._validate_claims(
+            contract,
+            trusted_evidence_refs,
+            violations,
+        )
         constraint_provenance = self._validate_constraints(contract, violations)
         for claim_id, provenance in constraint_provenance.items():
             claim_provenance.setdefault(claim_id, provenance)
@@ -390,6 +452,7 @@ class FirstPrinciplesGate:
     def _validate_claims(
         self,
         contract: Mapping[str, Any],
+        trusted_evidence_refs: frozenset[str],
         violations: list[Violation],
     ) -> tuple[dict[str, set[str]], dict[str, _ClaimProvenance]]:
         entries: list[tuple[str, Any, str | None]] = []
@@ -479,7 +542,10 @@ class FirstPrinciplesGate:
                         claim_type=claim_type,
                         evidence_traceable=(
                             claim_type == "FACT"
-                            and _fact_evidence_traceable(claim)
+                            and _fact_evidence_traceable(
+                                claim,
+                                trusted_evidence_refs,
+                            )
                         ),
                     ),
                 )
@@ -513,14 +579,23 @@ class FirstPrinciplesGate:
                     field,
                     "A FACT requires at least one Evidence reference.",
                 )
-            if claim_type == "FACT" and _only_non_evidentiary_fact_sources(
+            elif claim_type == "FACT" and not _evidence_references_are_trusted(
+                claim.get("evidence_refs"), trusted_evidence_refs
+            ):
+                self._add(
+                    violations,
+                    "FACT_EVIDENCE_NOT_TRUSTED",
+                    f"{field}.evidence_refs",
+                    "Every FACT Evidence reference must resolve to trusted Evidence.",
+                )
+            if claim_type == "FACT" and not _fact_source_types_allowed(
                 claim.get("source_types")
             ):
                 self._add(
                     violations,
                     "FACT_SOURCE_NOT_EVIDENCE",
                     f"{field}.source_types",
-                    "Opinion, intuition, convention, and uncited claims are not Evidence.",
+                    "Every FACT source type must be in the trusted allowlist.",
                 )
 
         if "FACT" not in found_types:
@@ -833,6 +908,7 @@ class FirstPrinciplesGate:
     def _validate_full(
         self,
         contract: Mapping[str, Any],
+        ceo_approved: bool,
         violations: list[Violation],
     ) -> None:
         full_fields = (
@@ -874,16 +950,12 @@ class FirstPrinciplesGate:
                 "FP_FULL requires a non-empty Evidence Pack.",
             )
 
-        approval = contract.get(
-            "explicit_ceo_approval",
-            contract.get("ceo_approval"),
-        )
-        if not _approved_by_ceo(approval):
+        if ceo_approved is not True:
             self._add(
                 violations,
                 "FP_FULL_CEO_APPROVAL_REQUIRED",
-                "explicit_ceo_approval",
-                "FP_FULL requires explicit CEO approval.",
+                "ceo_approved",
+                "FP_FULL requires CEO approval from the external authority state.",
             )
 
     @staticmethod
@@ -936,42 +1008,37 @@ def _evidence_references(value: Any) -> bool:
     )
 
 
-def _only_non_evidentiary_fact_sources(value: Any) -> bool:
+def _evidence_references_are_trusted(
+    value: Any,
+    trusted_evidence_refs: frozenset[str],
+) -> bool:
+    return bool(
+        _evidence_references(value)
+        and all(reference.strip() in trusted_evidence_refs for reference in value)
+    )
+
+
+def _fact_source_types_allowed(value: Any) -> bool:
     return bool(
         _non_string_sequence(value)
         and value
         and all(
             _non_empty_text(source_type)
-            and source_type.strip().upper() in _NON_EVIDENTIARY_FACT_SOURCE_TYPES
+            and source_type.strip().upper() in _TRUSTED_FACT_SOURCE_TYPES
             for source_type in value
         )
     )
 
 
-def _fact_evidence_traceable(claim: Mapping[str, Any]) -> bool:
-    return _evidence_references(
-        claim.get("evidence_refs")
-    ) and not _only_non_evidentiary_fact_sources(claim.get("source_types"))
+def _fact_evidence_traceable(
+    claim: Mapping[str, Any],
+    trusted_evidence_refs: frozenset[str],
+) -> bool:
+    return _evidence_references_are_trusted(
+        claim.get("evidence_refs"),
+        trusted_evidence_refs,
+    ) and _fact_source_types_allowed(claim.get("source_types"))
 
 
 def _normalize(value: str) -> str:
     return " ".join(value.casefold().split())
-
-
-def _approved_by_ceo(value: Any) -> bool:
-    if value is True:
-        return True
-    if isinstance(value, str):
-        return value.strip().upper() in {"APPROVED", "CEO_APPROVED"}
-    if not isinstance(value, Mapping):
-        return False
-
-    status = value.get("status")
-    if not isinstance(status, str) or status.strip().upper() not in {
-        "APPROVED",
-        "CEO_APPROVED",
-    }:
-        return False
-
-    approver = value.get("approved_by", value.get("actor", "CEO"))
-    return isinstance(approver, str) and approver.strip().upper() == "CEO"

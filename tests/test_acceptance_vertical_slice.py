@@ -6,9 +6,12 @@ from pathlib import Path
 from company_os.application import CompanyOS
 from company_os.fakes import FakeCMO, FakeCPO, FakeCTO, FakeExecutor
 
+from .helpers import CleanSourceSnapshotter
+
 
 def test_idea_to_waiting_for_opus_survives_restart(tmp_path: Path) -> None:
-    company = CompanyOS(root=tmp_path)
+    snapshotter = CleanSourceSnapshotter()
+    company = CompanyOS(root=tmp_path, source_snapshotter=snapshotter)
     company.initialize()
 
     idea = company.create_idea(
@@ -55,8 +58,14 @@ def test_idea_to_waiting_for_opus_survives_restart(tmp_path: Path) -> None:
     manifest = json.loads(venture.context_manifest_path.read_text(encoding="utf-8"))
     assert manifest["venture_id"] == venture.id
     assert manifest["idea_id"] == idea.id
+    assert manifest["isolation_mode"] == "LOGICAL_NAMESPACE_ONLY"
+    assert manifest["security_boundary"] is False
 
     work_order = company.first_work_order(venture.id)
+    verifier = json.loads(work_order.verifier_path.read_text(encoding="utf-8"))
+    assert verifier["verification_scope"] == "SYNTHETIC_ONLY"
+    assert verifier["verifier_semantics"] == "EXACT_TEXT_FIXTURE_ONLY"
+    assert verifier["contract_binding_sha256"]
     run = company.execute_work_order(
         work_order.id,
         executor=FakeExecutor(),
@@ -76,7 +85,7 @@ def test_idea_to_waiting_for_opus_survives_restart(tmp_path: Path) -> None:
 
     company.close()
 
-    restarted = CompanyOS(root=tmp_path)
+    restarted = CompanyOS(root=tmp_path, source_snapshotter=snapshotter)
     restarted.initialize()
 
     restored_work_order = restarted.work_order(work_order.id)

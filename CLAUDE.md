@@ -22,14 +22,35 @@ tests use a deterministic FakeReviewer.
 
 The required ReviewResult fields are:
 
-- `schema_version` (`1`)
+- `schema_version` (`2`)
 - `review_request_id`
 - `review_request_hash`
+- `reviewed_commit` (must equal the request's `source_commit`)
+- `reviewed_tree_sha256` (must equal the request's `source_tree_sha256`)
 - `source` (`user_supplied` for a real manual handoff)
 - `verdict` (`PASS` or `CHANGES_REQUIRED`)
 - `findings` (array)
 - `required_changes` (array)
 
-`CHANGES_REQUIRED` must contain at least one required change. The program
-validates structure and correlation; it does not cryptographically prove the
-reviewer's identity.
+`CHANGES_REQUIRED` must contain at least one uniquely identified required
+change. `PASS` must contain no required changes. The program validates the
+request file, request hash, source binding, structure, and correlation; it
+does not cryptographically prove the reviewer's identity.
+
+After `CHANGES_REQUIRED`, create a repair-manifest JSON covering every change
+ID with its commit and canonical trusted Evidence IDs. The program resolves
+those IDs to the same WorkOrder's PASS Runs and rechecks every Evidence file
+hash, then run:
+
+```powershell
+company work resume <work_order_id> --repair-manifest <repair_manifest.json>
+```
+
+A successful repair creates a new ReviewRequest. It does not complete the
+WorkOrder; only PASS on the new request can do that.
+
+Review and repair handoffs require a clean Git source state. Commit the code
+first; untracked source, tracked modifications, unsafe index flags, and
+unapproved ignored paths are rejected. Project-local `__pycache__`,
+`.egg-info`, tracked symlinks, and gitlinks are also rejected. The generated
+JSON and Markdown request files are both hash-checked before result ingest.

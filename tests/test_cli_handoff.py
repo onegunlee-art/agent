@@ -8,6 +8,8 @@ from company_os.cli import main
 from company_os.fakes import FakeCMO, FakeCPO, FakeCTO
 from company_os.utils import atomic_write_text
 
+from .helpers import CleanSourceSnapshotter
+
 
 def invoke(capsys, *arguments: str) -> dict:
     assert main(arguments) == 0
@@ -17,8 +19,15 @@ def invoke(capsys, *arguments: str) -> dict:
 
 
 def test_cli_manual_handoff_flow_reaches_waiting_for_opus(
-    tmp_path: Path, capsys
+    tmp_path: Path, capsys, monkeypatch
 ) -> None:
+    snapshotter = CleanSourceSnapshotter()
+    monkeypatch.setattr(
+        "company_os.cli.CompanyOS",
+        lambda root, db_path=None: CompanyOS(
+            root, db_path=db_path, source_snapshotter=snapshotter
+        ),
+    )
     root_args = ("--root", str(tmp_path))
     initialized = invoke(capsys, *root_args, "init")
     assert initialized["status"] == "INITIALIZED"
@@ -34,7 +43,7 @@ def test_cli_manual_handoff_flow_reaches_waiting_for_opus(
     requests = invoke(capsys, *root_args, "council", "prepare", idea_id)
     assert {item["role"] for item in requests} == {"cto", "cpo", "cmo"}
 
-    with CompanyOS(tmp_path) as company:
+    with CompanyOS(tmp_path, source_snapshotter=snapshotter) as company:
         idea_model = company.idea(idea_id)
         response_paths = {
             fake.role: fake.write_response(company.root, idea_model)
@@ -64,7 +73,7 @@ def test_cli_manual_handoff_flow_reaches_waiting_for_opus(
         compiled["contract_id"],
     )
 
-    with CompanyOS(tmp_path) as company:
+    with CompanyOS(tmp_path, source_snapshotter=snapshotter) as company:
         work_order = company.first_work_order(venture["id"])
         artifact_path = (
             company.venture(venture["id"]).workspace_path

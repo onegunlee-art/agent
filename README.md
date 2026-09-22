@@ -1,8 +1,11 @@
 # AI Company OS V0.1
 
+Status: **V0.1-alpha**. This repository proves the synthetic local workflow;
+it is not ready for a real Venture.
+
 AI Company OS is a local, on-demand operating kernel that turns a one-line
-idea into an isolated Venture, a mechanically verified WorkOrder, durable
-Evidence, and an auditable Decision trail.
+idea into a venture-scoped workspace, a mechanically checked WorkOrder,
+durable Evidence, and an auditable Decision trail.
 
 V0.1 is intentionally a Python CLI, not a chatbot or background service. It
 does not call the OpenAI or Anthropic APIs and does not invoke Codex
@@ -30,7 +33,7 @@ company council prepare <idea_id>
 company council ingest <idea_id> --role cto --file <cto_response.json>
 company council ingest <idea_id> --role cpo --file <cpo_response.json>
 company council ingest <idea_id> --role cmo --file <cmo_response.json>
-company council compile <idea_id>
+company council compile <idea_id> --min-level FP_STANDARD
 company venture scaffold <contract_id> --approval-status NOT_REQUIRED
 company work verify <work_order_id>
 company work review <work_order_id>
@@ -51,12 +54,17 @@ company stop
 company resume
 company inbox
 company work resume <work_order_id>
+company work resume <work_order_id> --repair-manifest <repair_manifest.json>
 company review ingest <review_id> --file <review_result.json>
 company events export --output <events.jsonl>
 ```
 
 Use `--root <path>` on any command to select a Company OS root. Canonical
 state defaults to `var/state/company.db` below that root.
+
+Corrected executive responses can be ingested again; the prior version is
+retained as `SUPERSEDED`. If a genuinely shared Council field conflicts, use
+`company council resolve <idea_id> --contract-file <complete_contract.json>`.
 
 ## State and artifacts
 
@@ -65,11 +73,27 @@ state defaults to `var/state/company.db` below that root.
 - Venture workspaces, handoffs, Evidence files, logs, and runtime databases
   live under `var/` and are excluded from Git.
 - Every filesystem path stored in SQLite is relative to the Company OS root.
-- Each Venture has its own workspace and Context Manifest.
+- Each Venture has its own workspace and Context Manifest. This is logical
+  namespacing, not a process or filesystem security boundary.
 - The verifier definition is hashed before execution. A changed hash marks
   the Run `INVALIDATED` and records `VERIFIER_TAMPER_DETECTED`.
 - Before a ReviewRequest is created, Evidence and Artifact files are rehashed
   against SQLite. Each review has a unique, immutable handoff directory.
+- Schema-v2 ReviewRequests contain the reviewable WorkOrder inputs and bind
+  the decision to a Git commit plus deterministic tracked-tree SHA-256.
+- Review and repair binding requires a clean Git source state; untracked
+  source, project-local `__pycache__`/`.egg-info`, symlinks, gitlinks, and
+  unapproved ignored paths are rejected. Run source-binding commands without
+  writing bytecode (for example, set `PYTHONDONTWRITEBYTECODE=1`) after removing
+  generated project caches. The interpreter and installed dependencies are a
+  trusted environment boundary, not part of the source digest.
+- Both the JSON and Markdown ReviewRequest files are hash-bound and rechecked
+  before a ReviewResult can change state.
+- A repair requires one hash-checked resolution per required-change ID and
+  always returns to independent rereview before completion.
+- A stale, legacy, or damaged pending review is preserved as `SUPERSEDED` and
+  reissued against current clean source; it cannot strand the WorkOrder in an
+  unrecoverable `WAITING_FOR_OPUS` state.
 
 See [architecture](docs/architecture.md) for the implemented flow and
 invariants, and [CLAUDE.md](CLAUDE.md) for manual review handoff rules.
@@ -81,3 +105,14 @@ include a web dashboard, scheduler, daemon, external database or queue,
 vector database, web crawler, external messaging, production deployment, or
 real customer data. All automated tests and the bootstrap smoke test use
 synthetic data.
+
+The built-in exact-text verifier is `SYNTHETIC_ONLY`. A PASS proves only that
+the declared local path contains the expected bytes. It does not evaluate a
+VentureContract's metric, experiment, or real-world pass/fail outcome, so V0.1
+must not be used to validate a real Venture.
+
+The Context Manifest provides `LOGICAL_NAMESPACE_ONLY` organization. It is
+not a sandbox: a local executor may still read the repository or modify files
+outside its Venture workspace. V0.1 therefore permits only a trusted local
+executor operating on synthetic, non-confidential data; untrusted executors
+and confidential multi-Venture workloads are out of scope.

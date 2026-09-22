@@ -10,7 +10,7 @@ from typing import Any, Sequence
 from .application import CompanyOS, ExistingArtifactExecutor
 from .errors import CompanyOSError
 from .roles import list_role_specs, serialize_role_spec
-from .utils import payload_hash, sha256_file
+from .utils import payload_hash, read_json, sha256_file
 
 
 def _json_default(value: Any) -> Any:
@@ -52,7 +52,21 @@ def build_parser() -> argparse.ArgumentParser:
     council_ingest.add_argument("--file", required=True, type=Path)
     council_compile = council_commands.add_parser("compile")
     council_compile.add_argument("idea_id")
+    council_compile.add_argument(
+        "--min-level",
+        default="FP_STANDARD",
+        choices=("FP_LITE", "FP_STANDARD", "FP_FULL"),
+    )
     council_compile.add_argument("--idempotency-key")
+    council_resolve = council_commands.add_parser("resolve")
+    council_resolve.add_argument("idea_id")
+    council_resolve.add_argument("--contract-file", required=True, type=Path)
+    council_resolve.add_argument(
+        "--min-level",
+        default="FP_STANDARD",
+        choices=("FP_LITE", "FP_STANDARD", "FP_FULL"),
+    )
+    council_resolve.add_argument("--idempotency-key")
 
     roles = commands.add_parser("roles", help="Inspect the three RoleSpecs")
     roles_commands = roles.add_subparsers(dest="roles_command", required=True)
@@ -60,7 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
     role_show = roles_commands.add_parser("show")
     role_show.add_argument("role", choices=("cto", "cpo", "cmo"))
 
-    venture = commands.add_parser("venture", help="Create an isolated Venture")
+    venture = commands.add_parser(
+        "venture", help="Create a venture-scoped local workspace"
+    )
     venture_commands = venture.add_subparsers(dest="venture_command", required=True)
     scaffold = venture_commands.add_parser("scaffold")
     scaffold.add_argument("contract_id")
@@ -83,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     work_review.add_argument("--idempotency-key")
     work_resume = work_commands.add_parser("resume")
     work_resume.add_argument("work_order_id")
+    work_resume.add_argument("--repair-manifest", type=Path)
 
     review = commands.add_parser("review", help="Ingest a supplied ReviewResult")
     review_commands = review.add_subparsers(dest="review_command", required=True)
@@ -123,8 +140,44 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         )
         return {"status": "INGESTED", "path": path}
     if args.command == "council" and args.council_command == "compile":
-        key = args.idempotency_key or f"cli-compile:{args.idea_id}"
-        outcome = company.compile_council(args.idea_id, idempotency_key=key)
+        active = company.store.query_all(
+            """
+            SELECT role, response_hash FROM council_responses
+            WHERE idea_id = ? AND status = 'ACTIVE' ORDER BY role
+            """,
+            (args.idea_id,),
+        )
+        fingerprint = payload_hash(
+            {
+                "idea_id": args.idea_id,
+                "min_level": args.min_level,
+                "responses": [dict(row) for row in active],
+            }
+        )
+        key = args.idempotency_key or f"cli-compile:{args.idea_id}:{fingerprint}"
+        outcome = company.compile_council(
+            args.idea_id,
+            min_decision_level=args.min_level,
+            idempotency_key=key,
+        )
+        return {
+            "contract_id": outcome.contract_id,
+            "gate": {
+                "passed": outcome.gate_result.passed,
+                "violations": [asdict(v) for v in outcome.gate_result.violations],
+            },
+        }
+    if args.command == "council" and args.council_command == "resolve":
+        contract_fingerprint = sha256_file(args.contract_file.resolve())
+        key = args.idempotency_key or (
+            f"cli-resolve:{args.idea_id}:{contract_fingerprint}:{args.min_level}"
+        )
+        outcome = company.resolve_council(
+            args.idea_id,
+            contract_file=args.contract_file,
+            min_decision_level=args.min_level,
+            idempotency_key=key,
+        )
         return {
             "contract_id": outcome.contract_id,
             "gate": {
@@ -162,11 +215,26 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
             args.work_order_id, idempotency_key=key
         )
     if args.command == "work" and args.work_command == "review":
-        key = args.idempotency_key or f"cli-review:{args.work_order_id}"
+        review_count = int(
+            company.store.scalar(
+                "SELECT COUNT(*) FROM reviews WHERE work_order_id = ?",
+                (args.work_order_id,),
+            )
+        )
+        key = args.idempotency_key or (
+            f"cli-review:{args.work_order_id}:{review_count}"
+        )
         return company.prepare_review(args.work_order_id, idempotency_key=key)
     if args.command == "work" and args.work_command == "resume":
+        repair_manifest = None
+        if args.repair_manifest is not None:
+            repair_manifest = read_json(args.repair_manifest.resolve())
+            if not isinstance(repair_manifest, dict):
+                raise ValueError("repair manifest must be a JSON object")
         return company.resume_work_order(
-            args.work_order_id, executor=ExistingArtifactExecutor()
+            args.work_order_id,
+            executor=ExistingArtifactExecutor(),
+            repair_manifest=repair_manifest,
         )
     if args.command == "review" and args.review_command == "ingest":
         return company.ingest_review_result(args.review_id, args.file)
@@ -178,14 +246,20 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         return {"stopped": False}
     if args.command == "status":
         waiting = company.store.query_all(
-            "SELECT id, work_order_id, request_json_path, request_markdown_path "
+            "SELECT id, work_order_id, binding_status, request_json_path, "
+            "request_markdown_path "
             "FROM reviews WHERE status = 'WAITING_FOR_OPUS' ORDER BY created_at"
+        )
+        legacy_unbound = company.store.query_all(
+            "SELECT id, work_order_id, status FROM reviews "
+            "WHERE binding_status = 'LEGACY_UNBOUND' ORDER BY created_at"
         )
         return {
             "root": company.root,
             "db_path": company.db_path,
             "stopped": company.is_stopped(),
             "waiting_for_opus": [dict(row) for row in waiting],
+            "legacy_unbound_reviews": [dict(row) for row in legacy_unbound],
             "event_count": len(company.events()),
         }
     if args.command == "inbox":

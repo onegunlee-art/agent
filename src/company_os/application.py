@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
 from copy import deepcopy
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -13,11 +15,14 @@ from .errors import (
     NotFoundError,
     ValidationError,
 )
+from .council import CouncilMergeConflict, merge_council_responses
 from .first_principles import FirstPrinciplesGate, GateResult
 from .handoffs import (
     MODEL_METADATA,
+    REVIEW_REQUEST_TITLE,
     REVIEWER_METADATA,
     markdown_document,
+    review_request_markdown,
     validate_council_response,
     validate_review_result,
 )
@@ -34,6 +39,12 @@ from .models import (
     WorkOrder,
 )
 from .roles import get_role_spec, list_role_specs, serialize_role_spec
+from .source_snapshot import (
+    GitSourceSnapshot,
+    SourceSnapshot,
+    SourceSnapshotError,
+    SourceSnapshotPort,
+)
 from .storage import (
     IdempotencyConflict,
     SQLiteStateStore,
@@ -74,12 +85,24 @@ class ExistingArtifactExecutor:
 
 
 class CompanyOS:
-    def __init__(self, root: str | Path, db_path: str | Path | None = None):
+    def __init__(
+        self,
+        root: str | Path,
+        db_path: str | Path | None = None,
+        *,
+        source_snapshotter: SourceSnapshotPort | None = None,
+        allow_test_reviewers: bool = False,
+    ):
         self.root = Path(root).resolve()
         default_db = self.root / "var" / "state" / "company.db"
         self.db_path = Path(db_path).resolve() if db_path else default_db
         self.store = SQLiteStateStore(self.db_path)
         self.gate = FirstPrinciplesGate()
+        code_root = Path(__file__).resolve().parents[2]
+        self.source_snapshotter = source_snapshotter or GitSourceSnapshot(
+            code_root=code_root
+        )
+        self.allow_test_reviewers = allow_test_reviewers
 
     def initialize(self) -> CompanyOS:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -107,6 +130,17 @@ class CompanyOS:
         if candidate.is_absolute():
             raise ValueError("Canonical paths must be relative to the Company OS root")
         return contained_path(self.root, candidate)
+
+    def _source_snapshot(self) -> SourceSnapshot:
+        try:
+            snapshot = self.source_snapshotter.capture()
+        except SourceSnapshotError as exc:
+            raise ValidationError(f"Source snapshot could not be captured: {exc}") from exc
+        if snapshot.dirty:
+            raise ValidationError(
+                "Source snapshot must be clean before review or repair binding"
+            )
+        return snapshot
 
     def _row(self, table: str, record_id: str) -> sqlite3.Row:
         row = self.store.get_row(table, record_id)
@@ -168,6 +202,41 @@ class CompanyOS:
             directory = contained_path(
                 self.root, "var", "handoffs", "council", idea_id
             )
+            source_evidence_path = directory / "idea_source_evidence.json"
+            source_evidence_ref = "source-evidence-1"
+            source_evidence = {
+                "schema_version": 1,
+                "idea_id": idea.id,
+                "kind": "SYNTHETIC_FIXTURE",
+                "statement": "The local input fixture for this Idea exists.",
+                "idea_text": idea.text,
+            }
+            atomic_write_json(source_evidence_path, source_evidence)
+            source_evidence_id = new_id("evidence")
+            now = utc_now()
+            self.store.insert_row(
+                "evidence",
+                {
+                    "id": source_evidence_id,
+                    "idea_id": idea_id,
+                    "venture_id": None,
+                    "work_order_id": None,
+                    "run_id": None,
+                    "external_ref": source_evidence_ref,
+                    "kind": "SYNTHETIC_FIXTURE",
+                    "path": self._relative(source_evidence_path),
+                    "sha256": sha256_file(source_evidence_path),
+                    "trusted": 1,
+                    "payload_json": self._json(
+                        {
+                            "trusted": True,
+                            "source_types": ["SYNTHETIC_FIXTURE"],
+                        }
+                    ),
+                    "created_at": now,
+                },
+                connection=connection,
+            )
             request_rows: list[dict[str, str]] = []
             for role in _ROLES:
                 spec = serialize_role_spec(role)
@@ -179,6 +248,15 @@ class CompanyOS:
                     "role_spec": spec,
                     "model_metadata": MODEL_METADATA,
                     "execution_status": "NOT_EXECUTED",
+                    "available_evidence": [
+                        {
+                            "id": source_evidence_id,
+                            "external_ref": source_evidence_ref,
+                            "kind": "SYNTHETIC_FIXTURE",
+                            "path": self._relative(source_evidence_path),
+                            "sha256": sha256_file(source_evidence_path),
+                        }
+                    ],
                     "response_requirements": {
                         "required_envelope_fields": [
                             "schema_version",
@@ -209,7 +287,7 @@ class CompanyOS:
                 )
             connection.execute(
                 "UPDATE ideas SET status = 'COUNCIL_PREPARED', updated_at = ? WHERE id = ?",
-                (utc_now(), idea_id),
+                (now, idea_id),
             )
             self.store.append_event(
                 "COUNCIL_REQUESTS_PREPARED",
@@ -256,58 +334,168 @@ class CompanyOS:
             role=normalized_role,
             required_outputs=get_role_spec(normalized_role).required_structured_outputs,
         )
+        response_digest = payload_hash(payload)
         target = contained_path(
             self.root,
             "var",
             "handoffs",
             "council",
             idea_id,
-            f"{normalized_role}_response.json",
+            f"{normalized_role}_response_{response_digest}.json",
         )
         command_payload = {
             "idea_id": idea_id,
             "role": normalized_role,
-            "response_hash": payload_hash(payload),
+            "response_hash": response_digest,
         }
 
-        def operation(connection: sqlite3.Connection) -> dict[str, str]:
-            atomic_write_json(target, payload)
-            response_id = new_id("council_response")
+        active_before = self.store.query_one(
+            """
+            SELECT id, response_hash, updated_at
+            FROM council_responses
+            WHERE idea_id = ? AND role = ? AND status = 'ACTIVE'
+            """,
+            (idea_id, normalized_role),
+        )
+        activation_context = (
+            f"{active_before['id']}:{active_before['updated_at']}"
+            if active_before is not None
+            else "none"
+        )
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             now = utc_now()
-            self.store.insert_row(
-                "council_responses",
-                {
-                    "id": response_id,
-                    "idea_id": idea_id,
-                    "role": normalized_role,
-                    "payload_json": self._json(payload),
-                    "source_path": self._relative(target),
-                    "created_at": now,
-                    "updated_at": now,
-                },
-                connection=connection,
+            existing_response = connection.execute(
+                """
+                SELECT id, version, status, source_path
+                FROM council_responses
+                WHERE idea_id = ? AND role = ? AND response_hash = ?
+                """,
+                (idea_id, normalized_role, response_digest),
+            ).fetchone()
+            if (
+                existing_response is not None
+                and existing_response["status"] == "ACTIVE"
+            ):
+                return {
+                    "response_path": existing_response["source_path"],
+                    "response_id": existing_response["id"],
+                    "version": existing_response["version"],
+                }
+
+            next_version = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(version), 0) + 1
+                    FROM council_responses WHERE idea_id = ? AND role = ?
+                    """,
+                    (idea_id, normalized_role),
+                ).fetchone()[0]
             )
+            connection.execute(
+                """
+                UPDATE council_responses
+                SET status = 'SUPERSEDED', updated_at = ?
+                WHERE idea_id = ? AND role = ? AND status = 'ACTIVE'
+                """,
+                (now, idea_id, normalized_role),
+            )
+            if existing_response is None:
+                response_id = new_id("council_response")
+                response_version = next_version
+                event_type = "COUNCIL_RESPONSE_INGESTED"
+                self.store.insert_row(
+                    "council_responses",
+                    {
+                        "id": response_id,
+                        "idea_id": idea_id,
+                        "role": normalized_role,
+                        "version": response_version,
+                        "status": "ACTIVE",
+                        "response_hash": response_digest,
+                        "payload_json": self._json(payload),
+                        "source_path": self._relative(target),
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                    connection=connection,
+                )
+                self.store.insert_row(
+                    "evidence",
+                    {
+                        "id": new_id("evidence"),
+                        "idea_id": idea_id,
+                        "venture_id": None,
+                        "work_order_id": None,
+                        "run_id": None,
+                        "external_ref": (
+                            f"model-output:{normalized_role}:{response_digest}"
+                        ),
+                        "kind": "MODEL_OUTPUT",
+                        "path": self._relative(target),
+                        "sha256": sha256_file(target),
+                        "trusted": 0,
+                        "payload_json": self._json(
+                            {
+                                "trusted": False,
+                                "role": normalized_role,
+                                "response_hash": response_digest,
+                            }
+                        ),
+                        "created_at": now,
+                    },
+                    connection=connection,
+                )
+            else:
+                response_id = str(existing_response["id"])
+                response_version = int(existing_response["version"])
+                event_type = "COUNCIL_RESPONSE_REACTIVATED"
+                connection.execute(
+                    """
+                    UPDATE council_responses
+                    SET status = 'ACTIVE', source_path = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (self._relative(target), now, response_id),
+                )
             self.store.append_event(
-                "COUNCIL_RESPONSE_INGESTED",
+                event_type,
                 aggregate_type="Idea",
                 aggregate_id=idea_id,
                 payload={
                     "role": normalized_role,
                     "response_hash": command_payload["response_hash"],
+                    "response_id": response_id,
+                    "version": response_version,
                 },
                 connection=connection,
             )
-            return {"response_path": self._relative(target)}
+            return {
+                "response_path": self._relative(target),
+                "response_id": response_id,
+                "version": response_version,
+            }
 
+        target_existed = target.exists()
+        atomic_write_json(target, payload)
         try:
             result = self.store.run_idempotent(
-                f"council-ingest:{idea_id}:{normalized_role}",
+                (
+                    f"council-ingest:{idea_id}:{normalized_role}:"
+                    f"{activation_context}:{response_digest}"
+                ),
                 "ingest_council_response",
                 command_payload,
                 operation,
             )
         except IdempotencyConflict as exc:
+            if not target_existed and target.exists():
+                target.unlink()
             raise ConflictError(str(exc)) from exc
+        except BaseException:
+            if not target_existed and target.exists():
+                target.unlink()
+            raise
         return self._absolute(str(result["response_path"]))
 
     def compile_council(
@@ -315,10 +503,15 @@ class CompanyOS:
         idea_id: str,
         *,
         idempotency_key: str,
+        min_decision_level: str = "FP_STANDARD",
     ) -> CompileOutcome:
         self.idea(idea_id)
         rows = self.store.query_all(
-            "SELECT * FROM council_responses WHERE idea_id = ? ORDER BY role",
+            """
+            SELECT * FROM council_responses
+            WHERE idea_id = ? AND status = 'ACTIVE'
+            ORDER BY role
+            """,
             (idea_id,),
         )
         by_role = {row["role"]: json.loads(row["payload_json"]) for row in rows}
@@ -327,55 +520,216 @@ class CompanyOS:
             raise ValidationError(
                 f"Council responses are incomplete; missing: {', '.join(missing)}"
             )
-        contributions = {
-            role: by_role[role]["contract_contribution"] for role in _ROLES
+        response_metadata = {
+            row["role"]: {
+                "response_id": row["id"],
+                "version": row["version"],
+                "response_hash": row["response_hash"],
+                "source_path": row["source_path"],
+            }
+            for row in rows
         }
-        fingerprints = {role: payload_hash(value) for role, value in contributions.items()}
-        if len(set(fingerprints.values())) != 1:
+        try:
+            contract = merge_council_responses(
+                by_role,
+                response_metadata=response_metadata,
+            )
+        except CouncilMergeConflict as exc:
+            fingerprints = {
+                role: response_metadata[role]["response_hash"] for role in _ROLES
+            }
             inbox_path = contained_path(
                 self.root, "var", "inbox", "ideas", idea_id, "council_conflict.json"
             )
+            conflict_payload = {
+                "type": "COUNCIL_SHARED_FIELD_CONFLICT",
+                "idea_id": idea_id,
+                "conflicts": exc.conflicts,
+                "role_response_hashes": fingerprints,
+                "status": "CEO_DECISION_REQUIRED",
+            }
+            conflict_hash = payload_hash(conflict_payload)
+            prior_hash = None
+            if inbox_path.is_file():
+                try:
+                    prior = read_json(inbox_path)
+                    if isinstance(prior, dict):
+                        prior_hash = prior.get("conflict_hash")
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    prior_hash = None
             atomic_write_json(
                 inbox_path,
-                {
-                    "type": "COUNCIL_CONTRIBUTION_CONFLICT",
-                    "idea_id": idea_id,
-                    "role_contribution_hashes": fingerprints,
-                    "status": "CEO_DECISION_REQUIRED",
-                },
+                {**conflict_payload, "conflict_hash": conflict_hash},
             )
-            self.store.append_event(
-                "COUNCIL_CONFLICT_DETECTED",
-                aggregate_type="Idea",
-                aggregate_id=idea_id,
-                payload={"inbox_path": self._relative(inbox_path), "hashes": fingerprints},
-            )
+            if prior_hash != conflict_hash:
+                self.store.append_event(
+                    "COUNCIL_CONFLICT_DETECTED",
+                    aggregate_type="Idea",
+                    aggregate_id=idea_id,
+                    payload={
+                        "inbox_path": self._relative(inbox_path),
+                        "hashes": fingerprints,
+                        "conflicts": exc.conflicts,
+                        "conflict_hash": conflict_hash,
+                    },
+                )
             raise ConflictError(f"Council contributions conflict; see {inbox_path}")
 
-        contract = deepcopy(contributions["cto"])
-        contract["council_provenance"] = {
-            "compiler": "deterministic_fixed_mapping_v1",
-            "roles": list(_ROLES),
-            "contribution_hashes": fingerprints,
-            "agreement_is_not_evidence": True,
-        }
-        gate_result = self.gate.validate(contract)
+        trusted_refs = self._trusted_evidence_refs(idea_id)
+        gate_result = self.gate.validate(
+            contract,
+            min_decision_level=min_decision_level,
+            trusted_evidence_refs=trusted_refs,
+            ceo_approved=False,
+        )
         command_payload = {
             "idea_id": idea_id,
+            "min_decision_level": min_decision_level,
             "response_hashes": {
-                role: payload_hash(by_role[role]) for role in _ROLES
+                role: response_metadata[role]["response_hash"] for role in _ROLES
             },
         }
+        return self._persist_contract(
+            idea_id=idea_id,
+            contract=contract,
+            min_decision_level=min_decision_level,
+            gate_result=gate_result,
+            idempotency_key=idempotency_key,
+            command="compile_council",
+            command_payload=command_payload,
+        )
+
+    def resolve_council(
+        self,
+        idea_id: str,
+        *,
+        contract_file: str | Path,
+        min_decision_level: str = "FP_STANDARD",
+        idempotency_key: str,
+    ) -> CompileOutcome:
+        self.idea(idea_id)
+        supplied = read_json(Path(contract_file).resolve())
+        if not isinstance(supplied, dict):
+            raise ValidationError("Resolved VentureContract must be a JSON object")
+        contract = deepcopy(supplied)
+        contract.pop("council_provenance", None)
+        contract.pop("executive_outputs", None)
+        rows = self.store.query_all(
+            """
+            SELECT * FROM council_responses
+            WHERE idea_id = ? AND status = 'ACTIVE' ORDER BY role
+            """,
+            (idea_id,),
+        )
+        by_role = {row["role"]: json.loads(row["payload_json"]) for row in rows}
+        missing = [role for role in _ROLES if role not in by_role]
+        if missing:
+            raise ValidationError(
+                f"Council responses are incomplete; missing: {', '.join(missing)}"
+            )
+        response_hashes = {row["role"]: row["response_hash"] for row in rows}
+        contract["executive_outputs"] = {
+            role: deepcopy(by_role[role]["outputs"]) for role in _ROLES
+        }
+        contract["council_provenance"] = {
+            "compiler": "ceo_conflict_resolution_v2",
+            "roles": list(_ROLES),
+            "response_hashes": response_hashes,
+            "resolution_source": "user_supplied_complete_contract",
+            "agreement_is_not_evidence": True,
+        }
+        trusted_refs = self._trusted_evidence_refs(idea_id)
+        gate_result = self.gate.validate(
+            contract,
+            min_decision_level=min_decision_level,
+            trusted_evidence_refs=trusted_refs,
+            ceo_approved=False,
+        )
+        command_payload = {
+            "idea_id": idea_id,
+            "min_decision_level": min_decision_level,
+            "contract_hash": payload_hash(contract),
+            "response_hashes": response_hashes,
+        }
+        outcome = self._persist_contract(
+            idea_id=idea_id,
+            contract=contract,
+            min_decision_level=min_decision_level,
+            gate_result=gate_result,
+            idempotency_key=idempotency_key,
+            command="resolve_council",
+            command_payload=command_payload,
+            resolved=True,
+        )
+        inbox_path = contained_path(
+            self.root, "var", "inbox", "ideas", idea_id, "council_conflict.json"
+        )
+        atomic_write_json(
+            inbox_path,
+            {
+                "type": "COUNCIL_SHARED_FIELD_CONFLICT",
+                "idea_id": idea_id,
+                "status": "RESOLVED",
+                "contract_id": outcome.contract_id,
+            },
+        )
+        return outcome
+
+    def _trusted_evidence_refs(
+        self,
+        idea_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> frozenset[str]:
+        query = (
+            "SELECT id, external_ref FROM evidence "
+            "WHERE idea_id = ? AND trusted = 1"
+        )
+        rows = (
+            connection.execute(query, (idea_id,)).fetchall()
+            if connection is not None
+            else self.store.query_all(query, (idea_id,))
+        )
+        refs: set[str] = set()
+        for row in rows:
+            refs.add(str(row["id"]))
+            if row["external_ref"]:
+                refs.add(str(row["external_ref"]))
+        return frozenset(refs)
+
+    def _persist_contract(
+        self,
+        *,
+        idea_id: str,
+        contract: dict[str, Any],
+        min_decision_level: str,
+        gate_result: GateResult,
+        idempotency_key: str,
+        command: str,
+        command_payload: dict[str, Any],
+        resolved: bool = False,
+    ) -> CompileOutcome:
+        only_ceo_approval_missing = bool(gate_result.violations) and all(
+            violation.code == "FP_FULL_CEO_APPROVAL_REQUIRED"
+            for violation in gate_result.violations
+        )
+        gate_status = (
+            "PASSED"
+            if gate_result.passed
+            else "PENDING_APPROVAL"
+            if only_ceo_approval_missing
+            else "FAILED"
+        )
 
         def operation(connection: sqlite3.Connection) -> dict[str, str]:
             encoded_contract = self._json(contract)
             existing_contract = connection.execute(
                 """
                 SELECT id FROM contracts
-                WHERE idea_id = ? AND payload_json = ?
+                WHERE idea_id = ? AND payload_json = ? AND min_decision_level = ?
                 ORDER BY created_at LIMIT 1
                 """,
-                (idea_id, encoded_contract),
+                (idea_id, encoded_contract, min_decision_level),
             ).fetchone()
             if existing_contract is not None:
                 return {"contract_id": existing_contract["id"]}
@@ -387,20 +741,24 @@ class CompanyOS:
                     "id": contract_id,
                     "idea_id": idea_id,
                     "decision_level": contract["decision_level"],
-                    "gate_status": "PASSED" if gate_result.passed else "FAILED",
+                    "min_decision_level": min_decision_level,
+                    "gate_status": gate_status,
                     "payload_json": encoded_contract,
                     "created_at": now,
                     "updated_at": now,
                 },
                 connection=connection,
             )
+            idea_status = (
+                "CONTRACT_COMPILED"
+                if gate_status == "PASSED"
+                else "APPROVAL_REQUIRED"
+                if gate_status == "PENDING_APPROVAL"
+                else "GATE_FAILED"
+            )
             connection.execute(
                 "UPDATE ideas SET status = ?, updated_at = ? WHERE id = ?",
-                (
-                    "CONTRACT_COMPILED" if gate_result.passed else "GATE_FAILED",
-                    now,
-                    idea_id,
-                ),
+                (idea_status, now, idea_id),
             )
             self.store.append_event(
                 "FIRST_PRINCIPLES_GATE_EVALUATED",
@@ -408,6 +766,8 @@ class CompanyOS:
                 aggregate_id=contract_id,
                 payload={
                     "passed": gate_result.passed,
+                    "gate_status": gate_status,
+                    "min_decision_level": min_decision_level,
                     "violations": [
                         {"code": v.code, "field": v.field, "message": v.message}
                         for v in gate_result.violations
@@ -415,19 +775,25 @@ class CompanyOS:
                 },
                 connection=connection,
             )
+            if resolved:
+                self.store.append_event(
+                    "COUNCIL_CONFLICT_RESOLVED",
+                    aggregate_type="Idea",
+                    aggregate_id=idea_id,
+                    payload={"contract_id": contract_id},
+                    connection=connection,
+                )
             return {"contract_id": contract_id}
 
         try:
             result = self.store.run_idempotent(
-                idempotency_key, "compile_council", command_payload, operation
+                idempotency_key, command, command_payload, operation
             )
         except IdempotencyConflict as exc:
             raise ConflictError(str(exc)) from exc
-        contract_id = str(result["contract_id"])
-        stored_contract = json.loads(self._row("contracts", contract_id)["payload_json"])
         return CompileOutcome(
-            contract_id=contract_id,
-            gate_result=self.gate.validate(stored_contract),
+            contract_id=str(result["contract_id"]),
+            gate_result=gate_result,
         )
 
     def record_approval_and_scaffold(
@@ -439,7 +805,7 @@ class CompanyOS:
     ) -> Venture:
         contract_row = self._row("contracts", contract_id)
         contract = json.loads(contract_row["payload_json"])
-        if contract_row["gate_status"] != "PASSED":
+        if contract_row["gate_status"] not in {"PASSED", "PENDING_APPROVAL"}:
             raise ValidationError("A Venture cannot be created before the Gate passes")
         normalized_approval = approval_status.strip().upper()
         if normalized_approval not in {"APPROVED", "NOT_REQUIRED"}:
@@ -451,6 +817,7 @@ class CompanyOS:
             "contract_id": contract_id,
             "approval_status": normalized_approval,
         }
+        staged_paths: list[Path] = []
 
         def operation(connection: sqlite3.Connection) -> dict[str, str]:
             venture_id = new_id("venture")
@@ -462,43 +829,89 @@ class CompanyOS:
             now = utc_now()
 
             workspace = self.venture_workspace(venture_id)
+            staging_workspace = contained_path(
+                self.root,
+                "var",
+                "ventures",
+                ".staging",
+                venture_id,
+            )
+            staged_paths.append(staging_workspace)
             manifest_path = workspace / "context_manifest.json"
+            staging_manifest_path = staging_workspace / "context_manifest.json"
             verifier_path = workspace / "work_orders" / work_order_id / "verifier.json"
+            staging_verifier_path = (
+                staging_workspace / "work_orders" / work_order_id / "verifier.json"
+            )
             artifact_relative_path = "artifacts/verified_result.txt"
             expected_content = f"synthetic verified evidence for {idea_id}\n"
             approved_verifier_hash = write_exact_text_verifier(
-                verifier_path,
+                staging_verifier_path,
                 artifact_relative_path=artifact_relative_path,
                 expected_content=expected_content,
+                contract_binding={
+                    "metric": contract["metric"],
+                    "experiment": contract["cheapest_valid_experiment"],
+                    "pass_condition": contract["pass_condition"],
+                    "fail_condition": contract["fail_condition"],
+                },
             )
 
-            assumption_claims = [
-                claim
-                for claim in contract.get("claims", [])
-                if claim.get("type") == "ASSUMPTION"
+            assumption_claims: list[dict[str, Any]] = []
+            for claim in contract.get("claims", []):
+                if isinstance(claim, dict) and claim.get("type") == "ASSUMPTION":
+                    assumption_claims.append(claim)
+            for claim in contract.get("assumptions", []):
+                if isinstance(claim, dict):
+                    assumption_claims.append(claim)
+
+            assumptions_by_external_ref: dict[str, dict[str, Any]] = {}
+            for claim in assumption_claims:
+                external_ref = str(claim.get("id", claim.get("claim_id", ""))).strip()
+                if not external_ref:
+                    raise ValidationError("Every persisted assumption requires an id")
+                prior = assumptions_by_external_ref.get(external_ref)
+                if prior is not None and prior != claim:
+                    raise ValidationError(
+                        f"Conflicting duplicate assumption id: {external_ref}"
+                    )
+                assumptions_by_external_ref[external_ref] = claim
+            assumption_records = [
+                (new_id("assumption"), external_ref, claim)
+                for external_ref, claim in assumptions_by_external_ref.items()
             ]
-            assumption_ids = [str(item["id"]) for item in assumption_claims]
-            source_fact = next(
-                (
-                    claim
-                    for claim in contract.get("claims", [])
-                    if claim.get("type") == "FACT"
-                ),
-                None,
-            )
-            source_evidence_id = (
-                str(source_fact["evidence_refs"][0])
-                if source_fact and source_fact.get("evidence_refs")
-                else new_id("source_evidence")
-            )
-            source_response = contained_path(
-                self.root,
-                "var",
-                "handoffs",
-                "council",
-                idea_id,
-                "cto_response.json",
-            )
+            assumption_ids = [item[0] for item in assumption_records]
+            idea_evidence_rows = connection.execute(
+                """
+                SELECT * FROM evidence
+                WHERE idea_id = ?
+                ORDER BY created_at, id
+                """,
+                (idea_id,),
+            ).fetchall()
+            venture_evidence_records: list[dict[str, Any]] = []
+            for row in idea_evidence_rows:
+                evidence_payload = json.loads(row["payload_json"])
+                evidence_payload["origin_evidence_id"] = row["id"]
+                venture_evidence_records.append(
+                    {
+                        "id": new_id("evidence"),
+                        "idea_id": None,
+                        "venture_id": venture_id,
+                        "work_order_id": None,
+                        "run_id": None,
+                        "external_ref": row["external_ref"],
+                        "kind": row["kind"],
+                        "path": row["path"],
+                        "sha256": row["sha256"],
+                        "trusted": row["trusted"],
+                        "payload_json": self._json(evidence_payload),
+                        "created_at": now,
+                    }
+                )
+            trusted_venture_evidence = [
+                item for item in venture_evidence_records if item["trusted"] == 1
+            ]
 
             manifest = {
                 "schema_version": 1,
@@ -508,15 +921,76 @@ class CompanyOS:
                 "decision_level": contract["decision_level"],
                 "approval_status": normalized_approval,
                 "assumption_ids": assumption_ids,
+                "assumption_external_refs": {
+                    internal_id: external_ref
+                    for internal_id, external_ref, _ in assumption_records
+                },
                 "metric_ids": [metric_id],
                 "experiment_ids": [experiment_id],
                 "decision_ids": [decision_id],
                 "work_order_ids": [work_order_id],
-                "source_evidence_ids": [source_evidence_id],
-                "workspace_policy": "VENTURE_ONLY",
+                "source_evidence_ids": [
+                    item["id"] for item in trusted_venture_evidence
+                ],
+                "source_evidence_external_refs": [
+                    str(item["external_ref"])
+                    for item in trusted_venture_evidence
+                    if item["external_ref"]
+                ],
+                "workspace_policy": "LOGICAL_NAMESPACE_ONLY",
+                "isolation_mode": "LOGICAL_NAMESPACE_ONLY",
+                "security_boundary": False,
                 "created_at": now,
             }
-            atomic_write_json(manifest_path, manifest)
+            atomic_write_json(staging_manifest_path, manifest)
+
+            self.store.insert_row(
+                "approvals",
+                {
+                    "id": approval_id,
+                    "contract_id": contract_id,
+                    "decision_id": None,
+                    "status": normalized_approval,
+                    "actor": (
+                        "CEO" if normalized_approval == "APPROVED" else "SYSTEM_POLICY"
+                    ),
+                    "payload_json": self._json(
+                        {
+                            "decision_level": contract["decision_level"],
+                            "explicit_ceo_approval": normalized_approval == "APPROVED",
+                        }
+                    ),
+                    "created_at": now,
+                },
+                connection=connection,
+            )
+            ceo_approved = (
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM approvals
+                    WHERE contract_id = ? AND status = 'APPROVED' AND actor = 'CEO'
+                    """,
+                    (contract_id,),
+                ).fetchone()[0]
+                > 0
+            )
+            gate_result = self.gate.validate(
+                contract,
+                min_decision_level=contract_row["min_decision_level"],
+                trusted_evidence_refs=self._trusted_evidence_refs(
+                    idea_id, connection=connection
+                ),
+                ceo_approved=ceo_approved,
+            )
+            if not gate_result.passed:
+                codes = ", ".join(item.code for item in gate_result.violations)
+                raise ValidationError(
+                    f"A Venture cannot be created before the Gate passes: {codes}"
+                )
+            connection.execute(
+                "UPDATE contracts SET gate_status = 'PASSED', updated_at = ? WHERE id = ?",
+                (now, contract_id),
+            )
 
             self.store.insert_row(
                 "ventures",
@@ -528,20 +1002,30 @@ class CompanyOS:
                     "workspace_path": self._relative(workspace),
                     "context_manifest_path": self._relative(manifest_path),
                     "metadata_json": self._json(
-                        {"context_isolation": "VENTURE_ONLY"}
+                        {
+                            "context_isolation": "LOGICAL_NAMESPACE_ONLY",
+                            "security_boundary": False,
+                        }
                     ),
                     "created_at": now,
                     "updated_at": now,
                 },
                 connection=connection,
             )
-            for claim in assumption_claims:
+            for evidence_record in venture_evidence_records:
+                self.store.insert_row(
+                    "evidence",
+                    evidence_record,
+                    connection=connection,
+                )
+            for assumption_id, external_ref, claim in assumption_records:
                 self.store.insert_row(
                     "assumptions",
                     {
-                        "id": str(claim["id"]),
+                        "id": assumption_id,
                         "venture_id": venture_id,
                         "contract_id": contract_id,
+                        "external_ref": external_ref,
                         "statement": str(claim["statement"]),
                         "status": "UNTESTED",
                         "classification": "ASSUMPTION",
@@ -593,6 +1077,8 @@ class CompanyOS:
                     "fail_condition": contract["fail_condition"],
                 },
                 "execution_mode": "manual_or_port",
+                "verification_scope": "SYNTHETIC_ONLY",
+                "verifier_semantics": "EXACT_TEXT_FIXTURE_ONLY",
             }
             self.store.insert_row(
                 "work_orders",
@@ -630,49 +1116,6 @@ class CompanyOS:
                 },
                 connection=connection,
             )
-            self.store.insert_row(
-                "approvals",
-                {
-                    "id": approval_id,
-                    "contract_id": contract_id,
-                    "decision_id": None,
-                    "status": normalized_approval,
-                    "actor": "CEO" if normalized_approval == "APPROVED" else "SYSTEM_POLICY",
-                    "payload_json": self._json(
-                        {
-                            "decision_level": contract["decision_level"],
-                            "explicit_ceo_approval": normalized_approval == "APPROVED",
-                        }
-                    ),
-                    "created_at": now,
-                },
-                connection=connection,
-            )
-            if source_response.is_file():
-                self.store.insert_row(
-                    "evidence",
-                    {
-                        "id": source_evidence_id,
-                        "venture_id": venture_id,
-                        "work_order_id": None,
-                        "run_id": None,
-                        "kind": "SOURCE_EVIDENCE",
-                        "path": self._relative(source_response),
-                        "sha256": sha256_file(source_response),
-                        "payload_json": self._json(
-                            {
-                                "trusted": True,
-                                "source_types": (
-                                    source_fact.get("source_types", [])
-                                    if source_fact
-                                    else []
-                                ),
-                            }
-                        ),
-                        "created_at": now,
-                    },
-                    connection=connection,
-                )
             connection.execute(
                 "UPDATE ideas SET status = 'VENTURE_CREATED', updated_at = ? WHERE id = ?",
                 (now, idea_id),
@@ -697,7 +1140,10 @@ class CompanyOS:
                 },
                 connection=connection,
             )
-            return {"venture_id": venture_id}
+            return {
+                "venture_id": venture_id,
+                "staging_workspace": self._relative(staging_workspace),
+            }
 
         try:
             result = self.store.run_idempotent(
@@ -707,8 +1153,69 @@ class CompanyOS:
                 operation,
             )
         except IdempotencyConflict as exc:
+            for path in staged_paths:
+                if path.exists():
+                    shutil.rmtree(path)
             raise ConflictError(str(exc)) from exc
-        return self.venture(str(result["venture_id"]))
+        except BaseException:
+            for path in staged_paths:
+                if path.exists():
+                    shutil.rmtree(path)
+            raise
+        venture_id = str(result["venture_id"])
+        workspace = self.venture_workspace(venture_id)
+        staging_relative = result.get("staging_workspace")
+        staging_workspace = (
+            self._absolute(str(staging_relative))
+            if staging_relative
+            else contained_path(
+                self.root, "var", "ventures", ".staging", venture_id
+            )
+        )
+        if not workspace.exists():
+            try:
+                workspace.parent.mkdir(parents=True, exist_ok=True)
+                staging_workspace.replace(workspace)
+            except OSError as exc:
+                with self.store.transaction() as connection:
+                    connection.execute(
+                        "UPDATE ventures SET status = 'SCAFFOLD_FAILED', updated_at = ? "
+                        "WHERE id = ?",
+                        (utc_now(), venture_id),
+                    )
+                    self.store.append_event(
+                        "VENTURE_SCAFFOLD_PROMOTION_FAILED",
+                        aggregate_type="Venture",
+                        aggregate_id=venture_id,
+                        venture_id=venture_id,
+                        payload={"error": type(exc).__name__},
+                        connection=connection,
+                    )
+                raise ValidationError(
+                    "Venture workspace could not be promoted from staging"
+                ) from exc
+        elif staging_workspace.exists():
+            shutil.rmtree(staging_workspace)
+        staging_root = staging_workspace.parent
+        if staging_root.is_dir() and not any(staging_root.iterdir()):
+            staging_root.rmdir()
+        current_venture = self.venture(venture_id)
+        if current_venture.status == "SCAFFOLD_FAILED":
+            with self.store.transaction() as connection:
+                recovered_at = utc_now()
+                connection.execute(
+                    "UPDATE ventures SET status = 'ACTIVE', updated_at = ? WHERE id = ?",
+                    (recovered_at, venture_id),
+                )
+                self.store.append_event(
+                    "VENTURE_SCAFFOLD_PROMOTION_RECOVERED",
+                    aggregate_type="Venture",
+                    aggregate_id=venture_id,
+                    venture_id=venture_id,
+                    payload={"workspace_path": self._relative(workspace)},
+                    connection=connection,
+                )
+        return self.venture(venture_id)
 
     def venture_workspace(self, venture_id: str) -> Path:
         if not _VENTURE_ID.fullmatch(venture_id):
@@ -757,8 +1264,38 @@ class CompanyOS:
         *,
         executor: ExecutorPort,
         idempotency_key: str,
-        _repair_mode: bool = False,
     ) -> Run:
+        """Execute an ordinary WorkOrder.
+
+        Repair execution is deliberately unavailable through this public
+        entrypoint because it requires a validated required-change manifest.
+        """
+
+        return self._execute_work_order(
+            work_order_id,
+            executor=executor,
+            idempotency_key=idempotency_key,
+        )
+
+    def _execute_work_order(
+        self,
+        work_order_id: str,
+        *,
+        executor: ExecutorPort,
+        idempotency_key: str,
+        _repair_mode: bool = False,
+        _repair_manifest: dict[str, Any] | None = None,
+    ) -> Run:
+        if _repair_mode:
+            if _repair_manifest is None:
+                raise ValidationError("Repair execution requires a repair manifest")
+            # The execution boundary validates again even when its caller is an
+            # internal helper.  A leading underscore is not an authorization
+            # boundary in Python and must not weaken repair invariants.
+            _repair_manifest = self._validate_repair_manifest(
+                work_order_id,
+                _repair_manifest,
+            )
         if self.is_stopped():
             raise CompanyStoppedError("Company execution is stopped; run company resume")
         work_order = self.work_order(work_order_id)
@@ -779,6 +1316,9 @@ class CompanyOS:
             "executor": executor.name,
             "approved_verifier_hash": work_order.verifier_hash,
             "repair_mode": _repair_mode,
+            "repair_manifest_hash": (
+                payload_hash(_repair_manifest) if _repair_manifest is not None else None
+            ),
         }
 
         def operation(connection: sqlite3.Connection) -> dict[str, str]:
@@ -885,6 +1425,7 @@ class CompanyOS:
                             "attempt": attempt,
                             "verifier_output_path": self._relative(verifier_output_path),
                             "verification": verifier_payload,
+                            "repair_manifest": _repair_manifest,
                         }
                     ),
                     "started_at": now,
@@ -894,6 +1435,16 @@ class CompanyOS:
                 connection=connection,
             )
             artifact_sha = sha256_file(artifact)
+            artifact_evidence_path = contained_path(
+                venture.workspace_path,
+                "runs",
+                run_id,
+                "artifact_snapshot",
+                artifact.name,
+            )
+            artifact_evidence_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(artifact, artifact_evidence_path)
+            artifact_evidence_sha = sha256_file(artifact_evidence_path)
             connection.execute(
                 """
                 INSERT INTO artifacts(
@@ -916,41 +1467,58 @@ class CompanyOS:
                     self._relative(artifact),
                     artifact_sha,
                     "text/plain",
-                    self._json({"synthetic": True}),
+                    self._json(
+                        {
+                            "synthetic": True,
+                            "verification_scope": "SYNTHETIC_ONLY",
+                        }
+                    ),
                     finished,
                 ),
             )
+            run_evidence_ids: list[str] = []
             for kind, path, digest in (
-                ("RUN_ARTIFACT", artifact, artifact_sha),
+                (
+                    "RUN_ARTIFACT",
+                    artifact_evidence_path,
+                    artifact_evidence_sha,
+                ),
                 (
                     "VERIFIER_OUTPUT",
                     verifier_output_path,
                     sha256_file(verifier_output_path),
                 ),
             ):
+                evidence_id = new_id("evidence")
                 self.store.insert_row(
                     "evidence",
                     {
-                        "id": new_id("evidence"),
+                        "id": evidence_id,
+                        "idea_id": None,
                         "venture_id": venture.id,
                         "work_order_id": work_order_id,
                         "run_id": run_id,
+                        "external_ref": None,
                         "kind": kind,
                         "path": self._relative(path),
                         "sha256": digest,
+                        "trusted": 1,
                         "payload_json": self._json(
                             {
                                 "trusted": True,
                                 "verification_status": verification.status,
+                                "verification_scope": "SYNTHETIC_ONLY",
+                                "verifier_semantics": "EXACT_TEXT_FIXTURE_ONLY",
                             }
                         ),
                         "created_at": finished,
                     },
                     connection=connection,
                 )
+                run_evidence_ids.append(evidence_id)
             if _repair_mode:
                 next_work_status = (
-                    "REPAIRED_VERIFIED"
+                    "AWAITING_REREVIEW"
                     if verification.status == "PASS"
                     else "REPAIR_REQUIRED"
                 )
@@ -965,16 +1533,64 @@ class CompanyOS:
                 (next_work_status, finished, work_order_id),
             )
             if _repair_mode and verification.status == "PASS":
+                if _repair_manifest is None:
+                    raise ValidationError("Repair PASS requires a repair manifest")
+                for change in _repair_manifest["changes"]:
+                    canonical_evidence_ids = self._canonical_repair_evidence_ids(
+                        work_order_id,
+                        change["evidence_ids"],
+                        connection=connection,
+                    )
+                    self.store.insert_row(
+                        "review_change_resolutions",
+                        {
+                            "id": new_id("change_resolution"),
+                            "review_id": _repair_manifest["review_id"],
+                            "required_change_id": change["id"],
+                            "repair_run_id": run_id,
+                            "source_commit": change["commit"],
+                            "source_tree_sha256": _repair_manifest[
+                                "source_tree_sha256"
+                            ],
+                            "evidence_json": self._json(
+                                sorted(
+                                    set(canonical_evidence_ids + run_evidence_ids)
+                                )
+                            ),
+                            "created_at": finished,
+                        },
+                        connection=connection,
+                    )
                 connection.execute(
                     """
-                    UPDATE reviews SET status = 'CHANGES_APPLIED', updated_at = ?
-                    WHERE id = (
-                        SELECT id FROM reviews WHERE work_order_id = ?
-                        ORDER BY created_at DESC LIMIT 1
+                    UPDATE review_required_changes
+                    SET status = 'SUBMITTED', updated_at = ?
+                    WHERE review_id = ? AND change_id IN (
+                        SELECT required_change_id
+                        FROM review_change_resolutions
+                        WHERE review_id = ? AND repair_run_id = ?
                     )
                     """,
-                    (finished, work_order_id),
+                    (
+                        finished,
+                        _repair_manifest["review_id"],
+                        _repair_manifest["review_id"],
+                        run_id,
+                    ),
                 )
+                submitted_count = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM review_required_changes
+                        WHERE review_id = ? AND status = 'SUBMITTED'
+                        """,
+                        (_repair_manifest["review_id"],),
+                    ).fetchone()[0]
+                )
+                if submitted_count != len(_repair_manifest["changes"]):
+                    raise ValidationError(
+                        "Repair resolutions do not match required_change records"
+                    )
             self.store.append_event(
                 "WORK_ORDER_VERIFIED",
                 aggregate_type="WorkOrder",
@@ -985,6 +1601,7 @@ class CompanyOS:
                     "status": verification.status,
                     "attempt": attempt,
                     "artifact_sha256": artifact_sha,
+                    "verification_scope": "SYNTHETIC_ONLY",
                 },
                 connection=connection,
             )
@@ -1053,12 +1670,15 @@ class CompanyOS:
             "evidence",
             {
                 "id": new_id("evidence"),
+                "idea_id": None,
                 "venture_id": venture.id,
                 "work_order_id": work_order.id,
                 "run_id": run_id,
+                "external_ref": None,
                 "kind": "UNTRUSTED_ARTIFACT" if artifact_path else "TAMPERED_VERIFIER",
                 "path": self._relative(evidence_path),
                 "sha256": evidence_digest,
+                "trusted": 0,
                 "payload_json": self._json(
                     {"trusted": False, "reason": "VERIFIER_TAMPER_DETECTED"}
                 ),
@@ -1122,12 +1742,15 @@ class CompanyOS:
             "evidence",
             {
                 "id": new_id("evidence"),
+                "idea_id": None,
                 "venture_id": venture.id,
                 "work_order_id": work_order.id,
                 "run_id": run_id,
+                "external_ref": None,
                 "kind": "UNTRUSTED_ARTIFACT",
                 "path": self._relative(artifact_path),
                 "sha256": sha256_file(artifact_path) if artifact_path.is_file() else None,
+                "trusted": 0,
                 "payload_json": self._json(
                     {
                         "trusted": False,
@@ -1242,13 +1865,594 @@ class CompanyOS:
             }
         return None
 
+    def _review_materials(
+        self,
+        work_order_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> tuple[sqlite3.Row | None, list[sqlite3.Row], list[sqlite3.Row]]:
+        conn = connection or self.store.connection
+        latest_run = conn.execute(
+            """
+            SELECT * FROM runs
+            WHERE work_order_id = ? AND status = 'PASS'
+            ORDER BY created_at DESC, id DESC LIMIT 1
+            """,
+            (work_order_id,),
+        ).fetchone()
+        if latest_run is None:
+            return None, [], []
+        evidence_rows = list(
+            conn.execute(
+                """
+                SELECT id, kind, path, sha256 FROM evidence
+                WHERE run_id = ? ORDER BY id
+                """,
+                (latest_run["id"],),
+            ).fetchall()
+        )
+        artifact_rows = list(
+            conn.execute(
+                """
+                SELECT id, path, sha256, media_type FROM artifacts
+                WHERE run_id = ? ORDER BY id
+                """,
+                (latest_run["id"],),
+            ).fetchall()
+        )
+        return latest_run, evidence_rows, artifact_rows
+
+    def _review_integrity_issues(
+        self,
+        latest_run: sqlite3.Row,
+        evidence_rows: Iterable[sqlite3.Row],
+        artifact_rows: Iterable[sqlite3.Row],
+    ) -> list[dict[str, Any]]:
+        evidence_items = list(evidence_rows)
+        artifact_items = list(artifact_rows)
+        issues: list[dict[str, Any]] = []
+        if not evidence_items:
+            issues.append(
+                {
+                    "source_table": "evidence",
+                    "record_id": latest_run["id"],
+                    "path": None,
+                    "expected_sha256": None,
+                    "observed_sha256": None,
+                    "reason": "METADATA_MISSING",
+                }
+            )
+        if not artifact_items:
+            issues.append(
+                {
+                    "source_table": "artifacts",
+                    "record_id": latest_run["id"],
+                    "path": None,
+                    "expected_sha256": None,
+                    "observed_sha256": None,
+                    "reason": "METADATA_MISSING",
+                }
+            )
+        for source_table, rows in (
+            ("evidence", evidence_items),
+            ("artifacts", artifact_items),
+        ):
+            for row in rows:
+                issue = self._file_integrity_issue(
+                    source_table=source_table,
+                    record_id=str(row["id"]),
+                    stored_path=row["path"],
+                    expected_sha256=row["sha256"],
+                )
+                if issue is not None:
+                    issues.append(issue)
+        return issues
+
+    def _bound_review_material_issues(
+        self,
+        review_row: sqlite3.Row,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> list[dict[str, Any]]:
+        """Revalidate the exact PASS Run bound into a ReviewRequest."""
+
+        latest_run, evidence_rows, artifact_rows = self._review_materials(
+            str(review_row["work_order_id"]),
+            connection=connection,
+        )
+        if latest_run is None or latest_run["id"] != review_row["run_id"]:
+            return [
+                {
+                    "source_table": "runs",
+                    "record_id": str(review_row["run_id"]),
+                    "path": None,
+                    "expected_sha256": None,
+                    "observed_sha256": None,
+                    "reason": "BOUND_RUN_MISSING_OR_NOT_LATEST",
+                }
+            ]
+        return self._review_integrity_issues(
+            latest_run,
+            evidence_rows,
+            artifact_rows,
+        )
+
+    def _review_resolution_integrity_issues(
+        self,
+        review_row: sqlite3.Row,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> list[dict[str, Any]]:
+        """Rehash every canonical Evidence record cited by repair lineage."""
+
+        payload = json.loads(review_row["payload_json"])
+        request = payload.get("request")
+        if not isinstance(request, dict):
+            return []
+        resolutions = request.get("change_resolutions", [])
+        if not isinstance(resolutions, list):
+            return [
+                {
+                    "source_table": "review_change_resolutions",
+                    "record_id": str(review_row["id"]),
+                    "path": None,
+                    "expected_sha256": None,
+                    "observed_sha256": None,
+                    "reason": "RESOLUTION_STRUCTURE_INVALID",
+                }
+            ]
+        evidence_ids: set[str] = set()
+        for resolution in resolutions:
+            if not isinstance(resolution, dict) or not isinstance(
+                resolution.get("evidence_ids"), list
+            ):
+                return [
+                    {
+                        "source_table": "review_change_resolutions",
+                        "record_id": str(review_row["id"]),
+                        "path": None,
+                        "expected_sha256": None,
+                        "observed_sha256": None,
+                        "reason": "RESOLUTION_STRUCTURE_INVALID",
+                    }
+                ]
+            evidence_ids.update(str(item) for item in resolution["evidence_ids"])
+        if not evidence_ids:
+            return []
+        try:
+            self._canonical_repair_evidence_ids(
+                str(review_row["work_order_id"]),
+                sorted(evidence_ids),
+                connection=connection,
+            )
+        except ValidationError as exc:
+            return [
+                {
+                    "source_table": "review_change_resolutions",
+                    "record_id": str(review_row["id"]),
+                    "path": None,
+                    "expected_sha256": None,
+                    "observed_sha256": None,
+                    "reason": "RESOLUTION_EVIDENCE_INVALID",
+                    "message": str(exc),
+                }
+            ]
+        return []
+
+    def _review_attachment_integrity_issues(
+        self,
+        request: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        for collection_name in ("artifacts", "evidence"):
+            collection = request.get(collection_name, [])
+            if not isinstance(collection, list):
+                continue
+            for item in collection:
+                if not isinstance(item, dict) or item.get("inline") is not False:
+                    continue
+                issue = self._file_integrity_issue(
+                    source_table="review_attachment",
+                    record_id=str(item.get("id", "unknown")),
+                    stored_path=item.get("attachment_path"),
+                    expected_sha256=item.get("attachment_sha256"),
+                )
+                if issue is not None:
+                    issues.append(issue)
+        return issues
+
+    @staticmethod
+    def _expected_review_markdown_sha256(
+        stored_payload: dict[str, Any],
+    ) -> str | None:
+        """Derive the Markdown digest from canonical DB-owned request data.
+
+        Derivation provides a safe compatibility path for reviews created
+        before ``request_markdown_sha256`` was persisted.  The current file is
+        never used as the source of the expected digest.
+        """
+
+        request = stored_payload.get("request")
+        if not isinstance(request, dict):
+            return None
+        stored = stored_payload.get("request_markdown_sha256")
+        if isinstance(stored, str) and stored:
+            return stored
+        rendered = review_request_markdown(request).encode("utf-8")
+        return sha256(rendered).hexdigest()
+
+    def _review_request_integrity_issues(
+        self,
+        review_row: sqlite3.Row,
+    ) -> list[dict[str, Any]]:
+        """Validate both ReviewRequest representations and attachments."""
+
+        review_id = str(review_row["id"])
+        try:
+            stored_payload = json.loads(review_row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            return [
+                {
+                    "source_table": "review_request",
+                    "record_id": review_id,
+                    "path": None,
+                    "reason": "CANONICAL_PAYLOAD_INVALID",
+                }
+            ]
+        if not isinstance(stored_payload, dict):
+            return [
+                {
+                    "source_table": "review_request",
+                    "record_id": review_id,
+                    "path": None,
+                    "reason": "CANONICAL_PAYLOAD_INVALID",
+                }
+            ]
+
+        issues: list[dict[str, Any]] = []
+        json_stored_path = review_row["request_json_path"]
+        expected_json_sha = stored_payload.get("request_json_sha256")
+        json_issue = self._file_integrity_issue(
+            source_table="review_request",
+            record_id=review_id,
+            stored_path=json_stored_path,
+            expected_sha256=expected_json_sha,
+        )
+        if json_issue is not None:
+            issues.append(json_issue)
+
+        actual_request: Any = None
+        try:
+            actual_request = read_json(self._absolute(json_stored_path))
+        except (OSError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+            issues.append(
+                {
+                    "source_table": "review_request",
+                    "record_id": review_id,
+                    "path": json_stored_path,
+                    "reason": "INVALID_JSON",
+                }
+            )
+        if isinstance(actual_request, dict):
+            embedded_hash = actual_request.get("review_request_hash")
+            request_core = dict(actual_request)
+            request_core.pop("review_request_hash", None)
+            observed_payload_hash = payload_hash(request_core)
+            expected_payload_hash = stored_payload.get("request_hash")
+            if (
+                embedded_hash != expected_payload_hash
+                or observed_payload_hash != expected_payload_hash
+                or actual_request != stored_payload.get("request")
+            ):
+                issues.append(
+                    {
+                        "source_table": "review_request",
+                        "record_id": review_id,
+                        "path": json_stored_path,
+                        "expected_payload_hash": expected_payload_hash,
+                        "embedded_payload_hash": embedded_hash,
+                        "observed_payload_hash": observed_payload_hash,
+                        "reason": "PAYLOAD_HASH_MISMATCH",
+                    }
+                )
+            issues.extend(
+                self._review_attachment_integrity_issues(actual_request)
+            )
+        elif actual_request is not None:
+            issues.append(
+                {
+                    "source_table": "review_request",
+                    "record_id": review_id,
+                    "path": json_stored_path,
+                    "reason": "REQUEST_NOT_OBJECT",
+                }
+            )
+
+        canonical_request = stored_payload.get("request")
+        candidate_markdown_hashes: set[str] = set()
+        if isinstance(canonical_request, dict):
+            candidate_markdown_hashes.add(
+                sha256(
+                    review_request_markdown(canonical_request).encode("utf-8")
+                ).hexdigest()
+            )
+        # Compatibility for ReviewRequests emitted before the renderer became
+        # key-sorted.  The legacy candidate is derived only from the separately
+        # hash-bound JSON file, never from the Markdown file under inspection.
+        if (
+            isinstance(actual_request, dict)
+            and actual_request == canonical_request
+        ):
+            candidate_markdown_hashes.add(
+                sha256(
+                    markdown_document(
+                        REVIEW_REQUEST_TITLE,
+                        actual_request,
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+        stored_markdown_sha = stored_payload.get("request_markdown_sha256")
+        if stored_markdown_sha is not None and (
+            not isinstance(stored_markdown_sha, str)
+            or stored_markdown_sha not in candidate_markdown_hashes
+        ):
+            issues.append(
+                {
+                    "source_table": "review_request",
+                    "record_id": review_id,
+                    "path": review_row["request_markdown_path"],
+                    "expected_sha256": sorted(candidate_markdown_hashes),
+                    "observed_sha256": stored_markdown_sha,
+                    "reason": "STORED_SHA256_MISMATCH",
+                }
+            )
+        accepted_markdown_hashes = (
+            {stored_markdown_sha}
+            if isinstance(stored_markdown_sha, str)
+            and stored_markdown_sha in candidate_markdown_hashes
+            else candidate_markdown_hashes
+        )
+        try:
+            observed_markdown_sha = sha256_file(
+                self._absolute(review_row["request_markdown_path"])
+            )
+        except (OSError, TypeError, ValueError):
+            observed_markdown_sha = None
+        if (
+            observed_markdown_sha is None
+            or observed_markdown_sha not in accepted_markdown_hashes
+        ):
+            issues.append(
+                {
+                    "source_table": "review_request",
+                    "record_id": review_id,
+                    "path": review_row["request_markdown_path"],
+                    "expected_sha256": sorted(accepted_markdown_hashes),
+                    "observed_sha256": observed_markdown_sha,
+                    "reason": (
+                        "FILE_UNREADABLE"
+                        if observed_markdown_sha is None
+                        else "SHA256_MISMATCH"
+                    ),
+                }
+            )
+        return issues
+
+    @staticmethod
+    def _review_lineage(
+        connection: sqlite3.Connection,
+        *,
+        start_review_id: str,
+        work_order_id: str,
+    ) -> list[sqlite3.Row]:
+        """Return direct parent then ancestors, rejecting cycles/cross-work links."""
+
+        lineage: list[sqlite3.Row] = []
+        seen: set[str] = set()
+        current_id: str | None = start_review_id
+        while current_id is not None:
+            if current_id in seen:
+                raise ValidationError("Review parent lineage contains a cycle")
+            seen.add(current_id)
+            row = connection.execute(
+                "SELECT id, work_order_id, run_id, parent_review_id, status "
+                "FROM reviews WHERE id = ?",
+                (current_id,),
+            ).fetchone()
+            if row is None or row["work_order_id"] != work_order_id:
+                raise ValidationError("Review parent lineage is invalid")
+            lineage.append(row)
+            current_id = (
+                str(row["parent_review_id"])
+                if row["parent_review_id"] is not None
+                else None
+            )
+        return lineage
+
+    def _record_review_integrity_failure(
+        self,
+        *,
+        work_order_id: str,
+        venture_id: str,
+        run_id: str,
+        issues: list[dict[str, Any]],
+    ) -> None:
+        now = utc_now()
+        with self.store.transaction() as connection:
+            self.store.append_event(
+                "REVIEW_INPUT_TAMPER_DETECTED",
+                aggregate_type="WorkOrder",
+                aggregate_id=work_order_id,
+                venture_id=venture_id,
+                payload={
+                    "run_id": run_id,
+                    "source_table": issues[0]["source_table"],
+                    "issues": issues,
+                    "detected_at": now,
+                },
+                connection=connection,
+            )
+
+    def _refresh_waiting_review(self, work_order_id: str) -> Review:
+        """Reuse a current ReviewRequest or supersede and safely reissue it."""
+
+        source_snapshot = self._source_snapshot()
+        replacement_state: str | None = None
+        superseded_review_id: str | None = None
+        with self.store.transaction() as connection:
+            work_row = connection.execute(
+                "SELECT * FROM work_orders WHERE id = ?",
+                (work_order_id,),
+            ).fetchone()
+            if work_row is None:
+                raise NotFoundError(f"WorkOrder not found: {work_order_id}")
+            waiting_row = connection.execute(
+                """
+                SELECT * FROM reviews
+                WHERE work_order_id = ? AND status = 'WAITING_FOR_OPUS'
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (work_order_id,),
+            ).fetchone()
+            if waiting_row is None:
+                raise ValidationError("WAITING_FOR_OPUS has no ReviewRequest")
+            if work_row["status"] != "WAITING_FOR_OPUS":
+                raise ValidationError(
+                    "WorkOrder and Review WAITING_FOR_OPUS state is inconsistent"
+                )
+
+            reason: str | None = None
+            issues: list[dict[str, Any]] = []
+            if (
+                int(waiting_row["schema_version"]) < 2
+                or waiting_row["binding_status"] != "BOUND"
+            ):
+                reason = "LEGACY_UNBOUND"
+            elif (
+                waiting_row["source_commit"] != source_snapshot.source_commit
+                or waiting_row["source_tree_sha256"]
+                != source_snapshot.source_tree_sha256
+            ):
+                reason = "SOURCE_CHANGED"
+            else:
+                issues.extend(
+                    self._review_request_integrity_issues(waiting_row)
+                )
+                issues.extend(
+                    self._bound_review_material_issues(
+                        waiting_row,
+                        connection=connection,
+                    )
+                )
+                issues.extend(
+                    self._review_resolution_integrity_issues(
+                        waiting_row,
+                        connection=connection,
+                    )
+                )
+                if issues:
+                    reason = "BOUND_INPUT_CHANGED"
+
+            if reason is None:
+                return self.review(str(waiting_row["id"]))
+
+            superseded_review_id = str(waiting_row["id"])
+            has_parent = waiting_row["parent_review_id"] is not None
+            replacement_state = "AWAITING_REREVIEW" if has_parent else "VERIFIED"
+            if has_parent and reason == "SOURCE_CHANGED":
+                # A new commit after a repair is not covered by the submitted
+                # change resolutions. Reopen the direct parent's changes and
+                # require a new repair manifest rather than silently carrying
+                # old remediation claims onto different source.
+                replacement_state = "REPAIR_REQUIRED"
+                connection.execute(
+                    """
+                    UPDATE review_required_changes
+                    SET status = 'OPEN', verified_by_review_id = NULL,
+                        updated_at = ?
+                    WHERE review_id = ? AND status = 'SUBMITTED'
+                    """,
+                    (utc_now(), waiting_row["parent_review_id"]),
+                )
+            now = utc_now()
+            connection.execute(
+                "UPDATE reviews SET status = 'SUPERSEDED', updated_at = ? WHERE id = ?",
+                (now, superseded_review_id),
+            )
+            connection.execute(
+                "UPDATE work_orders SET status = ?, updated_at = ? WHERE id = ?",
+                (replacement_state, now, work_order_id),
+            )
+            self.store.append_event(
+                "OPUS_REVIEW_REQUEST_SUPERSEDED",
+                aggregate_type="Review",
+                aggregate_id=superseded_review_id,
+                venture_id=str(work_row["venture_id"]),
+                payload={
+                    "reason": reason,
+                    "issues": issues,
+                    "replacement_work_order_status": replacement_state,
+                    "current_source_commit": source_snapshot.source_commit,
+                    "current_source_tree_sha256": (
+                        source_snapshot.source_tree_sha256
+                    ),
+                },
+                connection=connection,
+            )
+
+        assert superseded_review_id is not None
+        assert replacement_state is not None
+        if replacement_state == "REPAIR_REQUIRED":
+            raise ValidationError(
+                "Source changed after repair; the required changes were reopened "
+                "and a new repair manifest is required"
+            )
+        return self.prepare_review(
+            work_order_id,
+            idempotency_key=(
+                f"review-reissue:{work_order_id}:{superseded_review_id}:"
+                f"{source_snapshot.source_commit}:"
+                f"{source_snapshot.source_tree_sha256}"
+            ),
+        )
+
     def prepare_review(
         self,
         work_order_id: str,
         *,
         idempotency_key: str,
     ) -> Review:
-        command_payload = {"work_order_id": work_order_id}
+        preflight_work = self.work_order(work_order_id)
+        if preflight_work.status == "WAITING_FOR_OPUS":
+            return self._refresh_waiting_review(work_order_id)
+        source_snapshot = self._source_snapshot()
+        if preflight_work.status in {"VERIFIED", "AWAITING_REREVIEW"}:
+            preflight_run, preflight_evidence, preflight_artifacts = (
+                self._review_materials(work_order_id)
+            )
+            if preflight_run is not None:
+                preflight_issues = self._review_integrity_issues(
+                    preflight_run,
+                    preflight_evidence,
+                    preflight_artifacts,
+                )
+                if preflight_issues:
+                    self._record_review_integrity_failure(
+                        work_order_id=work_order_id,
+                        venture_id=preflight_work.venture_id,
+                        run_id=str(preflight_run["id"]),
+                        issues=preflight_issues,
+                    )
+                    raise ValidationError(
+                        "review input integrity check failed; Evidence or Artifact "
+                        "content no longer matches canonical SQLite metadata"
+                    )
+        command_payload = {
+            "work_order_id": work_order_id,
+            "source_commit": source_snapshot.source_commit,
+            "source_tree_sha256": source_snapshot.source_tree_sha256,
+        }
+        created_review_directories: list[Path] = []
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             current_row = connection.execute(
@@ -1274,96 +2478,33 @@ class CompanyOS:
                 return {"review_id": waiting_review["id"]}
             if current_row["status"] == "WAITING_FOR_OPUS":
                 raise ValidationError("WAITING_FOR_OPUS has no ReviewRequest")
-            if current_row["status"] != "VERIFIED":
+            if current_row["status"] not in {"VERIFIED", "AWAITING_REREVIEW"}:
                 raise ValidationError(
                     f"Review cannot be prepared from status {current_row['status']}"
                 )
+            current_source_snapshot = self._source_snapshot()
+            if current_source_snapshot != source_snapshot:
+                raise ValidationError(
+                    "Source snapshot changed while preparing the ReviewRequest"
+                )
 
             current_work = self._work_order_from_row(current_row)
-            latest_run = connection.execute(
-                """
-                SELECT * FROM runs
-                WHERE work_order_id = ? AND status = 'PASS'
-                ORDER BY created_at DESC, id DESC LIMIT 1
-                """,
-                (work_order_id,),
-            ).fetchone()
+            latest_run, evidence_rows, artifact_rows = self._review_materials(
+                work_order_id,
+                connection=connection,
+            )
             if latest_run is None:
                 raise ValidationError("A PASS Run is required before review")
-            evidence_rows = connection.execute(
-                """
-                SELECT id, kind, path, sha256 FROM evidence
-                WHERE run_id = ? ORDER BY id
-                """,
-                (latest_run["id"],),
-            ).fetchall()
-            artifact_rows = connection.execute(
-                """
-                SELECT id, path, sha256 FROM artifacts
-                WHERE run_id = ? ORDER BY id
-                """,
-                (latest_run["id"],),
-            ).fetchall()
-
-            integrity_issues: list[dict[str, Any]] = []
-            if not evidence_rows:
-                integrity_issues.append(
-                    {
-                        "source_table": "evidence",
-                        "record_id": latest_run["id"],
-                        "path": None,
-                        "expected_sha256": None,
-                        "observed_sha256": None,
-                        "reason": "METADATA_MISSING",
-                    }
-                )
-            if not artifact_rows:
-                integrity_issues.append(
-                    {
-                        "source_table": "artifacts",
-                        "record_id": latest_run["id"],
-                        "path": None,
-                        "expected_sha256": None,
-                        "observed_sha256": None,
-                        "reason": "METADATA_MISSING",
-                    }
-                )
-            for source_table, rows in (
-                ("evidence", evidence_rows),
-                ("artifacts", artifact_rows),
-            ):
-                for row in rows:
-                    issue = self._file_integrity_issue(
-                        source_table=source_table,
-                        record_id=str(row["id"]),
-                        stored_path=row["path"],
-                        expected_sha256=row["sha256"],
-                    )
-                    if issue is not None:
-                        integrity_issues.append(issue)
-
+            integrity_issues = self._review_integrity_issues(
+                latest_run,
+                evidence_rows,
+                artifact_rows,
+            )
             if integrity_issues:
-                now = utc_now()
-                self.store.append_event(
-                    "REVIEW_INPUT_TAMPER_DETECTED",
-                    aggregate_type="WorkOrder",
-                    aggregate_id=work_order_id,
-                    venture_id=current_work.venture_id,
-                    payload={
-                        "run_id": latest_run["id"],
-                        "source_table": integrity_issues[0]["source_table"],
-                        "issues": integrity_issues,
-                        "detected_at": now,
-                    },
-                    connection=connection,
+                raise ValidationError(
+                    "review input integrity check failed; Evidence or Artifact "
+                    "content no longer matches canonical SQLite metadata"
                 )
-                return {
-                    "integrity_error": (
-                        "review input integrity check failed; Evidence or Artifact "
-                        "content no longer matches canonical SQLite metadata"
-                    ),
-                    "issues": integrity_issues,
-                }
 
             review_id = new_id("review")
             directory = contained_path(
@@ -1374,14 +2515,251 @@ class CompanyOS:
                 work_order_id,
                 review_id,
             )
+            created_review_directories.append(directory)
             json_path = directory / "opus_review_request.json"
             markdown_path = directory / "opus_review_request.md"
+            specification = json.loads(current_row["specification_json"])
+            verifier_spec = read_json(current_work.verifier_path)
+            verifier_output_row = next(
+                (row for row in evidence_rows if row["kind"] == "VERIFIER_OUTPUT"),
+                None,
+            )
+            if verifier_output_row is None:
+                raise ValidationError("Verifier output Evidence is required before review")
+            verifier_output_path = self._absolute(verifier_output_row["path"])
+            verifier_output_content = read_json(verifier_output_path)
+
+            artifact_documents: list[dict[str, Any]] = []
+            inline_limit = 64 * 1024
+            for artifact_row in artifact_rows:
+                artifact_path = self._absolute(artifact_row["path"])
+                content_bytes = artifact_path.read_bytes()
+                item: dict[str, Any] = {
+                    "id": artifact_row["id"],
+                    "path": artifact_row["path"],
+                    "sha256": artifact_row["sha256"],
+                    "media_type": artifact_row["media_type"],
+                    "size_bytes": len(content_bytes),
+                }
+                try:
+                    decoded = content_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    decoded = None
+                if decoded is not None and len(content_bytes) <= inline_limit:
+                    item["content"] = decoded
+                    item["inline"] = True
+                else:
+                    attachment = contained_path(
+                        directory,
+                        "attachments",
+                        f"{artifact_row['id']}_{artifact_path.name}",
+                    )
+                    attachment.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(artifact_path, attachment)
+                    item["inline"] = False
+                    item["attachment_path"] = self._relative(attachment)
+                    item["attachment_sha256"] = sha256_file(attachment)
+                artifact_documents.append(item)
+
+            parent_review_id: str | None = None
+            review_lineage: list[str] = []
+            change_resolutions: list[dict[str, Any]] = []
+            if current_row["status"] == "AWAITING_REREVIEW":
+                parent = connection.execute(
+                    """
+                    SELECT id FROM reviews
+                    WHERE work_order_id = ? AND status = 'CHANGES_REQUIRED'
+                    ORDER BY created_at DESC, id DESC LIMIT 1
+                    """,
+                    (work_order_id,),
+                ).fetchone()
+                if parent is None:
+                    raise ValidationError(
+                        "AWAITING_REREVIEW has no CHANGES_REQUIRED parent Review"
+                    )
+                parent_review_id = str(parent["id"])
+                lineage_rows = self._review_lineage(
+                    connection,
+                    start_review_id=parent_review_id,
+                    work_order_id=work_order_id,
+                )
+                review_lineage = [str(row["id"]) for row in lineage_rows]
+                for lineage_index, lineage_review in enumerate(lineage_rows):
+                    lineage_review_id = str(lineage_review["id"])
+                    required_rows = connection.execute(
+                        """
+                        SELECT change_id, description, status
+                        FROM review_required_changes
+                        WHERE review_id = ? ORDER BY change_id
+                        """,
+                        (lineage_review_id,),
+                    ).fetchall()
+                    if not required_rows:
+                        continue
+                    if any(
+                        row["status"] not in {"SUBMITTED", "VERIFIED"}
+                        for row in required_rows
+                    ):
+                        raise ValidationError(
+                            "Rereview lineage contains an unresolved required_change"
+                        )
+                    if lineage_index == 0:
+                        resolution_rows = connection.execute(
+                            """
+                            SELECT required_change_id, repair_run_id, source_commit,
+                                   source_tree_sha256, evidence_json, created_at
+                            FROM review_change_resolutions
+                            WHERE review_id = ? AND repair_run_id = ?
+                            ORDER BY required_change_id, created_at
+                            """,
+                            (lineage_review_id, latest_run["id"]),
+                        ).fetchall()
+                    else:
+                        child_review = lineage_rows[lineage_index - 1]
+                        resolution_rows = connection.execute(
+                            """
+                            SELECT required_change_id, repair_run_id, source_commit,
+                                   source_tree_sha256, evidence_json, created_at
+                            FROM review_change_resolutions
+                            WHERE review_id = ? AND repair_run_id = ?
+                            ORDER BY required_change_id, created_at
+                            """,
+                            (lineage_review_id, child_review["run_id"]),
+                        ).fetchall()
+                    required_ids = [
+                        str(row["change_id"]) for row in required_rows
+                    ]
+                    resolution_ids = [
+                        str(row["required_change_id"])
+                        for row in resolution_rows
+                    ]
+                    if required_ids != resolution_ids:
+                        raise ValidationError(
+                            "Rereview requires one resolution per lineage required_change"
+                        )
+                    for resolution in resolution_rows:
+                        if lineage_index == 0 and (
+                            resolution["source_commit"]
+                            != current_source_snapshot.source_commit
+                            or resolution["source_tree_sha256"]
+                            != current_source_snapshot.source_tree_sha256
+                        ):
+                            raise ValidationError(
+                                "Rereview resolution source does not match current source"
+                            )
+                        evidence_ids = json.loads(resolution["evidence_json"])
+                        canonical_evidence_ids = self._canonical_repair_evidence_ids(
+                            work_order_id,
+                            evidence_ids,
+                            connection=connection,
+                        )
+                        required_status = next(
+                            row["status"]
+                            for row in required_rows
+                            if row["change_id"]
+                            == resolution["required_change_id"]
+                        )
+                        change_resolutions.append(
+                            {
+                                "origin_review_id": lineage_review_id,
+                                "required_change_id": resolution[
+                                    "required_change_id"
+                                ],
+                                "description": next(
+                                    row["description"]
+                                    for row in required_rows
+                                    if row["change_id"]
+                                    == resolution["required_change_id"]
+                                ),
+                                "required_change_status": required_status,
+                                "repair_run_id": resolution["repair_run_id"],
+                                "source_commit": resolution["source_commit"],
+                                "source_tree_sha256": resolution[
+                                    "source_tree_sha256"
+                                ],
+                                "evidence_ids": canonical_evidence_ids,
+                                "created_at": resolution["created_at"],
+                            }
+                        )
+            requested_evidence_ids = {
+                str(row["id"]) for row in evidence_rows
+            }
+            for resolution in change_resolutions:
+                requested_evidence_ids.update(resolution["evidence_ids"])
+            evidence_documents: list[dict[str, Any]] = []
+            if requested_evidence_ids:
+                evidence_placeholders = ",".join(
+                    "?" for _ in requested_evidence_ids
+                )
+                requested_evidence_rows = connection.execute(
+                    f"""
+                    SELECT id, kind, path, sha256, run_id, trusted
+                    FROM evidence
+                    WHERE id IN ({evidence_placeholders})
+                    ORDER BY id
+                    """,
+                    tuple(sorted(requested_evidence_ids)),
+                ).fetchall()
+                if len(requested_evidence_rows) != len(requested_evidence_ids):
+                    raise ValidationError(
+                        "ReviewRequest Evidence metadata is incomplete"
+                    )
+                for evidence_row in requested_evidence_rows:
+                    evidence_path = self._absolute(evidence_row["path"])
+                    content_bytes = evidence_path.read_bytes()
+                    evidence_document: dict[str, Any] = {
+                        "id": evidence_row["id"],
+                        "kind": evidence_row["kind"],
+                        "path": evidence_row["path"],
+                        "sha256": evidence_row["sha256"],
+                        "run_id": evidence_row["run_id"],
+                        "trusted": bool(evidence_row["trusted"]),
+                        "size_bytes": len(content_bytes),
+                    }
+                    try:
+                        decoded_evidence = content_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        decoded_evidence = None
+                    if (
+                        decoded_evidence is not None
+                        and len(content_bytes) <= inline_limit
+                    ):
+                        evidence_document["content"] = decoded_evidence
+                        evidence_document["inline"] = True
+                    else:
+                        evidence_attachment = contained_path(
+                            directory,
+                            "attachments",
+                            (
+                                f"evidence_{evidence_row['id']}_"
+                                f"{evidence_path.name}"
+                            ),
+                        )
+                        evidence_attachment.parent.mkdir(
+                            parents=True,
+                            exist_ok=True,
+                        )
+                        shutil.copyfile(evidence_path, evidence_attachment)
+                        evidence_document["inline"] = False
+                        evidence_document["attachment_path"] = self._relative(
+                            evidence_attachment
+                        )
+                        evidence_document["attachment_sha256"] = sha256_file(
+                            evidence_attachment
+                        )
+                    evidence_documents.append(evidence_document)
             request_core = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "review_request_id": review_id,
                 "work_order_id": work_order_id,
                 "venture_id": current_work.venture_id,
                 "run_id": latest_run["id"],
+                "parent_review_id": parent_review_id,
+                "review_lineage": review_lineage,
+                "source_commit": source_snapshot.source_commit,
+                "source_tree_oid": source_snapshot.source_tree_oid,
+                "source_tree_sha256": source_snapshot.source_tree_sha256,
+                "source_dirty": source_snapshot.dirty,
                 "requested_reviewer": REVIEWER_METADATA,
                 "actual_review_status": "NOT_YET_REVIEWED",
                 "review_objectives": [
@@ -1389,12 +2767,33 @@ class CompanyOS:
                     "hidden-assumption and requirements-gap detection",
                     "verification-weakening and risk review",
                 ],
-                "evidence": [dict(row) for row in evidence_rows],
+                "work_order": {
+                    "id": work_order_id,
+                    "title": current_row["title"],
+                    "objective": specification.get("objective"),
+                    "acceptance": specification.get("acceptance", {}),
+                    "specification": specification,
+                },
+                "verifier": {
+                    "path": current_row["verifier_path"],
+                    "sha256": current_row["verifier_sha256"],
+                    "spec": verifier_spec,
+                },
+                "verifier_output": {
+                    "path": verifier_output_row["path"],
+                    "sha256": verifier_output_row["sha256"],
+                    "content": verifier_output_content,
+                },
+                "artifacts": artifact_documents,
+                "evidence": evidence_documents,
+                "change_resolutions": change_resolutions,
                 "response_schema": {
                     "required": [
                         "schema_version",
                         "review_request_id",
                         "review_request_hash",
+                        "reviewed_commit",
+                        "reviewed_tree_sha256",
                         "source",
                         "verdict",
                         "findings",
@@ -1408,9 +2807,10 @@ class CompanyOS:
             atomic_write_json(json_path, request)
             atomic_write_text(
                 markdown_path,
-                markdown_document("Claude Opus ReviewRequest", request),
+                review_request_markdown(request),
             )
             request_json_sha256 = sha256_file(json_path)
+            request_markdown_sha256 = sha256_file(markdown_path)
             now = utc_now()
             self.store.insert_row(
                 "reviews",
@@ -1418,6 +2818,11 @@ class CompanyOS:
                     "id": review_id,
                     "work_order_id": work_order_id,
                     "run_id": latest_run["id"],
+                    "schema_version": 2,
+                    "parent_review_id": parent_review_id,
+                    "source_commit": source_snapshot.source_commit,
+                    "source_tree_sha256": source_snapshot.source_tree_sha256,
+                    "binding_status": "BOUND",
                     "status": "WAITING_FOR_OPUS",
                     "request_json_path": self._relative(json_path),
                     "request_markdown_path": self._relative(markdown_path),
@@ -1427,6 +2832,7 @@ class CompanyOS:
                             "request": request,
                             "request_hash": request_digest,
                             "request_json_sha256": request_json_sha256,
+                            "request_markdown_sha256": request_markdown_sha256,
                         }
                     ),
                     "created_at": now,
@@ -1449,6 +2855,9 @@ class CompanyOS:
                     "request_markdown_path": self._relative(markdown_path),
                     "request_hash": request_digest,
                     "request_json_sha256": request_json_sha256,
+                    "request_markdown_sha256": request_markdown_sha256,
+                    "source_commit": source_snapshot.source_commit,
+                    "source_tree_sha256": source_snapshot.source_tree_sha256,
                     "status": "WAITING_FOR_OPUS",
                 },
                 connection=connection,
@@ -1460,9 +2869,15 @@ class CompanyOS:
                 idempotency_key, "prepare_review", command_payload, operation
             )
         except IdempotencyConflict as exc:
+            for directory in created_review_directories:
+                if directory.exists():
+                    shutil.rmtree(directory)
             raise ConflictError(str(exc)) from exc
-        if "integrity_error" in result:
-            raise ValidationError(str(result["integrity_error"]))
+        except BaseException:
+            for directory in created_review_directories:
+                if directory.exists():
+                    shutil.rmtree(directory)
+            raise
         return self.review(str(result["review_id"]))
 
     def review(self, review_id: str) -> Review:
@@ -1472,9 +2887,13 @@ class CompanyOS:
             id=row["id"],
             work_order_id=row["work_order_id"],
             status=row["status"],
+            binding_status=row["binding_status"],
             json_path=self._absolute(row["request_json_path"]),
             markdown_path=self._absolute(row["request_markdown_path"]),
             request_hash=payload["request_hash"],
+            request_markdown_sha256=self._expected_review_markdown_sha256(
+                payload
+            ),
         )
 
     def ingest_review_result(
@@ -1482,73 +2901,7 @@ class CompanyOS:
     ) -> dict[str, Any]:
         row = self._row("reviews", review_id)
         review = self.review(review_id)
-        stored_payload = json.loads(row["payload_json"])
-        integrity_issues: list[dict[str, Any]] = []
-        expected_file_sha = stored_payload.get("request_json_sha256")
-        try:
-            observed_file_sha = sha256_file(review.json_path)
-        except OSError:
-            observed_file_sha = None
-        if not isinstance(expected_file_sha, str) or (
-            observed_file_sha != expected_file_sha
-        ):
-            integrity_issues.append(
-                {
-                    "source_table": "review_request",
-                    "record_id": review_id,
-                    "path": self._relative(review.json_path),
-                    "expected_sha256": expected_file_sha,
-                    "observed_sha256": observed_file_sha,
-                    "reason": (
-                        "FILE_UNREADABLE"
-                        if observed_file_sha is None
-                        else "SHA256_MISMATCH"
-                    ),
-                }
-            )
-
-        actual_request: Any = None
-        try:
-            actual_request = read_json(review.json_path)
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            integrity_issues.append(
-                {
-                    "source_table": "review_request",
-                    "record_id": review_id,
-                    "path": self._relative(review.json_path),
-                    "reason": "INVALID_JSON",
-                }
-            )
-        if isinstance(actual_request, dict):
-            embedded_hash = actual_request.get("review_request_hash")
-            request_core = dict(actual_request)
-            request_core.pop("review_request_hash", None)
-            observed_payload_hash = payload_hash(request_core)
-            if (
-                embedded_hash != review.request_hash
-                or observed_payload_hash != review.request_hash
-                or actual_request != stored_payload.get("request")
-            ):
-                integrity_issues.append(
-                    {
-                        "source_table": "review_request",
-                        "record_id": review_id,
-                        "path": self._relative(review.json_path),
-                        "expected_payload_hash": review.request_hash,
-                        "embedded_payload_hash": embedded_hash,
-                        "observed_payload_hash": observed_payload_hash,
-                        "reason": "PAYLOAD_HASH_MISMATCH",
-                    }
-                )
-        elif actual_request is not None:
-            integrity_issues.append(
-                {
-                    "source_table": "review_request",
-                    "record_id": review_id,
-                    "path": self._relative(review.json_path),
-                    "reason": "REQUEST_NOT_OBJECT",
-                }
-            )
+        integrity_issues = self._review_request_integrity_issues(row)
 
         if integrity_issues:
             venture_id = self.work_order(review.work_order_id).venture_id
@@ -1567,14 +2920,62 @@ class CompanyOS:
                 "does not match its canonical hashes"
             )
 
+        material_issues = self._bound_review_material_issues(row)
+        material_issues.extend(self._review_resolution_integrity_issues(row))
+        if material_issues:
+            venture_id = self.work_order(review.work_order_id).venture_id
+            self._record_review_integrity_failure(
+                work_order_id=review.work_order_id,
+                venture_id=venture_id,
+                run_id=str(row["run_id"]),
+                issues=material_issues,
+            )
+            raise ValidationError(
+                "ReviewResult cannot be ingested because bound Evidence or "
+                "Artifact content changed after the ReviewRequest was created"
+            )
+
         result = read_json(Path(result_file).resolve())
         if not isinstance(result, dict):
             raise ValidationError("ReviewResult must be a JSON object")
+        if int(row["schema_version"]) >= 2:
+            current_source = self._source_snapshot()
+            if (
+                current_source.source_commit != row["source_commit"]
+                or current_source.source_tree_sha256 != row["source_tree_sha256"]
+            ):
+                venture_id = self.work_order(review.work_order_id).venture_id
+                self.store.append_event(
+                    "STALE_REVIEW_RESULT_REJECTED",
+                    aggregate_type="Review",
+                    aggregate_id=review_id,
+                    venture_id=venture_id,
+                    payload={
+                        "requested_commit": row["source_commit"],
+                        "current_commit": current_source.source_commit,
+                        "requested_tree_sha256": row["source_tree_sha256"],
+                        "current_tree_sha256": current_source.source_tree_sha256,
+                    },
+                )
+                raise ValidationError(
+                    "ReviewResult is stale because the current source snapshot changed"
+                )
         validate_review_result(
             result,
             request_id=review.id,
             request_hash=review.request_hash,
+            request_schema_version=int(row["schema_version"]),
+            source_commit=row["source_commit"] if int(row["schema_version"]) >= 2 else None,
+            source_tree_sha256=(
+                row["source_tree_sha256"] if int(row["schema_version"]) >= 2 else None
+            ),
+            allow_fake_reviewer=self.allow_test_reviewers,
         )
+        if int(row["schema_version"]) < 2 and result["verdict"] == "PASS":
+            raise ValidationError(
+                "Legacy unbound ReviewRequest cannot complete a WorkOrder; "
+                "create a schema-v2 rereview"
+            )
         command_payload = {
             "review_id": review_id,
             "result_hash": payload_hash(result),
@@ -1595,6 +2996,34 @@ class CompanyOS:
                 raise ValidationError(
                     f"ReviewResult cannot be ingested from status {current_row['status']}"
                 )
+            current_material_issues = self._bound_review_material_issues(
+                current_row,
+                connection=connection,
+            )
+            current_material_issues.extend(
+                self._review_request_integrity_issues(current_row)
+            )
+            current_material_issues.extend(
+                self._review_resolution_integrity_issues(
+                    current_row,
+                    connection=connection,
+                )
+            )
+            if current_material_issues:
+                raise ValidationError(
+                    "ReviewResult is stale because bound Evidence or Artifact "
+                    "content changed during ingest"
+                )
+            if int(current_row["schema_version"]) >= 2:
+                commit_snapshot = self._source_snapshot()
+                if (
+                    commit_snapshot.source_commit != current_row["source_commit"]
+                    or commit_snapshot.source_tree_sha256
+                    != current_row["source_tree_sha256"]
+                ):
+                    raise ValidationError(
+                        "ReviewResult is stale because source changed during ingest"
+                    )
             atomic_write_json(response_target, result)
             current_payload = json.loads(current_row["payload_json"])
             current_payload["result"] = result
@@ -1631,6 +3060,21 @@ class CompanyOS:
             )
             venture_id = self.work_order(review.work_order_id).venture_id
             if result["required_changes"]:
+                for change in result["required_changes"]:
+                    self.store.insert_row(
+                        "review_required_changes",
+                        {
+                            "id": new_id("review_change"),
+                            "review_id": review_id,
+                            "change_id": change["id"],
+                            "description": change["description"],
+                            "status": "OPEN",
+                            "verified_by_review_id": None,
+                            "created_at": now,
+                            "updated_at": now,
+                        },
+                        connection=connection,
+                    )
                 self.store.insert_row(
                     "decisions",
                     {
@@ -1649,6 +3093,44 @@ class CompanyOS:
                         "updated_at": now,
                     },
                     connection=connection,
+                )
+            if result["verdict"] == "PASS" and current_row["parent_review_id"]:
+                parent_review_id = str(current_row["parent_review_id"])
+                lineage = self._review_lineage(
+                    connection,
+                    start_review_id=parent_review_id,
+                    work_order_id=review.work_order_id,
+                )
+                lineage_ids = [str(item["id"]) for item in lineage]
+                placeholders = ",".join("?" for _ in lineage_ids)
+                unresolved_count = int(
+                    connection.execute(
+                        f"""
+                        SELECT COUNT(*) FROM review_required_changes
+                        WHERE review_id IN ({placeholders})
+                          AND status NOT IN ('SUBMITTED', 'VERIFIED')
+                        """,
+                        tuple(lineage_ids),
+                    ).fetchone()[0]
+                )
+                if unresolved_count:
+                    raise ValidationError(
+                        "Rereview PASS cannot verify a lineage with unresolved changes"
+                    )
+                connection.execute(
+                    f"""
+                    UPDATE review_required_changes
+                    SET status = 'VERIFIED', verified_by_review_id = ?, updated_at = ?
+                    WHERE review_id IN ({placeholders}) AND status = 'SUBMITTED'
+                    """,
+                    (review_id, now, *lineage_ids),
+                )
+                connection.execute(
+                    """
+                    UPDATE decisions SET status = 'RESOLVED', updated_at = ?
+                    WHERE work_order_id = ? AND status = 'ACTION_REQUIRED'
+                    """,
+                    (now, review.work_order_id),
                 )
             self.store.append_event(
                 "REVIEW_RESULT_INGESTED",
@@ -1675,26 +3157,302 @@ class CompanyOS:
             raise ConflictError(str(exc)) from exc
         return dict(stored["result"])
 
+    def _canonical_repair_evidence_ids(
+        self,
+        work_order_id: str,
+        evidence_ids: Any,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> list[str]:
+        if not isinstance(evidence_ids, list) or not evidence_ids:
+            raise ValidationError("Repair change requires canonical Evidence ids")
+        if not all(
+            isinstance(evidence_id, str) and evidence_id.strip()
+            for evidence_id in evidence_ids
+        ):
+            raise ValidationError("Repair Evidence ids must be non-empty strings")
+        normalized = [str(evidence_id) for evidence_id in evidence_ids]
+        if len(normalized) != len(set(normalized)):
+            raise ValidationError("Repair Evidence ids must be unique")
+
+        conn = connection or self.store.connection
+        for evidence_id in normalized:
+            row = conn.execute(
+                """
+                SELECT evidence.id, evidence.work_order_id, evidence.run_id,
+                       evidence.path, evidence.sha256, evidence.trusted,
+                       runs.work_order_id AS run_work_order_id,
+                       runs.status AS run_status
+                FROM evidence
+                JOIN runs ON runs.id = evidence.run_id
+                WHERE evidence.id = ?
+                """,
+                (evidence_id,),
+            ).fetchone()
+            if row is None:
+                raise ValidationError(
+                    f"Repair Evidence is not a canonical run record: {evidence_id}"
+                )
+            if (
+                row["work_order_id"] != work_order_id
+                or row["run_work_order_id"] != work_order_id
+                or not row["run_id"]
+            ):
+                raise ValidationError(
+                    f"Repair Evidence is not linked to this WorkOrder: {evidence_id}"
+                )
+            if int(row["trusted"]) != 1 or row["run_status"] != "PASS":
+                raise ValidationError(
+                    f"Repair Evidence must be trusted and from a PASS Run: {evidence_id}"
+                )
+            issue = self._file_integrity_issue(
+                source_table="evidence",
+                record_id=evidence_id,
+                stored_path=row["path"],
+                expected_sha256=row["sha256"],
+            )
+            if issue is not None:
+                raise ValidationError(
+                    f"Repair Evidence content is missing or changed: {evidence_id}"
+                )
+        return sorted(normalized)
+
+    def _validate_repair_manifest(
+        self,
+        work_order_id: str,
+        repair_manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(repair_manifest, dict):
+            raise ValidationError("Repair manifest must be a JSON object")
+        required_fields = {
+            "schema_version",
+            "review_id",
+            "source_commit",
+            "source_tree_sha256",
+            "changes",
+        }
+        missing = sorted(required_fields.difference(repair_manifest))
+        if missing:
+            raise ValidationError(
+                "Repair manifest missing fields: " + ", ".join(missing)
+            )
+        if repair_manifest["schema_version"] != 1:
+            raise ValidationError("Unsupported repair manifest schema_version")
+        review_row = self.store.query_one(
+            """
+            SELECT * FROM reviews
+            WHERE id = ? AND work_order_id = ? AND status = 'CHANGES_REQUIRED'
+            """,
+            (repair_manifest["review_id"], work_order_id),
+        )
+        if review_row is None:
+            raise ValidationError(
+                "Repair manifest must reference the CHANGES_REQUIRED Review"
+            )
+        current_work = self.work_order(work_order_id)
+        if current_work.status != "REPAIR_REQUIRED":
+            raise ValidationError("WorkOrder is not awaiting repair")
+        latest_review = self.store.query_one(
+            """
+            SELECT id, status FROM reviews
+            WHERE work_order_id = ? AND status = 'CHANGES_REQUIRED'
+            ORDER BY created_at DESC, id DESC LIMIT 1
+            """,
+            (work_order_id,),
+        )
+        if (
+            latest_review is None
+            or latest_review["id"] != review_row["id"]
+        ):
+            raise ValidationError(
+                "Repair manifest must reference the latest CHANGES_REQUIRED Review"
+            )
+        snapshot = self._source_snapshot()
+        if repair_manifest["source_commit"] != snapshot.source_commit:
+            raise ValidationError("Repair manifest source_commit does not match source")
+        if repair_manifest["source_tree_sha256"] != snapshot.source_tree_sha256:
+            raise ValidationError(
+                "Repair manifest source_tree_sha256 does not match source"
+            )
+        changes = repair_manifest["changes"]
+        if not isinstance(changes, list):
+            raise ValidationError("Repair manifest changes must be a list")
+        expected_rows = self.store.query_all(
+            """
+            SELECT change_id, status FROM review_required_changes
+            WHERE review_id = ? ORDER BY change_id
+            """,
+            (review_row["id"],),
+        )
+        expected_ids = [str(row["change_id"]) for row in expected_rows]
+        if not expected_rows or any(row["status"] != "OPEN" for row in expected_rows):
+            raise ValidationError(
+                "Latest Review required changes are not all open for repair"
+            )
+        observed_ids = [
+            str(change.get("id")) for change in changes if isinstance(change, dict)
+        ]
+        if sorted(observed_ids) != expected_ids or len(set(observed_ids)) != len(
+            observed_ids
+        ):
+            raise ValidationError(
+                "Repair manifest must cover every required_change id exactly once"
+            )
+
+        normalized_changes: list[dict[str, Any]] = []
+        for change in changes:
+            if change.get("commit") != snapshot.source_commit:
+                raise ValidationError(
+                    f"Repair change {change.get('id')} commit does not match source"
+                )
+            normalized_evidence_ids = self._canonical_repair_evidence_ids(
+                work_order_id,
+                change.get("evidence_ids"),
+            )
+            normalized_changes.append(
+                {
+                    "id": str(change["id"]),
+                    "commit": snapshot.source_commit,
+                    "evidence_ids": normalized_evidence_ids,
+                }
+            )
+
+        if int(review_row["schema_version"]) >= 2:
+            prior_payload = json.loads(review_row["payload_json"])
+            prior_request = prior_payload.get("request", {})
+            prior_artifacts = {
+                item.get("path"): item.get("sha256")
+                for item in prior_request.get("artifacts", [])
+                if isinstance(item, dict)
+            }
+            current_artifacts: dict[str, str] = {}
+            for artifact in self.store.query_all(
+                "SELECT path FROM artifacts WHERE work_order_id = ? ORDER BY path",
+                (work_order_id,),
+            ):
+                path = self._absolute(artifact["path"])
+                if path.is_file():
+                    current_artifacts[str(artifact["path"])] = sha256_file(path)
+            if (
+                review_row["source_tree_sha256"] == snapshot.source_tree_sha256
+                and prior_artifacts == current_artifacts
+            ):
+                work = self.work_order(work_order_id)
+                self.store.append_event(
+                    "REPAIR_NO_CHANGE_DETECTED",
+                    aggregate_type="WorkOrder",
+                    aggregate_id=work_order_id,
+                    venture_id=work.venture_id,
+                    payload={"review_id": review_row["id"]},
+                )
+                raise ValidationError("Repair has no substantive change to rereview")
+
+        return {
+            "schema_version": 1,
+            "review_id": str(review_row["id"]),
+            "source_commit": snapshot.source_commit,
+            "source_tree_sha256": snapshot.source_tree_sha256,
+            "changes": normalized_changes,
+        }
+
+    @staticmethod
+    def _repair_manifest_replay_identity(
+        repair_manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Project a manifest to the immutable identity used for replay checks."""
+
+        if not isinstance(repair_manifest, dict):
+            raise ValidationError("Repair manifest must be a JSON object")
+        changes = repair_manifest.get("changes")
+        if not isinstance(changes, list):
+            raise ValidationError("Repair manifest changes must be a list")
+        projected_changes: list[dict[str, Any]] = []
+        for change in changes:
+            if not isinstance(change, dict):
+                raise ValidationError("Repair manifest change must be an object")
+            evidence_ids = change.get("evidence_ids")
+            if not isinstance(evidence_ids, list):
+                raise ValidationError("Repair change requires canonical Evidence ids")
+            projected_changes.append(
+                {
+                    "id": change.get("id"),
+                    "commit": change.get("commit"),
+                    "evidence_ids": sorted(str(item) for item in evidence_ids),
+                }
+            )
+        return {
+            "schema_version": repair_manifest.get("schema_version"),
+            "review_id": repair_manifest.get("review_id"),
+            "source_commit": repair_manifest.get("source_commit"),
+            "source_tree_sha256": repair_manifest.get("source_tree_sha256"),
+            "changes": sorted(projected_changes, key=lambda item: str(item["id"])),
+        }
+
     def repair_once(
         self,
         work_order_id: str,
         *,
         executor: ExecutorPort,
         idempotency_key: str,
+        repair_manifest: dict[str, Any] | None = None,
     ) -> Run:
-        current_status = self.work_order(work_order_id).status
+        if repair_manifest is None:
+            raise ValidationError("WorkOrder repair requires a repair manifest")
         existing = self.store.get_row("idempotency", idempotency_key)
-        if current_status == "REPAIRED_VERIFIED" and existing is not None:
+        if existing is not None and existing["status"] == "COMPLETED":
+            if existing["command"] != "repair_work_order":
+                raise ConflictError(
+                    "Idempotency key belongs to a different command"
+                )
+            stored_request = json.loads(existing["request_json"])
+            current_work = self.work_order(work_order_id)
+            if (
+                stored_request.get("work_order_id") != work_order_id
+                or stored_request.get("executor") != executor.name
+                or stored_request.get("approved_verifier_hash")
+                != current_work.verifier_hash
+                or stored_request.get("repair_mode") is not True
+            ):
+                raise ConflictError(
+                    "Idempotency key was reused with different repair inputs"
+                )
             stored_result = json.loads(existing["result_json"])
-            return self.run(stored_result["run_id"])
-        if current_status != "REPAIR_REQUIRED":
-            raise ValidationError("WorkOrder is not awaiting repair")
-        return self.execute_work_order(
+            replayed = self.run(str(stored_result["run_id"]))
+            run_row = self._row("runs", replayed.id)
+            run_payload = json.loads(run_row["payload_json"])
+            stored_manifest = run_payload.get("repair_manifest")
+            supplied_identity = self._repair_manifest_replay_identity(
+                repair_manifest
+            )
+            if not isinstance(stored_manifest, dict) or payload_hash(
+                supplied_identity
+            ) != payload_hash(
+                self._repair_manifest_replay_identity(stored_manifest)
+            ):
+                raise ConflictError(
+                    "Idempotency key was reused with a different repair manifest"
+                )
+            return replayed
+        normalized_manifest = self._validate_repair_manifest(
+            work_order_id,
+            repair_manifest,
+        )
+        repaired = self._execute_work_order(
             work_order_id,
             executor=executor,
             idempotency_key=idempotency_key,
             _repair_mode=True,
+            _repair_manifest=normalized_manifest,
         )
+        if (
+            repaired.status == "PASS"
+            and self.work_order(work_order_id).status == "AWAITING_REREVIEW"
+        ):
+            self.prepare_review(
+                work_order_id,
+                idempotency_key=f"rereview:{work_order_id}:{repaired.id}",
+            )
+        return repaired
 
     def stop(self) -> None:
         if self.store.is_stopped():
@@ -1726,23 +3484,45 @@ class CompanyOS:
         return self.store.is_stopped()
 
     def resume_work_order(
-        self, work_order_id: str, *, executor: ExecutorPort
+        self,
+        work_order_id: str,
+        *,
+        executor: ExecutorPort,
+        repair_manifest: dict[str, Any] | None = None,
     ) -> Review | Run:
         if self.is_stopped():
             raise CompanyStoppedError("Company execution is stopped; run company resume")
         work_order = self.work_order(work_order_id)
         if work_order.status == "WAITING_FOR_OPUS":
-            row = self.store.query_one(
-                "SELECT id FROM reviews WHERE work_order_id = ? ORDER BY created_at DESC LIMIT 1",
-                (work_order_id,),
-            )
-            if row is None:
-                raise ValidationError("WAITING_FOR_OPUS has no ReviewRequest")
-            return self.review(row["id"])
-        if work_order.status == "VERIFIED":
             return self.prepare_review(
                 work_order_id,
-                idempotency_key=f"resume-review:{work_order_id}",
+                idempotency_key=f"refresh-review:{work_order_id}",
+            )
+        if work_order.status == "VERIFIED":
+            review_count = int(
+                self.store.scalar(
+                    "SELECT COUNT(*) FROM reviews WHERE work_order_id = ?",
+                    (work_order_id,),
+                )
+            )
+            return self.prepare_review(
+                work_order_id,
+                idempotency_key=f"resume-review:{work_order_id}:{review_count}",
+            )
+        if work_order.status == "AWAITING_REREVIEW":
+            latest_run = self.store.query_one(
+                """
+                SELECT id FROM runs
+                WHERE work_order_id = ? AND status = 'PASS'
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (work_order_id,),
+            )
+            if latest_run is None:
+                raise ValidationError("AWAITING_REREVIEW has no PASS repair Run")
+            return self.prepare_review(
+                work_order_id,
+                idempotency_key=f"rereview:{work_order_id}:{latest_run['id']}",
             )
         next_attempt = len(self.runs_for_work_order(work_order_id)) + 1
         if work_order.status == "REPAIR_REQUIRED":
@@ -1750,6 +3530,7 @@ class CompanyOS:
                 work_order_id,
                 executor=executor,
                 idempotency_key=f"resume-repair:{work_order_id}:attempt:{next_attempt}",
+                repair_manifest=repair_manifest,
             )
         if work_order.status in {"READY", "VERIFICATION_FAILED"}:
             return self.execute_work_order(

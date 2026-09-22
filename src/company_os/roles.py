@@ -319,17 +319,17 @@ def _identity(idea_id: str | Any, idea_text: str | None) -> tuple[str, str]:
 
 def _fact(idea_id: str) -> dict[str, Any]:
     return {
-        "id": f"{idea_id}:fact:synthetic-input",
+        "id": "fact-1",
         "type": "FACT",
         "statement": "The deterministic synthetic input fixture exists.",
-        "evidence_refs": [f"source-evidence:{idea_id}:synthetic-input"],
+        "evidence_refs": ["source-evidence-1"],
         "source_types": ["SYNTHETIC_FIXTURE"],
     }
 
 
 def _assumption(idea_id: str) -> dict[str, Any]:
     return {
-        "id": f"{idea_id}:assumption:single-artifact",
+        "id": "assumption-1",
         "type": "ASSUMPTION",
         "statement": "Writing one artifact is sufficient for this experiment.",
         "evidence_refs": [],
@@ -410,14 +410,14 @@ def _contract_contribution(idea_id: str) -> dict[str, Any]:
         "claims": [fact, assumption],
         "hard_constraints": [
             {
-                "claim_id": f"{idea_id}:constraint:no-network",
+                "claim_id": "constraint-1",
                 "statement": "No external network action is permitted.",
                 "type": "HARD_CONSTRAINT",
             }
         ],
         "inherited_conventions": [
             {
-                "claim_id": f"{idea_id}:convention:web-dashboard",
+                "claim_id": "convention-1",
                 "statement": "A web dashboard is customary but unnecessary for this experiment.",
                 "type": "INHERITED_CONVENTION",
             }
@@ -445,6 +445,31 @@ def _contract_contribution(idea_id: str) -> dict[str, Any]:
         "decision_basis": [{"claim_id": fact["id"], "type": "FACT"}],
     }
     contribution.update(_governance())
+    return contribution
+
+
+def _role_contract_contribution(role: str, idea_id: str) -> dict[str, Any]:
+    """Return realistic independent contributions with stable owned fields."""
+
+    contribution = _contract_contribution(idea_id)
+    if role == "cpo":
+        contribution["observable_problem"] = {
+            "statement": "The operator has no auditable verified artifact yet.",
+            "observable": True,
+        }
+        contribution["metric"] = {
+            **contribution["metric"],
+            "data_source": "product acceptance plus deterministic verifier output",
+        }
+    elif role == "cmo":
+        contribution["cheapest_valid_experiment"] = {
+            "description": "Run one local validation before any external acquisition action.",
+            "measurable_output": "verified_artifact_count",
+        }
+        contribution["strategy_check"] = {
+            **contribution["strategy_check"],
+            "why_now": "A verified local loop is needed before testing any market channel.",
+        }
     return contribution
 
 
@@ -565,7 +590,7 @@ def _cpo_outputs(idea_id: str, idea_text: str) -> dict[str, Any]:
 def _cmo_outputs(idea_id: str, idea_text: str) -> dict[str, Any]:
     fact = _fact(idea_id)
     assumption = {
-        "id": f"{idea_id}:assumption:operator-value",
+        "id": "market-assumption-1",
         "type": "ASSUMPTION",
         "statement": "An operator values an auditable verified execution loop.",
         "evidence_refs": [],
@@ -627,7 +652,10 @@ def synthetic_council_response(
         "outputs": _OUTPUT_BUILDERS[normalized](
             normalized_idea_id, normalized_idea_text
         ),
-        "contract_contribution": _contract_contribution(normalized_idea_id),
+        "contract_contribution": _role_contract_contribution(
+            normalized,
+            normalized_idea_id,
+        ),
     }
 
 

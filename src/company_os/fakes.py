@@ -7,7 +7,7 @@ from typing import Any
 from .handoffs import markdown_document
 from .models import ExecutionOutput, Idea, Review, WorkOrder
 from .roles import synthetic_council_response
-from .utils import atomic_write_json, atomic_write_text, contained_path
+from .utils import atomic_write_json, atomic_write_text, contained_path, read_json
 
 
 @dataclass(frozen=True)
@@ -65,10 +65,13 @@ class FakeReviewer:
     name = "fake_reviewer"
 
     def result(self, review: Review) -> dict[str, Any]:
+        request = read_json(review.json_path)
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "review_request_id": review.id,
             "review_request_hash": review.request_hash,
+            "reviewed_commit": request["source_commit"],
+            "reviewed_tree_sha256": request["source_tree_sha256"],
             "source": "fake_reviewer",
             "requested_reviewer": "Claude Opus 5",
             "actual_reviewer": "FakeReviewer",
@@ -89,9 +92,7 @@ class FakeReviewer:
         }
 
     def write_result(self, root: Path, review: Review) -> Path:
-        directory = contained_path(
-            root, "var", "handoffs", "reviews", review.work_order_id
-        )
+        directory = review.json_path.parent
         path = directory / "fake_review_result.json"
         atomic_write_json(path, self.result(review))
         return path

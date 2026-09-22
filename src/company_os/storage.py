@@ -75,6 +75,8 @@ _TABLES = frozenset(
         "work_orders",
         "runs",
         "reviews",
+        "review_required_changes",
+        "review_change_resolutions",
         "evidence",
         "decisions",
         "approvals",
@@ -100,17 +102,23 @@ CREATE TABLE IF NOT EXISTS council_responses (
     id              TEXT PRIMARY KEY,
     idea_id         TEXT NOT NULL REFERENCES ideas(id),
     role            TEXT NOT NULL CHECK (role IN ('cto', 'cpo', 'cmo')),
+    version         INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+    status          TEXT NOT NULL DEFAULT 'ACTIVE'
+                    CHECK (status IN ('ACTIVE', 'SUPERSEDED')),
+    response_hash   TEXT NOT NULL,
     payload_json    TEXT NOT NULL CHECK (json_valid(payload_json)),
     source_path     TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
-    UNIQUE (idea_id, role)
+    UNIQUE (idea_id, role, version),
+    UNIQUE (idea_id, role, response_hash)
 );
 
 CREATE TABLE IF NOT EXISTS contracts (
     id              TEXT PRIMARY KEY,
     idea_id         TEXT NOT NULL REFERENCES ideas(id),
     decision_level  TEXT NOT NULL,
+    min_decision_level TEXT NOT NULL DEFAULT 'FP_LITE',
     gate_status     TEXT NOT NULL DEFAULT 'PENDING',
     payload_json    TEXT NOT NULL CHECK (json_valid(payload_json)),
     created_at      TEXT NOT NULL,
@@ -133,6 +141,7 @@ CREATE TABLE IF NOT EXISTS assumptions (
     id              TEXT PRIMARY KEY,
     venture_id      TEXT NOT NULL REFERENCES ventures(id),
     contract_id     TEXT REFERENCES contracts(id),
+    external_ref    TEXT,
     statement       TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'UNTESTED',
     classification  TEXT NOT NULL DEFAULT 'ASSUMPTION',
@@ -196,6 +205,12 @@ CREATE TABLE IF NOT EXISTS reviews (
     id                      TEXT PRIMARY KEY,
     work_order_id           TEXT NOT NULL REFERENCES work_orders(id),
     run_id                  TEXT REFERENCES runs(id),
+    schema_version          INTEGER NOT NULL DEFAULT 1,
+    parent_review_id        TEXT REFERENCES reviews(id),
+    source_commit           TEXT,
+    source_tree_sha256      TEXT,
+    binding_status          TEXT NOT NULL DEFAULT 'BOUND'
+                            CHECK (binding_status IN ('BOUND', 'LEGACY_UNBOUND')),
     status                  TEXT NOT NULL DEFAULT 'WAITING_FOR_OPUS',
     request_json_path       TEXT NOT NULL,
     request_markdown_path   TEXT NOT NULL,
@@ -207,14 +222,43 @@ CREATE TABLE IF NOT EXISTS reviews (
 
 CREATE TABLE IF NOT EXISTS evidence (
     id              TEXT PRIMARY KEY,
-    venture_id      TEXT NOT NULL REFERENCES ventures(id),
+    idea_id         TEXT REFERENCES ideas(id),
+    venture_id      TEXT REFERENCES ventures(id),
     work_order_id   TEXT REFERENCES work_orders(id),
     run_id          TEXT REFERENCES runs(id),
+    external_ref    TEXT,
     kind            TEXT NOT NULL,
     path            TEXT,
     sha256          TEXT,
+    trusted         INTEGER NOT NULL DEFAULT 0 CHECK (trusted IN (0, 1)),
     payload_json    TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload_json)),
-    created_at      TEXT NOT NULL
+    created_at      TEXT NOT NULL,
+    CHECK (idea_id IS NOT NULL OR venture_id IS NOT NULL)
+);
+
+CREATE TABLE IF NOT EXISTS review_required_changes (
+    id                      TEXT PRIMARY KEY,
+    review_id               TEXT NOT NULL REFERENCES reviews(id),
+    change_id               TEXT NOT NULL,
+    description             TEXT NOT NULL,
+    status                  TEXT NOT NULL DEFAULT 'OPEN'
+                            CHECK (status IN ('OPEN', 'SUBMITTED', 'VERIFIED')),
+    verified_by_review_id   TEXT REFERENCES reviews(id),
+    created_at              TEXT NOT NULL,
+    updated_at              TEXT NOT NULL,
+    UNIQUE (review_id, change_id)
+);
+
+CREATE TABLE IF NOT EXISTS review_change_resolutions (
+    id                  TEXT PRIMARY KEY,
+    review_id           TEXT NOT NULL REFERENCES reviews(id),
+    required_change_id  TEXT NOT NULL,
+    repair_run_id       TEXT NOT NULL REFERENCES runs(id),
+    source_commit       TEXT NOT NULL,
+    source_tree_sha256  TEXT NOT NULL,
+    evidence_json       TEXT NOT NULL CHECK (json_valid(evidence_json)),
+    created_at          TEXT NOT NULL,
+    UNIQUE (review_id, required_change_id, repair_run_id)
 );
 
 CREATE TABLE IF NOT EXISTS decisions (
@@ -290,6 +334,10 @@ CREATE INDEX IF NOT EXISTS idx_experiments_venture ON experiments(venture_id);
 CREATE INDEX IF NOT EXISTS idx_work_orders_venture ON work_orders(venture_id);
 CREATE INDEX IF NOT EXISTS idx_runs_work_order ON runs(work_order_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_work_order ON reviews(work_order_id);
+CREATE INDEX IF NOT EXISTS idx_review_required_changes_review
+    ON review_required_changes(review_id);
+CREATE INDEX IF NOT EXISTS idx_review_change_resolutions_review
+    ON review_change_resolutions(review_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_venture ON evidence(venture_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_run ON evidence(run_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_venture ON decisions(venture_id);
@@ -309,6 +357,29 @@ BEFORE DELETE ON events
 BEGIN
     SELECT RAISE(ABORT, 'events are append-only');
 END;
+"""
+
+
+_SCHEMA_VERSION = 3
+
+_VERSIONED_INDEXES = r"""
+CREATE UNIQUE INDEX IF NOT EXISTS ux_council_active_role
+    ON council_responses(idea_id, role)
+    WHERE status = 'ACTIVE';
+CREATE UNIQUE INDEX IF NOT EXISTS ux_assumption_external_ref
+    ON assumptions(venture_id, external_ref)
+    WHERE external_ref IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_evidence_venture_external_ref
+    ON evidence(venture_id, external_ref)
+    WHERE venture_id IS NOT NULL AND external_ref IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_evidence_idea_external_ref
+    ON evidence(idea_id, external_ref)
+    WHERE idea_id IS NOT NULL AND external_ref IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_council_responses_idea
+    ON council_responses(idea_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_venture ON evidence(venture_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_idea ON evidence(idea_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_run ON evidence(run_id);
 """
 
 
@@ -361,6 +432,286 @@ def payload_fingerprint(value: JsonValue) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {
+        str(row["name"])
+        for row in connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+    }
+
+
+def _create_council_responses_v2(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE council_responses (
+            id              TEXT PRIMARY KEY,
+            idea_id         TEXT NOT NULL REFERENCES ideas(id),
+            role            TEXT NOT NULL CHECK (role IN ('cto', 'cpo', 'cmo')),
+            version         INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+            status          TEXT NOT NULL DEFAULT 'ACTIVE'
+                            CHECK (status IN ('ACTIVE', 'SUPERSEDED')),
+            response_hash   TEXT NOT NULL,
+            payload_json    TEXT NOT NULL CHECK (json_valid(payload_json)),
+            source_path     TEXT,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            UNIQUE (idea_id, role, version),
+            UNIQUE (idea_id, role, response_hash)
+        )
+        """
+    )
+
+
+def _create_evidence_v2(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE evidence (
+            id              TEXT PRIMARY KEY,
+            idea_id         TEXT REFERENCES ideas(id),
+            venture_id      TEXT REFERENCES ventures(id),
+            work_order_id   TEXT REFERENCES work_orders(id),
+            run_id          TEXT REFERENCES runs(id),
+            external_ref    TEXT,
+            kind            TEXT NOT NULL,
+            path            TEXT,
+            sha256          TEXT,
+            trusted         INTEGER NOT NULL DEFAULT 0 CHECK (trusted IN (0, 1)),
+            payload_json    TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload_json)),
+            created_at      TEXT NOT NULL,
+            CHECK (idea_id IS NOT NULL OR venture_id IS NOT NULL)
+        )
+        """
+    )
+
+
+def _migrate_schema(connection: sqlite3.Connection) -> None:
+    """Migrate existing durable state without rewriting the append-only ledger."""
+
+    current = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if current > _SCHEMA_VERSION:
+        raise StorageError(
+            f"database schema version {current} is newer than supported "
+            f"version {_SCHEMA_VERSION}"
+        )
+
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        council_columns = _column_names(connection, "council_responses")
+        if "version" not in council_columns:
+            council_rows = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM council_responses ORDER BY created_at, id"
+                ).fetchall()
+            ]
+            connection.execute("DROP TABLE council_responses")
+            _create_council_responses_v2(connection)
+            for row in council_rows:
+                response = json.loads(row["payload_json"])
+                connection.execute(
+                    """
+                    INSERT INTO council_responses(
+                        id, idea_id, role, version, status, response_hash,
+                        payload_json, source_path, created_at, updated_at
+                    ) VALUES (?, ?, ?, 1, 'ACTIVE', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["id"],
+                        row["idea_id"],
+                        row["role"],
+                        payload_fingerprint(response),
+                        row["payload_json"],
+                        row["source_path"],
+                        row["created_at"],
+                        row["updated_at"],
+                    ),
+                )
+
+        contract_columns = _column_names(connection, "contracts")
+        if "min_decision_level" not in contract_columns:
+            connection.execute(
+                "ALTER TABLE contracts ADD COLUMN min_decision_level "
+                "TEXT NOT NULL DEFAULT 'FP_LITE'"
+            )
+            connection.execute(
+                "UPDATE contracts SET min_decision_level = decision_level"
+            )
+
+        assumption_columns = _column_names(connection, "assumptions")
+        if "external_ref" not in assumption_columns:
+            connection.execute("ALTER TABLE assumptions ADD COLUMN external_ref TEXT")
+            connection.execute("UPDATE assumptions SET external_ref = id")
+
+        review_columns = _column_names(connection, "reviews")
+        for statement, column in (
+            (
+                "ALTER TABLE reviews ADD COLUMN schema_version INTEGER "
+                "NOT NULL DEFAULT 1",
+                "schema_version",
+            ),
+            (
+                "ALTER TABLE reviews ADD COLUMN parent_review_id TEXT "
+                "REFERENCES reviews(id)",
+                "parent_review_id",
+            ),
+            ("ALTER TABLE reviews ADD COLUMN source_commit TEXT", "source_commit"),
+            (
+                "ALTER TABLE reviews ADD COLUMN source_tree_sha256 TEXT",
+                "source_tree_sha256",
+            ),
+            (
+                "ALTER TABLE reviews ADD COLUMN binding_status TEXT NOT NULL "
+                "DEFAULT 'LEGACY_UNBOUND' CHECK (binding_status IN "
+                "('BOUND', 'LEGACY_UNBOUND'))",
+                "binding_status",
+            ),
+        ):
+            if column not in review_columns:
+                connection.execute(statement)
+
+        connection.execute(
+            """
+            UPDATE reviews
+            SET binding_status = CASE
+                WHEN schema_version >= 2
+                     AND source_commit IS NOT NULL
+                     AND source_tree_sha256 IS NOT NULL
+                THEN 'BOUND'
+                ELSE 'LEGACY_UNBOUND'
+            END
+            """
+        )
+
+        evidence_columns = _column_names(connection, "evidence")
+        if "idea_id" not in evidence_columns:
+            evidence_rows = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT evidence.*, ventures.idea_id AS derived_idea_id
+                    FROM evidence
+                    LEFT JOIN ventures ON ventures.id = evidence.venture_id
+                    ORDER BY evidence.created_at, evidence.id
+                    """
+                ).fetchall()
+            ]
+            connection.execute("DROP TABLE evidence")
+            _create_evidence_v2(connection)
+            for row in evidence_rows:
+                payload = json.loads(row["payload_json"])
+                external_ref = row["id"] if row["kind"] == "SOURCE_EVIDENCE" else None
+                connection.execute(
+                    """
+                    INSERT INTO evidence(
+                        id, idea_id, venture_id, work_order_id, run_id,
+                        external_ref, kind, path, sha256, trusted,
+                        payload_json, created_at
+                    ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["id"],
+                        row["venture_id"],
+                        row["work_order_id"],
+                        row["run_id"],
+                        external_ref,
+                        row["kind"],
+                        row["path"],
+                        row["sha256"],
+                        1 if payload.get("trusted") is True else 0,
+                        row["payload_json"],
+                        row["created_at"],
+                    ),
+                )
+
+        # Import legacy ReviewResult requirements as explicit OPEN records.
+        for review_row in connection.execute(
+            "SELECT id, payload_json, created_at, updated_at FROM reviews"
+        ).fetchall():
+            review_payload = json.loads(review_row["payload_json"])
+            result = review_payload.get("result")
+            if not isinstance(result, dict):
+                continue
+            changes = result.get("required_changes")
+            if not isinstance(changes, list):
+                continue
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                change_id = change.get("id")
+                description = change.get("description")
+                if not isinstance(change_id, str) or not isinstance(description, str):
+                    continue
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO review_required_changes(
+                        id, review_id, change_id, description, status,
+                        verified_by_review_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'OPEN', NULL, ?, ?)
+                    """,
+                    (
+                        new_id("review_change"),
+                        review_row["id"],
+                        change_id,
+                        description,
+                        review_row["created_at"],
+                        review_row["updated_at"],
+                    ),
+                )
+
+        migration_time = utc_now()
+        legacy_waiting_work_orders = [
+            str(row["work_order_id"])
+            for row in connection.execute(
+                """
+                SELECT DISTINCT work_order_id FROM reviews
+                WHERE schema_version < 2 AND status = 'WAITING_FOR_OPUS'
+                """
+            ).fetchall()
+        ]
+        connection.execute(
+            """
+            UPDATE reviews
+            SET status = 'SUPERSEDED', updated_at = ?
+            WHERE schema_version < 2 AND status = 'WAITING_FOR_OPUS'
+            """,
+            (migration_time,),
+        )
+        for work_order_id in legacy_waiting_work_orders:
+            connection.execute(
+                """
+                UPDATE work_orders
+                SET status = 'VERIFIED', updated_at = ?
+                WHERE id = ? AND status = 'WAITING_FOR_OPUS'
+                """,
+                (migration_time, work_order_id),
+            )
+        connection.execute(
+            """
+            UPDATE reviews
+            SET status = 'CHANGES_REQUIRED', updated_at = ?
+            WHERE schema_version = 1 AND status = 'CHANGES_APPLIED'
+            """,
+            (migration_time,),
+        )
+        connection.execute(
+            """
+            UPDATE work_orders
+            SET status = 'REPAIR_REQUIRED', updated_at = ?
+            WHERE status = 'REPAIRED_VERIFIED'
+            """,
+            (migration_time,),
+        )
+        connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
+
+    connection.executescript(_VERSIONED_INDEXES)
+
+
 class SQLiteStateStore:
     """Small transactional state store with no external dependencies."""
 
@@ -404,7 +755,7 @@ class SQLiteStateStore:
                     connection.execute("PRAGMA journal_mode = WAL").fetchone()
                     connection.execute("PRAGMA synchronous = NORMAL")
                 connection.executescript(_SCHEMA)
-                connection.execute("PRAGMA user_version = 1")
+                _migrate_schema(connection)
                 connection.execute(
                     """
                     INSERT INTO global_state(key, value_json, updated_at)
