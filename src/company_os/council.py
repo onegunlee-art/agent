@@ -50,6 +50,46 @@ ROLE_FIELD_OWNERS: dict[str, tuple[str, ...]] = {
 SHARED_FIELDS = ("decision_level",)
 
 
+def council_ignored_fields(
+    contributions: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, dict[str, str]], list[dict[str, str]]]:
+    """Return hash-only dropped fields and deterministic non-owner conflicts."""
+
+    field_owner = {
+        field: role
+        for role, fields in ROLE_FIELD_OWNERS.items()
+        for field in fields
+    }
+    ignored: dict[str, dict[str, str]] = {}
+    conflicts: list[dict[str, str]] = []
+    for role, owned_fields in ROLE_FIELD_OWNERS.items():
+        owned = set(owned_fields).union(SHARED_FIELDS)
+        contribution = contributions[role]
+        role_ignored: dict[str, str] = {}
+        for field in sorted(contribution):
+            if field in owned:
+                continue
+            opinion_hash = payload_fingerprint(contribution[field])
+            role_ignored[field] = opinion_hash
+            owner_role = field_owner.get(field)
+            if owner_role is None or field not in contributions[owner_role]:
+                continue
+            owner_hash = payload_fingerprint(contributions[owner_role][field])
+            if owner_hash != opinion_hash:
+                conflicts.append(
+                    {
+                        "field": field,
+                        "owner_role": owner_role,
+                        "owner_value_hash": owner_hash,
+                        "opinion_role": role,
+                        "opinion_value_hash": opinion_hash,
+                    }
+                )
+        ignored[role] = role_ignored
+    conflicts.sort(key=lambda item: (item["field"], item["opinion_role"]))
+    return ignored, conflicts
+
+
 @dataclass(frozen=True, slots=True)
 class CouncilMergeConflict(ValueError):
     conflicts: dict[str, dict[str, Any]]
@@ -94,6 +134,7 @@ def merge_council_responses(
         role: deepcopy(responses[role]["outputs"]) for role in ROLE_FIELD_OWNERS
     }
     metadata = response_metadata or {}
+    ignored_fields, non_owner_conflicts = council_ignored_fields(contributions)
     contract["council_provenance"] = {
         "compiler": "deterministic_role_field_ownership_v2",
         "field_ownership": {
@@ -109,6 +150,8 @@ def merge_council_responses(
             }
             for role in ROLE_FIELD_OWNERS
         },
+        "ignored_fields": ignored_fields,
+        "non_owner_conflicts": non_owner_conflicts,
         "agreement_is_not_evidence": True,
     }
     return contract
@@ -118,5 +161,6 @@ __all__ = [
     "CouncilMergeConflict",
     "ROLE_FIELD_OWNERS",
     "SHARED_FIELDS",
+    "council_ignored_fields",
     "merge_council_responses",
 ]

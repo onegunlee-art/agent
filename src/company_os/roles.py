@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from .first_principles import SYNTHETIC_FIXTURE_STATEMENT
+
 
 SCHEMA_VERSION = 1
 
@@ -321,7 +323,7 @@ def _fact(idea_id: str) -> dict[str, Any]:
     return {
         "id": "fact-1",
         "type": "FACT",
-        "statement": "The deterministic synthetic input fixture exists.",
+        "statement": SYNTHETIC_FIXTURE_STATEMENT,
         "evidence_refs": ["source-evidence-1"],
         "source_types": ["SYNTHETIC_FIXTURE"],
     }

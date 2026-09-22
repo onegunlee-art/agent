@@ -30,6 +30,26 @@ class GateResult:
     violations: tuple[Violation, ...]
 
 
+SYNTHETIC_FIXTURE_STATEMENT: Final = "The synthetic input fixture exists."
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceGrant:
+    """A trusted Evidence record's claim-support policy.
+
+    ``EXACT_STATEMENT`` is intentionally narrow and is used by automatically
+    created synthetic fixtures. ``GENERAL_DOCUMENT`` represents an explicit
+    CEO registration and can support a cited FACT without pretending that the
+    gate independently proved the document's contents.
+    """
+
+    kind: str
+    source_type: str
+    claim_scope: str
+    supported_statements: tuple[str, ...] = ()
+    trusted: bool = True
+
+
 _DECISION_LEVELS: Final = frozenset({"FP_LITE", "FP_STANDARD", "FP_FULL"})
 _DECISION_LEVEL_RANK: Final = {
     "FP_LITE": 1,
@@ -140,6 +160,7 @@ class FirstPrinciplesGate:
         *,
         min_decision_level: str = "FP_LITE",
         trusted_evidence_refs: frozenset[str] = frozenset(),
+        evidence_grants: Mapping[str, EvidenceGrant] | None = None,
         ceo_approved: bool = False,
     ) -> GateResult:
         """Return all structurally detectable violations in a stable order.
@@ -177,6 +198,12 @@ class FirstPrinciplesGate:
             for reference in trusted_evidence_refs
             if _non_empty_text(reference)
         )
+        if evidence_grants is not None:
+            trusted_refs = frozenset(
+                reference.strip()
+                for reference, grant in evidence_grants.items()
+                if _non_empty_text(reference) and grant.trusted
+            )
 
         raw_level = contract.get("decision_level")
         if not _non_empty_text(raw_level):
@@ -208,9 +235,19 @@ class FirstPrinciplesGate:
 
         self._validate_governance_checks(contract, violations)
         if level == "FP_LITE":
-            self._validate_lite(contract, trusted_refs, violations)
+            self._validate_lite(
+                contract,
+                trusted_refs,
+                evidence_grants,
+                violations,
+            )
         else:
-            self._validate_standard(contract, trusted_refs, violations)
+            self._validate_standard(
+                contract,
+                trusted_refs,
+                evidence_grants,
+                violations,
+            )
             if level == "FP_FULL":
                 self._validate_full(contract, ceo_approved, violations)
 
@@ -220,6 +257,7 @@ class FirstPrinciplesGate:
         self,
         contract: Mapping[str, Any],
         trusted_evidence_refs: frozenset[str],
+        evidence_grants: Mapping[str, EvidenceGrant] | None,
         violations: list[Violation],
     ) -> None:
         objective = contract.get("observable_objective")
@@ -288,12 +326,24 @@ class FirstPrinciplesGate:
                             f"{field}.source_types",
                             "Every FACT source type must be in the trusted allowlist.",
                         )
-                elif not _non_empty_text(fact):
+                    elif (
+                        _evidence_references_are_trusted(
+                            fact.get("evidence_refs"), trusted_evidence_refs
+                        )
+                        and not _fact_evidence_scope_matches(fact, evidence_grants)
+                    ):
+                        self._add(
+                            violations,
+                            "FACT_EVIDENCE_SCOPE_MISMATCH",
+                            field,
+                            "The cited Evidence does not support this FACT statement and source type.",
+                        )
+                else:
                     self._add(
                         violations,
-                        "KNOWN_FACTS_REQUIRED",
+                        "FACT_STRUCTURE_INVALID",
                         field,
-                        "A known-fact reference must be non-empty.",
+                        "Each known fact must be a structured FACT record with Evidence.",
                     )
 
         self._require_present(
@@ -315,6 +365,7 @@ class FirstPrinciplesGate:
         self,
         contract: Mapping[str, Any],
         trusted_evidence_refs: frozenset[str],
+        evidence_grants: Mapping[str, EvidenceGrant] | None,
         violations: list[Violation],
     ) -> dict[str, set[str]]:
         self._validate_observable_problem(contract, violations)
@@ -322,6 +373,7 @@ class FirstPrinciplesGate:
         claim_index, claim_provenance = self._validate_claims(
             contract,
             trusted_evidence_refs,
+            evidence_grants,
             violations,
         )
         constraint_provenance = self._validate_constraints(contract, violations)
@@ -453,6 +505,7 @@ class FirstPrinciplesGate:
         self,
         contract: Mapping[str, Any],
         trusted_evidence_refs: frozenset[str],
+        evidence_grants: Mapping[str, EvidenceGrant] | None,
         violations: list[Violation],
     ) -> tuple[dict[str, set[str]], dict[str, _ClaimProvenance]]:
         entries: list[tuple[str, Any, str | None]] = []
@@ -545,6 +598,7 @@ class FirstPrinciplesGate:
                             and _fact_evidence_traceable(
                                 claim,
                                 trusted_evidence_refs,
+                                evidence_grants,
                             )
                         ),
                     ),
@@ -596,6 +650,19 @@ class FirstPrinciplesGate:
                     "FACT_SOURCE_NOT_EVIDENCE",
                     f"{field}.source_types",
                     "Every FACT source type must be in the trusted allowlist.",
+                )
+            elif (
+                claim_type == "FACT"
+                and _evidence_references_are_trusted(
+                    claim.get("evidence_refs"), trusted_evidence_refs
+                )
+                and not _fact_evidence_scope_matches(claim, evidence_grants)
+            ):
+                self._add(
+                    violations,
+                    "FACT_EVIDENCE_SCOPE_MISMATCH",
+                    field,
+                    "The cited Evidence does not support this FACT statement and source type.",
                 )
 
         if "FACT" not in found_types:
@@ -1033,11 +1100,75 @@ def _fact_source_types_allowed(value: Any) -> bool:
 def _fact_evidence_traceable(
     claim: Mapping[str, Any],
     trusted_evidence_refs: frozenset[str],
+    evidence_grants: Mapping[str, EvidenceGrant] | None = None,
 ) -> bool:
     return _evidence_references_are_trusted(
         claim.get("evidence_refs"),
         trusted_evidence_refs,
-    ) and _fact_source_types_allowed(claim.get("source_types"))
+    ) and _fact_source_types_allowed(
+        claim.get("source_types")
+    ) and _fact_evidence_scope_matches(claim, evidence_grants)
+
+
+def _fact_evidence_scope_matches(
+    claim: Mapping[str, Any],
+    evidence_grants: Mapping[str, EvidenceGrant] | None,
+) -> bool:
+    """Return whether every cited grant is allowed to support this FACT.
+
+    Without a catalog, opaque caller-supplied references retain structural
+    behavior, but the reserved automatic ``source-evidence-1`` alias remains
+    exact-statement scoped. The CompanyOS application always supplies grants
+    resolved from SQLite and revalidated against their immutable files.
+    """
+
+    references = claim.get("evidence_refs")
+    source_types = claim.get("source_types")
+    statement = claim.get("statement")
+    if (
+        not _evidence_references(references)
+        or not _non_string_sequence(source_types)
+        or not _non_empty_text(statement)
+    ):
+        return False
+    if evidence_grants is None:
+        normalized_references = {
+            reference.strip() for reference in references
+        }
+        if "source-evidence-1" not in normalized_references:
+            return True
+        return (
+            _normalize(statement) == _normalize(SYNTHETIC_FIXTURE_STATEMENT)
+            and "SYNTHETIC_FIXTURE"
+            in {
+                source_type.strip().upper()
+                for source_type in source_types
+                if _non_empty_text(source_type)
+            }
+        )
+    declared_types = {
+        source_type.strip().upper()
+        for source_type in source_types
+        if _non_empty_text(source_type)
+    }
+    normalized_statement = _normalize(statement)
+    for reference in references:
+        grant = evidence_grants.get(reference.strip())
+        if grant is None or not grant.trusted:
+            return False
+        if grant.source_type.strip().upper() not in declared_types:
+            return False
+        if grant.claim_scope == "GENERAL_DOCUMENT":
+            continue
+        if grant.claim_scope != "EXACT_STATEMENT":
+            return False
+        if normalized_statement not in {
+            _normalize(item)
+            for item in grant.supported_statements
+            if _non_empty_text(item)
+        }:
+            return False
+    return True
 
 
 def _normalize(value: str) -> str:

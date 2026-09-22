@@ -149,6 +149,15 @@ def violation_codes(contract: dict, **kwargs) -> set[str]:
     return {item.code for item in validate_contract(contract, **kwargs).violations}
 
 
+def test_reserved_synthetic_fixture_ref_is_exact_statement_scoped() -> None:
+    contract = valid_standard_contract()
+    contract["claims"][0]["statement"] = (
+        "A fabricated synthetic market claim is worth KRW 10 trillion."
+    )
+
+    assert "FACT_EVIDENCE_SCOPE_MISMATCH" in violation_codes(contract)
+
+
 @pytest.mark.parametrize(
     ("mutate", "expected_code"),
     [
@@ -444,6 +453,18 @@ def test_gate_accepts_complete_lite_contract() -> None:
     assert result.violations == ()
 
 
+def test_gate_rejects_unstructured_lite_known_fact_even_when_nonempty() -> None:
+    contract = valid_lite_contract()
+    contract["known_facts"] = ["The synthetic input fixture exists."]
+
+    result = validate_contract(contract)
+
+    assert result.passed is False
+    assert "FACT_STRUCTURE_INVALID" in {
+        violation.code for violation in result.violations
+    }
+
+
 @pytest.mark.parametrize(
     ("section", "expected_code"),
     [
@@ -569,8 +590,12 @@ def test_gate_accepts_complete_standard_contract() -> None:
 def test_gate_accepts_allowlisted_fact_source_type(source_type: str) -> None:
     contract = valid_standard_contract()
     contract["claims"][0]["source_types"] = [source_type]
+    trusted_refs = TRUSTED_EVIDENCE_REFS
+    if source_type != "SYNTHETIC_FIXTURE":
+        contract["claims"][0]["evidence_refs"] = ["generic-evidence-1"]
+        trusted_refs = frozenset({"generic-evidence-1"})
 
-    result = validate_contract(contract)
+    result = validate_contract(contract, trusted_evidence_refs=trusted_refs)
 
     assert result.passed is True
     assert result.violations == ()

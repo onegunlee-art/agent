@@ -15,8 +15,18 @@ from .errors import (
     NotFoundError,
     ValidationError,
 )
-from .council import CouncilMergeConflict, merge_council_responses
-from .first_principles import FirstPrinciplesGate, GateResult
+from .evidence import validate_test_result_receipt
+from .council import (
+    CouncilMergeConflict,
+    council_ignored_fields,
+    merge_council_responses,
+)
+from .first_principles import (
+    EvidenceGrant,
+    FirstPrinciplesGate,
+    GateResult,
+    SYNTHETIC_FIXTURE_STATEMENT,
+)
 from .handoffs import (
     MODEL_METADATA,
     REVIEW_REQUEST_TITLE,
@@ -53,6 +63,7 @@ from .storage import (
     utc_now,
 )
 from .utils import (
+    atomic_write_bytes,
     atomic_write_json,
     atomic_write_text,
     contained_path,
@@ -69,7 +80,26 @@ from .verifier import (
 
 
 _VENTURE_ID = re.compile(r"^venture_[0-9a-f]{32}$")
+_EVIDENCE_EXTERNAL_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _ROLES = ("cto", "cpo", "cmo")
+_MAX_REGISTERED_EVIDENCE_BYTES = 16 * 1024 * 1024
+
+
+def _read_bounded_evidence_file(source: Path, *, label: str) -> bytes:
+    if source.is_symlink() or not source.is_file():
+        raise ValidationError(f"{label} source must be a regular file")
+    try:
+        if source.stat().st_size > _MAX_REGISTERED_EVIDENCE_BYTES:
+            raise ValidationError(f"{label} source exceeds the 16 MiB limit")
+        with source.open("rb") as handle:
+            content = handle.read(_MAX_REGISTERED_EVIDENCE_BYTES + 1)
+    except OSError as exc:
+        raise ValidationError(f"{label} source could not be read: {exc}") from exc
+    if not content:
+        raise ValidationError(f"{label} source must not be empty")
+    if len(content) > _MAX_REGISTERED_EVIDENCE_BYTES:
+        raise ValidationError(f"{label} source exceeds the 16 MiB limit")
+    return content
 
 
 class ExistingArtifactExecutor:
@@ -194,9 +224,419 @@ class CompanyOS:
         row = self._row("ideas", idea_id)
         return Idea(id=row["id"], text=row["text"], created_at=row["created_at"])
 
+    def register_idea_evidence(
+        self,
+        idea_id: str,
+        *,
+        evidence_file: str | Path,
+        external_ref: str | None = None,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Register an immutable CEO-supplied document for one Idea."""
+
+        self.idea(idea_id)
+        source = Path(evidence_file)
+        content = _read_bounded_evidence_file(source, label="Idea Evidence")
+        digest = sha256(content).hexdigest()
+        normalized_ref = (
+            external_ref.strip()
+            if isinstance(external_ref, str)
+            else f"ceo-evidence-{digest[:16]}"
+        )
+        if not _EVIDENCE_EXTERNAL_REF.fullmatch(normalized_ref):
+            raise ValidationError(
+                "Evidence external_ref must use letters, numbers, '.', '_', ':', or '-'"
+            )
+        if normalized_ref == "source-evidence-1":
+            raise ValidationError("source-evidence-1 is reserved for the system fixture")
+        command_payload = {
+            "idea_id": idea_id,
+            "external_ref": normalized_ref,
+            "sha256": digest,
+            "size_bytes": len(content),
+        }
+        created_paths: list[Path] = []
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            duplicate = connection.execute(
+                """
+                SELECT id FROM evidence
+                WHERE idea_id = ? AND (external_ref = ? OR id = ?)
+                """,
+                (idea_id, normalized_ref, normalized_ref),
+            ).fetchone()
+            if duplicate is not None:
+                raise ValidationError(
+                    "Evidence external_ref collides with an existing Evidence "
+                    f"alias for this Idea: {normalized_ref}"
+                )
+            evidence_id = new_id("evidence")
+            while evidence_id == normalized_ref or connection.execute(
+                """
+                SELECT 1 FROM evidence
+                WHERE id = ? OR (idea_id = ? AND external_ref = ?)
+                """,
+                (evidence_id, idea_id, evidence_id),
+            ).fetchone() is not None:
+                evidence_id = new_id("evidence")
+            target = contained_path(
+                self.root,
+                "var",
+                "evidence",
+                "ideas",
+                idea_id,
+                evidence_id,
+                "source.txt",
+            )
+            atomic_write_bytes(target, content)
+            created_paths.append(target)
+            copied_digest = sha256_file(target)
+            if copied_digest != digest:
+                raise ValidationError("Registered Evidence copy hash mismatch")
+            now = utc_now()
+            self.store.insert_row(
+                "evidence",
+                {
+                    "id": evidence_id,
+                    "idea_id": idea_id,
+                    "venture_id": None,
+                    "work_order_id": None,
+                    "run_id": None,
+                    "external_ref": normalized_ref,
+                    "kind": "CEO_SUPPLIED_DOCUMENT",
+                    "path": self._relative(target),
+                    "sha256": copied_digest,
+                    "trusted": 1,
+                    "payload_json": self._json(
+                        {
+                            "schema_version": 1,
+                            "trusted": True,
+                            "claimed_actor": "CEO",
+                            "trust_basis": "CEO_EXPLICIT_REGISTRATION",
+                            "source_type": "USER_SUPPLIED_DOCUMENT",
+                            "claim_scope": "GENERAL_DOCUMENT",
+                            "size_bytes": len(content),
+                        }
+                    ),
+                    "created_at": now,
+                },
+                connection=connection,
+            )
+            self.store.append_event(
+                "IDEA_EVIDENCE_REGISTERED",
+                aggregate_type="Evidence",
+                aggregate_id=evidence_id,
+                payload={
+                    "idea_id": idea_id,
+                    "external_ref": normalized_ref,
+                    "sha256": copied_digest,
+                    "claimed_actor": "CEO",
+                    "actor_identity_verified": False,
+                },
+                connection=connection,
+            )
+            return {
+                "id": evidence_id,
+                "idea_id": idea_id,
+                "external_ref": normalized_ref,
+                "kind": "CEO_SUPPLIED_DOCUMENT",
+                "path": self._relative(target),
+                "sha256": copied_digest,
+            }
+
+        try:
+            result = self.store.run_idempotent(
+                idempotency_key,
+                "register_idea_evidence",
+                command_payload,
+                operation,
+            )
+        except IdempotencyConflict as exc:
+            raise ConflictError(str(exc)) from exc
+        except BaseException:
+            for path in created_paths:
+                if path.is_file():
+                    path.unlink()
+                parent = path.parent
+                if parent.is_dir() and not any(parent.iterdir()):
+                    parent.rmdir()
+            raise
+        return dict(result)
+
+    def register_test_result(
+        self,
+        work_order_id: str,
+        *,
+        required_change_id: str,
+        result_file: str | Path,
+        test_node_ids: Iterable[str],
+        idempotency_key: str,
+        source_commit: str,
+        review_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Register immutable, change-specific local test execution evidence."""
+
+        if not isinstance(required_change_id, str):
+            raise ValidationError("TEST_RESULT required_change_id must be text")
+        normalized_change_id = required_change_id.strip()
+        if not normalized_change_id:
+            raise ValidationError("TEST_RESULT required_change_id must not be empty")
+        nodes = [
+            node.strip()
+            for node in test_node_ids
+            if isinstance(node, str) and node.strip()
+        ]
+        if not nodes:
+            raise ValidationError("TEST_RESULT requires at least one test node id")
+        if len(nodes) != len(set(nodes)):
+            raise ValidationError("TEST_RESULT test node ids must be unique")
+        nodes = sorted(nodes)
+        source = Path(result_file)
+        content = _read_bounded_evidence_file(source, label="TEST_RESULT")
+        digest = sha256(content).hexdigest()
+        receipt = validate_test_result_receipt(
+            content,
+            selected_node_ids=nodes,
+            source_commit=source_commit,
+            source_tree_sha256=None,
+        )
+        declared_tree = str(receipt["source_tree_sha256"])
+        existing = self.store.get_row("idempotency", idempotency_key)
+        if existing is not None and existing["status"] == "COMPLETED":
+            if existing["command"] != "register_test_result":
+                raise ConflictError(
+                    "Idempotency key belongs to a different command"
+                )
+            stored_request = json.loads(existing["request_json"])
+            replay_identity = {
+                "work_order_id": work_order_id,
+                "required_change_id": normalized_change_id,
+                "test_node_ids": nodes,
+                "result_file_sha256": digest,
+                "source_commit": source_commit,
+                "source_tree_sha256": declared_tree,
+            }
+            stored_identity = {
+                key: stored_request.get(key) for key in replay_identity
+            }
+            if stored_identity != replay_identity or (
+                review_id is not None
+                and stored_request.get("review_id") != review_id
+            ):
+                raise ConflictError(
+                    "Idempotency key was reused with different TEST_RESULT inputs"
+                )
+            return dict(json.loads(existing["result_json"]))
+
+        work = self.work_order(work_order_id)
+        if work.status != "REPAIR_REQUIRED":
+            raise ValidationError("TEST_RESULT requires a REPAIR_REQUIRED WorkOrder")
+        snapshot = self._source_snapshot()
+        if source_commit != snapshot.source_commit:
+            raise ValidationError("TEST_RESULT source_commit does not match source")
+        if declared_tree != snapshot.source_tree_sha256:
+            raise ValidationError(
+                "TEST_RESULT receipt source_tree_sha256 does not match source"
+            )
+        if review_id is None:
+            review_row = self.store.query_one(
+                """
+                SELECT * FROM reviews
+                WHERE work_order_id = ? AND status = 'CHANGES_REQUIRED'
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (work_order_id,),
+            )
+        else:
+            review_row = self.store.query_one(
+                """
+                SELECT * FROM reviews
+                WHERE id = ? AND work_order_id = ? AND status = 'CHANGES_REQUIRED'
+                """,
+                (review_id, work_order_id),
+            )
+        if review_row is None:
+            raise ValidationError(
+                "TEST_RESULT must reference the latest CHANGES_REQUIRED Review"
+            )
+        latest_review = self.store.query_one(
+            """
+            SELECT id FROM reviews
+            WHERE work_order_id = ? AND status = 'CHANGES_REQUIRED'
+            ORDER BY created_at DESC, id DESC LIMIT 1
+            """,
+            (work_order_id,),
+        )
+        if latest_review is None or latest_review["id"] != review_row["id"]:
+            raise ValidationError(
+                "TEST_RESULT must reference the latest CHANGES_REQUIRED Review"
+            )
+        change_row = self.store.query_one(
+            """
+            SELECT status FROM review_required_changes
+            WHERE review_id = ? AND change_id = ?
+            """,
+            (review_row["id"], normalized_change_id),
+        )
+        if change_row is None or change_row["status"] != "OPEN":
+            raise ValidationError("TEST_RESULT must reference an OPEN required_change")
+        selected_review_id = str(review_row["id"])
+        command_payload = {
+            "work_order_id": work_order_id,
+            "review_id": selected_review_id,
+            "required_change_id": normalized_change_id,
+            "test_node_ids": nodes,
+            "result_file_sha256": digest,
+            "source_commit": source_commit,
+            "source_tree_sha256": declared_tree,
+        }
+        created_paths: list[Path] = []
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            current_snapshot = self._source_snapshot()
+            if current_snapshot != snapshot:
+                raise ValidationError(
+                    "Source changed while registering TEST_RESULT Evidence"
+                )
+            current_work = connection.execute(
+                "SELECT status, venture_id FROM work_orders WHERE id = ?",
+                (work_order_id,),
+            ).fetchone()
+            current_change = connection.execute(
+                """
+                SELECT status FROM review_required_changes
+                WHERE review_id = ? AND change_id = ?
+                """,
+                (selected_review_id, normalized_change_id),
+            ).fetchone()
+            if current_work is None or current_work["status"] != "REPAIR_REQUIRED":
+                raise ValidationError(
+                    "TEST_RESULT requires a REPAIR_REQUIRED WorkOrder"
+                )
+            if current_change is None or current_change["status"] != "OPEN":
+                raise ValidationError(
+                    "TEST_RESULT must reference an OPEN required_change"
+                )
+            evidence_id = new_id("evidence")
+            target = contained_path(
+                self.root,
+                "var",
+                "evidence",
+                "test_results",
+                work_order_id,
+                selected_review_id,
+                payload_hash(normalized_change_id)[:16],
+                f"{evidence_id}.json",
+            )
+            atomic_write_bytes(target, content)
+            created_paths.append(target)
+            copied_digest = sha256_file(target)
+            if copied_digest != digest:
+                raise ValidationError("TEST_RESULT Evidence copy hash mismatch")
+            now = utc_now()
+            payload = {
+                "schema_version": 1,
+                "trusted": True,
+                "trust_basis": "LOCAL_TEST_RESULT_REGISTRATION",
+                "review_id": selected_review_id,
+                "required_change_id": normalized_change_id,
+                "test_node_ids": nodes,
+                "result_file_sha256": copied_digest,
+                "source_commit": snapshot.source_commit,
+                "source_tree_sha256": snapshot.source_tree_sha256,
+                "receipt_kind": receipt["kind"],
+                "receipt_status": receipt["status"],
+                "receipt_exit_code": receipt["exit_code"],
+            }
+            self.store.insert_row(
+                "evidence",
+                {
+                    "id": evidence_id,
+                    "idea_id": None,
+                    "venture_id": current_work["venture_id"],
+                    "work_order_id": work_order_id,
+                    "run_id": None,
+                    "external_ref": None,
+                    "kind": "TEST_RESULT",
+                    "path": self._relative(target),
+                    "sha256": copied_digest,
+                    "trusted": 1,
+                    "payload_json": self._json(payload),
+                    "created_at": now,
+                },
+                connection=connection,
+            )
+            self.store.append_event(
+                "TEST_RESULT_EVIDENCE_REGISTERED",
+                aggregate_type="Evidence",
+                aggregate_id=evidence_id,
+                venture_id=str(current_work["venture_id"]),
+                payload={
+                    "work_order_id": work_order_id,
+                    "review_id": selected_review_id,
+                    "required_change_id": normalized_change_id,
+                    "test_node_ids": nodes,
+                    "result_file_sha256": copied_digest,
+                    "source_commit": snapshot.source_commit,
+                    "source_tree_sha256": snapshot.source_tree_sha256,
+                },
+                connection=connection,
+            )
+            return {
+                "id": evidence_id,
+                "kind": "TEST_RESULT",
+                "work_order_id": work_order_id,
+                "review_id": selected_review_id,
+                "required_change_id": normalized_change_id,
+                "test_node_ids": nodes,
+                "path": self._relative(target),
+                "sha256": copied_digest,
+                "source_commit": snapshot.source_commit,
+                "source_tree_sha256": snapshot.source_tree_sha256,
+            }
+
+        try:
+            result = self.store.run_idempotent(
+                idempotency_key,
+                "register_test_result",
+                command_payload,
+                operation,
+            )
+        except IdempotencyConflict as exc:
+            raise ConflictError(str(exc)) from exc
+        except BaseException:
+            for path in created_paths:
+                if path.is_file():
+                    path.unlink()
+                parent = path.parent
+                if parent.is_dir() and not any(parent.iterdir()):
+                    parent.rmdir()
+            raise
+        return dict(result)
+
     def prepare_council(self, idea_id: str) -> tuple[CouncilRequest, ...]:
         idea = self.idea(idea_id)
-        command_payload = {"idea_id": idea_id, "schema_version": 1}
+        registered_inputs = [
+            {
+                "id": row["id"],
+                "external_ref": row["external_ref"],
+                "sha256": row["sha256"],
+            }
+            for row in self.store.query_all(
+                """
+                SELECT id, external_ref, sha256 FROM evidence
+                WHERE idea_id = ? AND trusted = 1
+                  AND kind != 'SYNTHETIC_FIXTURE'
+                ORDER BY id
+                """,
+                (idea_id,),
+            )
+        ]
+        command_payload = {
+            "idea_id": idea_id,
+            "schema_version": 1,
+            "registered_evidence": registered_inputs,
+        }
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             directory = contained_path(
@@ -208,35 +648,90 @@ class CompanyOS:
                 "schema_version": 1,
                 "idea_id": idea.id,
                 "kind": "SYNTHETIC_FIXTURE",
-                "statement": "The local input fixture for this Idea exists.",
+                "statement": SYNTHETIC_FIXTURE_STATEMENT,
                 "idea_text": idea.text,
             }
-            atomic_write_json(source_evidence_path, source_evidence)
-            source_evidence_id = new_id("evidence")
             now = utc_now()
-            self.store.insert_row(
-                "evidence",
+            existing_source = connection.execute(
+                """
+                SELECT id, kind, path, sha256 FROM evidence
+                WHERE idea_id = ? AND external_ref = ?
+                """,
+                (idea_id, source_evidence_ref),
+            ).fetchone()
+            if existing_source is None:
+                atomic_write_json(source_evidence_path, source_evidence)
+                source_evidence_id = new_id("evidence")
+                while connection.execute(
+                    """
+                    SELECT 1 FROM evidence
+                    WHERE id = ? OR (idea_id = ? AND external_ref = ?)
+                    """,
+                    (source_evidence_id, idea_id, source_evidence_id),
+                ).fetchone() is not None:
+                    source_evidence_id = new_id("evidence")
+                self.store.insert_row(
+                    "evidence",
+                    {
+                        "id": source_evidence_id,
+                        "idea_id": idea_id,
+                        "venture_id": None,
+                        "work_order_id": None,
+                        "run_id": None,
+                        "external_ref": source_evidence_ref,
+                        "kind": "SYNTHETIC_FIXTURE",
+                        "path": self._relative(source_evidence_path),
+                        "sha256": sha256_file(source_evidence_path),
+                        "trusted": 1,
+                        "payload_json": self._json(
+                            {
+                                "schema_version": 1,
+                                "trusted": True,
+                                "trust_basis": "SYSTEM_SYNTHETIC_FIXTURE",
+                                "source_type": "SYNTHETIC_FIXTURE",
+                                "claim_scope": "EXACT_STATEMENT",
+                                "supported_statements": [
+                                    SYNTHETIC_FIXTURE_STATEMENT
+                                ],
+                            }
+                        ),
+                        "created_at": now,
+                    },
+                    connection=connection,
+                )
+            else:
+                if existing_source["kind"] != "SYNTHETIC_FIXTURE":
+                    raise ValidationError(
+                        "Reserved source-evidence-1 has an invalid Evidence kind"
+                    )
+                issue = self._file_integrity_issue(
+                    source_table="evidence",
+                    record_id=str(existing_source["id"]),
+                    stored_path=existing_source["path"],
+                    expected_sha256=existing_source["sha256"],
+                )
+                if issue is not None:
+                    raise ValidationError(
+                        "Existing synthetic fixture Evidence is missing or changed"
+                    )
+            available_evidence = [
                 {
-                    "id": source_evidence_id,
-                    "idea_id": idea_id,
-                    "venture_id": None,
-                    "work_order_id": None,
-                    "run_id": None,
-                    "external_ref": source_evidence_ref,
-                    "kind": "SYNTHETIC_FIXTURE",
-                    "path": self._relative(source_evidence_path),
-                    "sha256": sha256_file(source_evidence_path),
-                    "trusted": 1,
-                    "payload_json": self._json(
-                        {
-                            "trusted": True,
-                            "source_types": ["SYNTHETIC_FIXTURE"],
-                        }
-                    ),
-                    "created_at": now,
-                },
-                connection=connection,
-            )
+                    "id": row["id"],
+                    "external_ref": row["external_ref"],
+                    "kind": row["kind"],
+                    "path": row["path"],
+                    "sha256": row["sha256"],
+                }
+                for row in connection.execute(
+                    """
+                    SELECT id, external_ref, kind, path, sha256
+                    FROM evidence
+                    WHERE idea_id = ? AND trusted = 1
+                    ORDER BY created_at, id
+                    """,
+                    (idea_id,),
+                ).fetchall()
+            ]
             request_rows: list[dict[str, str]] = []
             for role in _ROLES:
                 spec = serialize_role_spec(role)
@@ -248,15 +743,7 @@ class CompanyOS:
                     "role_spec": spec,
                     "model_metadata": MODEL_METADATA,
                     "execution_status": "NOT_EXECUTED",
-                    "available_evidence": [
-                        {
-                            "id": source_evidence_id,
-                            "external_ref": source_evidence_ref,
-                            "kind": "SYNTHETIC_FIXTURE",
-                            "path": self._relative(source_evidence_path),
-                            "sha256": sha256_file(source_evidence_path),
-                        }
-                    ],
+                    "available_evidence": available_evidence,
                     "response_requirements": {
                         "required_envelope_fields": [
                             "schema_version",
@@ -299,7 +786,7 @@ class CompanyOS:
             return {"requests": request_rows}
 
         result = self.store.run_idempotent(
-            f"council-prepare:{idea_id}:v1",
+            f"council-prepare:{idea_id}:v2:{payload_hash(registered_inputs)}",
             "prepare_council",
             command_payload,
             operation,
@@ -575,11 +1062,12 @@ class CompanyOS:
                 )
             raise ConflictError(f"Council contributions conflict; see {inbox_path}")
 
-        trusted_refs = self._trusted_evidence_refs(idea_id)
+        evidence_grants = self._evidence_grants(idea_id)
         gate_result = self.gate.validate(
             contract,
             min_decision_level=min_decision_level,
-            trusted_evidence_refs=trusted_refs,
+            trusted_evidence_refs=frozenset(evidence_grants),
+            evidence_grants=evidence_grants,
             ceo_approved=False,
         )
         command_payload = {
@@ -588,8 +1076,12 @@ class CompanyOS:
             "response_hashes": {
                 role: response_metadata[role]["response_hash"] for role in _ROLES
             },
+            "evidence_grants_fingerprint": self._evidence_grants_fingerprint(
+                evidence_grants
+            ),
+            "gate_result_fingerprint": self._gate_result_fingerprint(gate_result),
         }
-        return self._persist_contract(
+        outcome = self._persist_contract(
             idea_id=idea_id,
             contract=contract,
             min_decision_level=min_decision_level,
@@ -598,6 +1090,17 @@ class CompanyOS:
             command="compile_council",
             command_payload=command_payload,
         )
+        self._close_shared_council_conflict_after_resubmission(
+            idea_id,
+            contract_id=outcome.contract_id,
+        )
+        self._surface_council_non_owner_conflicts(
+            idea_id,
+            contract,
+            by_role,
+            contract_id=outcome.contract_id,
+        )
+        return outcome
 
     def resolve_council(
         self,
@@ -628,21 +1131,42 @@ class CompanyOS:
                 f"Council responses are incomplete; missing: {', '.join(missing)}"
             )
         response_hashes = {row["role"]: row["response_hash"] for row in rows}
+        response_metadata = {
+            row["role"]: {
+                "response_id": row["id"],
+                "version": row["version"],
+                "response_hash": row["response_hash"],
+                "source_path": row["source_path"],
+                "contribution_hash": payload_hash(
+                    by_role[row["role"]]["contract_contribution"]
+                ),
+                "outputs_hash": payload_hash(by_role[row["role"]]["outputs"]),
+            }
+            for row in rows
+        }
         contract["executive_outputs"] = {
             role: deepcopy(by_role[role]["outputs"]) for role in _ROLES
         }
+        contributions = {
+            role: by_role[role]["contract_contribution"] for role in _ROLES
+        }
+        ignored_fields, non_owner_conflicts = council_ignored_fields(contributions)
         contract["council_provenance"] = {
             "compiler": "ceo_conflict_resolution_v2",
             "roles": list(_ROLES),
             "response_hashes": response_hashes,
+            "responses": response_metadata,
             "resolution_source": "user_supplied_complete_contract",
+            "ignored_fields": ignored_fields,
+            "non_owner_conflicts": non_owner_conflicts,
             "agreement_is_not_evidence": True,
         }
-        trusted_refs = self._trusted_evidence_refs(idea_id)
+        evidence_grants = self._evidence_grants(idea_id)
         gate_result = self.gate.validate(
             contract,
             min_decision_level=min_decision_level,
-            trusted_evidence_refs=trusted_refs,
+            trusted_evidence_refs=frozenset(evidence_grants),
+            evidence_grants=evidence_grants,
             ceo_approved=False,
         )
         command_payload = {
@@ -650,6 +1174,10 @@ class CompanyOS:
             "min_decision_level": min_decision_level,
             "contract_hash": payload_hash(contract),
             "response_hashes": response_hashes,
+            "evidence_grants_fingerprint": self._evidence_grants_fingerprint(
+                evidence_grants
+            ),
+            "gate_result_fingerprint": self._gate_result_fingerprint(gate_result),
         }
         outcome = self._persist_contract(
             idea_id=idea_id,
@@ -673,7 +1201,170 @@ class CompanyOS:
                 "contract_id": outcome.contract_id,
             },
         )
+        self._surface_council_non_owner_conflicts(
+            idea_id,
+            contract,
+            by_role,
+            contract_id=outcome.contract_id,
+            resolved_by_ceo=True,
+        )
         return outcome
+
+    def _close_shared_council_conflict_after_resubmission(
+        self,
+        idea_id: str,
+        *,
+        contract_id: str,
+    ) -> None:
+        """Close a durable shared-field conflict after responses converge."""
+
+        inbox_path = contained_path(
+            self.root, "var", "inbox", "ideas", idea_id, "council_conflict.json"
+        )
+        if not inbox_path.is_file():
+            return
+        try:
+            prior = read_json(inbox_path)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return
+        if (
+            not isinstance(prior, dict)
+            or prior.get("type") != "COUNCIL_SHARED_FIELD_CONFLICT"
+            or prior.get("status") != "CEO_DECISION_REQUIRED"
+        ):
+            return
+        core = {
+            "type": "COUNCIL_SHARED_FIELD_CONFLICT",
+            "idea_id": idea_id,
+            "status": "RESOLVED_BY_ROLE_RESUBMISSION",
+            "contract_id": contract_id,
+            "resolution_method": "ROLE_RESPONSE_RESUBMISSION",
+            "previous_conflict_hash": prior.get("conflict_hash"),
+        }
+        resolution_hash = payload_hash(core)
+        atomic_write_json(
+            inbox_path,
+            {**core, "conflict_hash": resolution_hash},
+        )
+        self.store.append_event(
+            "COUNCIL_CONFLICT_RESOLVED",
+            aggregate_type="Idea",
+            aggregate_id=idea_id,
+            payload={
+                "inbox_path": self._relative(inbox_path),
+                "contract_id": contract_id,
+                "resolution_method": "ROLE_RESPONSE_RESUBMISSION",
+                "previous_conflict_hash": prior.get("conflict_hash"),
+                "resolution_hash": resolution_hash,
+            },
+        )
+
+    def _surface_council_non_owner_conflicts(
+        self,
+        idea_id: str,
+        contract: dict[str, Any],
+        responses: dict[str, dict[str, Any]],
+        *,
+        contract_id: str | None = None,
+        resolved_by_ceo: bool = False,
+    ) -> None:
+        provenance = contract.get("council_provenance", {})
+        conflict_records = provenance.get("non_owner_conflicts", [])
+        if not isinstance(conflict_records, list):
+            return
+        inbox_path = contained_path(
+            self.root,
+            "var",
+            "inbox",
+            "ideas",
+            idea_id,
+            "council_non_owner_conflicts.json",
+        )
+        if not conflict_records and not inbox_path.is_file():
+            return
+        response_metadata = provenance.get("responses", {})
+        expanded: list[dict[str, Any]] = []
+        for item in conflict_records:
+            if not isinstance(item, dict):
+                continue
+            field = item.get("field")
+            owner_role = item.get("owner_role")
+            opinion_role = item.get("opinion_role")
+            if (
+                not isinstance(field, str)
+                or owner_role not in responses
+                or opinion_role not in responses
+            ):
+                continue
+            owner_contribution = responses[owner_role].get(
+                "contract_contribution", {}
+            )
+            opinion_contribution = responses[opinion_role].get(
+                "contract_contribution", {}
+            )
+            expanded.append(
+                {
+                    **item,
+                    "owner_value": deepcopy(owner_contribution.get(field)),
+                    "opinion_value": deepcopy(opinion_contribution.get(field)),
+                    "owner_source_path": (
+                        response_metadata.get(owner_role, {}).get("source_path")
+                        if isinstance(response_metadata, dict)
+                        else None
+                    ),
+                    "opinion_source_path": (
+                        response_metadata.get(opinion_role, {}).get("source_path")
+                        if isinstance(response_metadata, dict)
+                        else None
+                    ),
+                    "selected_contract_value": deepcopy(contract.get(field)),
+                    "selected_contract_value_hash": payload_hash(
+                        contract.get(field)
+                    ),
+                }
+            )
+        status = (
+            "RESOLVED_BY_CEO"
+            if expanded and resolved_by_ceo
+            else "CEO_REVIEW_REQUIRED"
+            if expanded
+            else "RESOLVED"
+        )
+        core = {
+            "type": "COUNCIL_NON_OWNER_CONFLICT",
+            "idea_id": idea_id,
+            "status": status,
+            "contract_id": contract_id,
+            "conflicts": expanded,
+        }
+        conflict_hash = payload_hash(core)
+        prior_hash = None
+        if inbox_path.is_file():
+            try:
+                prior = read_json(inbox_path)
+                if isinstance(prior, dict):
+                    prior_hash = prior.get("conflict_hash")
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                prior_hash = None
+        atomic_write_json(inbox_path, {**core, "conflict_hash": conflict_hash})
+        if prior_hash != conflict_hash:
+            self.store.append_event(
+                (
+                    "COUNCIL_NON_OWNER_CONFLICT_DETECTED"
+                    if status == "CEO_REVIEW_REQUIRED"
+                    else "COUNCIL_NON_OWNER_CONFLICT_RESOLVED"
+                ),
+                aggregate_type="Idea",
+                aggregate_id=idea_id,
+                payload={
+                    "inbox_path": self._relative(inbox_path),
+                    "conflict_hash": conflict_hash,
+                    "status": status,
+                    "contract_id": contract_id,
+                    "resolved_by_ceo": resolved_by_ceo,
+                    "conflicts": conflict_records,
+                },
+            )
 
     def _trusted_evidence_refs(
         self,
@@ -681,21 +1372,130 @@ class CompanyOS:
         *,
         connection: sqlite3.Connection | None = None,
     ) -> frozenset[str]:
-        query = (
-            "SELECT id, external_ref FROM evidence "
-            "WHERE idea_id = ? AND trusted = 1"
+        return frozenset(self._evidence_grants(idea_id, connection=connection))
+
+    def idea_evidence_fingerprint(self, idea_id: str) -> str:
+        """Fingerprint the currently usable Evidence grants for CLI replay keys."""
+
+        self.idea(idea_id)
+        return self._evidence_grants_fingerprint(self._evidence_grants(idea_id))
+
+    @staticmethod
+    def _evidence_grants_fingerprint(
+        grants: dict[str, EvidenceGrant],
+    ) -> str:
+        return payload_hash(
+            {
+                reference: {
+                    "kind": grant.kind,
+                    "source_type": grant.source_type,
+                    "claim_scope": grant.claim_scope,
+                    "supported_statements": list(grant.supported_statements),
+                    "trusted": grant.trusted,
+                }
+                for reference, grant in grants.items()
+            }
         )
+
+    @staticmethod
+    def _gate_result_fingerprint(gate_result: GateResult) -> str:
+        return payload_hash(
+            {
+                "passed": gate_result.passed,
+                "violations": [
+                    {
+                        "code": violation.code,
+                        "field": violation.field,
+                        "message": violation.message,
+                    }
+                    for violation in gate_result.violations
+                ],
+            }
+        )
+
+    def _evidence_grants(
+        self,
+        idea_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, EvidenceGrant]:
+        query = """
+            SELECT id, external_ref, kind, path, sha256, trusted, payload_json
+            FROM evidence
+            WHERE idea_id = ? AND trusted = 1
+            ORDER BY created_at, id
+        """
         rows = (
             connection.execute(query, (idea_id,)).fetchall()
             if connection is not None
             else self.store.query_all(query, (idea_id,))
         )
-        refs: set[str] = set()
+        grants: dict[str, EvidenceGrant] = {}
+        ambiguous: set[str] = set()
         for row in rows:
-            refs.add(str(row["id"]))
+            issue = self._file_integrity_issue(
+                source_table="evidence",
+                record_id=str(row["id"]),
+                stored_path=row["path"],
+                expected_sha256=row["sha256"],
+            )
+            if issue is not None:
+                continue
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            kind = str(row["kind"])
+            if kind == "SYNTHETIC_FIXTURE":
+                source_type = "SYNTHETIC_FIXTURE"
+                claim_scope = "EXACT_STATEMENT"
+                raw_statements = payload.get(
+                    "supported_statements",
+                    [SYNTHETIC_FIXTURE_STATEMENT],
+                )
+                if not isinstance(raw_statements, list):
+                    continue
+                supported_statements = tuple(
+                    item.strip()
+                    for item in raw_statements
+                    if isinstance(item, str) and item.strip()
+                )
+                if supported_statements != (SYNTHETIC_FIXTURE_STATEMENT,):
+                    continue
+            elif kind == "CEO_SUPPLIED_DOCUMENT":
+                if (
+                    payload.get("trust_basis") != "CEO_EXPLICIT_REGISTRATION"
+                    or payload.get("source_type") != "USER_SUPPLIED_DOCUMENT"
+                    or payload.get("claim_scope") != "GENERAL_DOCUMENT"
+                ):
+                    continue
+                source_type = "USER_SUPPLIED_DOCUMENT"
+                claim_scope = "GENERAL_DOCUMENT"
+                supported_statements = ()
+            else:
+                continue
+            grant = EvidenceGrant(
+                kind=kind,
+                source_type=source_type,
+                claim_scope=claim_scope,
+                supported_statements=supported_statements,
+                trusted=True,
+            )
+            aliases = [str(row["id"])]
             if row["external_ref"]:
-                refs.add(str(row["external_ref"]))
-        return frozenset(refs)
+                aliases.append(str(row["external_ref"]))
+            for alias in aliases:
+                if alias in ambiguous:
+                    continue
+                prior = grants.get(alias)
+                if prior is not None:
+                    grants.pop(alias, None)
+                    ambiguous.add(alias)
+                else:
+                    grants[alias] = grant
+        return grants
 
     def _persist_contract(
         self,
@@ -720,21 +1520,66 @@ class CompanyOS:
             if only_ceo_approval_missing
             else "FAILED"
         )
+        idea_status = (
+            "CONTRACT_COMPILED"
+            if gate_status == "PASSED"
+            else "APPROVAL_REQUIRED"
+            if gate_status == "PENDING_APPROVAL"
+            else "GATE_FAILED"
+        )
+        violation_payload = [
+            {"code": v.code, "field": v.field, "message": v.message}
+            for v in gate_result.violations
+        ]
 
         def operation(connection: sqlite3.Connection) -> dict[str, str]:
             encoded_contract = self._json(contract)
+            now = utc_now()
             existing_contract = connection.execute(
                 """
-                SELECT id FROM contracts
+                SELECT id, gate_status FROM contracts
                 WHERE idea_id = ? AND payload_json = ? AND min_decision_level = ?
                 ORDER BY created_at LIMIT 1
                 """,
                 (idea_id, encoded_contract, min_decision_level),
             ).fetchone()
             if existing_contract is not None:
-                return {"contract_id": existing_contract["id"]}
+                contract_id = str(existing_contract["id"])
+                connection.execute(
+                    "UPDATE contracts SET gate_status = ?, updated_at = ? WHERE id = ?",
+                    (gate_status, now, contract_id),
+                )
+                connection.execute(
+                    "UPDATE ideas SET status = ?, updated_at = ? WHERE id = ?",
+                    (idea_status, now, idea_id),
+                )
+                self.store.append_event(
+                    "FIRST_PRINCIPLES_GATE_EVALUATED",
+                    aggregate_type="VentureContract",
+                    aggregate_id=contract_id,
+                    payload={
+                        "passed": gate_result.passed,
+                        "gate_status": gate_status,
+                        "previous_gate_status": existing_contract["gate_status"],
+                        "reevaluation": True,
+                        "min_decision_level": min_decision_level,
+                        "violations": violation_payload,
+                    },
+                    connection=connection,
+                )
+                if resolved:
+                    self.store.append_event(
+                        "COUNCIL_CONFLICT_RESOLVED",
+                        aggregate_type="Idea",
+                        aggregate_id=idea_id,
+                        payload={
+                            "contract_id": contract_id,
+                            "resolution_method": "CEO_CONTRACT",
+                        },
+                        connection=connection,
+                    )
+                return {"contract_id": contract_id}
             contract_id = new_id("contract")
-            now = utc_now()
             self.store.insert_row(
                 "contracts",
                 {
@@ -749,13 +1594,6 @@ class CompanyOS:
                 },
                 connection=connection,
             )
-            idea_status = (
-                "CONTRACT_COMPILED"
-                if gate_status == "PASSED"
-                else "APPROVAL_REQUIRED"
-                if gate_status == "PENDING_APPROVAL"
-                else "GATE_FAILED"
-            )
             connection.execute(
                 "UPDATE ideas SET status = ?, updated_at = ? WHERE id = ?",
                 (idea_status, now, idea_id),
@@ -767,11 +1605,9 @@ class CompanyOS:
                 payload={
                     "passed": gate_result.passed,
                     "gate_status": gate_status,
+                    "reevaluation": False,
                     "min_decision_level": min_decision_level,
-                    "violations": [
-                        {"code": v.code, "field": v.field, "message": v.message}
-                        for v in gate_result.violations
-                    ],
+                    "violations": violation_payload,
                 },
                 connection=connection,
             )
@@ -780,7 +1616,10 @@ class CompanyOS:
                     "COUNCIL_CONFLICT_RESOLVED",
                     aggregate_type="Idea",
                     aggregate_id=idea_id,
-                    payload={"contract_id": contract_id},
+                    payload={
+                        "contract_id": contract_id,
+                        "resolution_method": "CEO_CONTRACT",
+                    },
                     connection=connection,
                 )
             return {"contract_id": contract_id}
@@ -889,6 +1728,23 @@ class CompanyOS:
                 """,
                 (idea_id,),
             ).fetchall()
+            evidence_grants = self._evidence_grants(
+                idea_id,
+                connection=connection,
+            )
+            invalid_trusted_evidence = [
+                str(row["id"])
+                for row in idea_evidence_rows
+                if row["trusted"] == 1 and str(row["id"]) not in evidence_grants
+            ]
+            if invalid_trusted_evidence:
+                raise ValidationError(
+                    "Trusted Idea Evidence failed canonical integrity or policy "
+                    "validation: " + ", ".join(invalid_trusted_evidence)
+                )
+            evidence_grants_fingerprint = self._evidence_grants_fingerprint(
+                evidence_grants
+            )
             venture_evidence_records: list[dict[str, Any]] = []
             for row in idea_evidence_rows:
                 evidence_payload = json.loads(row["payload_json"])
@@ -974,12 +1830,22 @@ class CompanyOS:
                 ).fetchone()[0]
                 > 0
             )
+            current_evidence_grants = self._evidence_grants(
+                idea_id,
+                connection=connection,
+            )
+            if (
+                self._evidence_grants_fingerprint(current_evidence_grants)
+                != evidence_grants_fingerprint
+            ):
+                raise ValidationError(
+                    "Idea Evidence changed while creating the Venture context"
+                )
             gate_result = self.gate.validate(
                 contract,
                 min_decision_level=contract_row["min_decision_level"],
-                trusted_evidence_refs=self._trusted_evidence_refs(
-                    idea_id, connection=connection
-                ),
+                trusted_evidence_refs=frozenset(current_evidence_grants),
+                evidence_grants=current_evidence_grants,
                 ceo_approved=ceo_approved,
             )
             if not gate_result.passed:
@@ -1535,11 +2401,28 @@ class CompanyOS:
             if _repair_mode and verification.status == "PASS":
                 if _repair_manifest is None:
                     raise ValidationError("Repair PASS requires a repair manifest")
+                repair_snapshot = self._source_snapshot()
+                if (
+                    repair_snapshot.source_commit
+                    != _repair_manifest["source_commit"]
+                    or repair_snapshot.source_tree_sha256
+                    != _repair_manifest["source_tree_sha256"]
+                ):
+                    raise ValidationError(
+                        "Source changed while executing the repair WorkOrder"
+                    )
                 for change in _repair_manifest["changes"]:
                     canonical_evidence_ids = self._canonical_repair_evidence_ids(
                         work_order_id,
                         change["evidence_ids"],
                         connection=connection,
+                        review_id=_repair_manifest["review_id"],
+                        required_change_id=change["id"],
+                        source_commit=_repair_manifest["source_commit"],
+                        source_tree_sha256=_repair_manifest[
+                            "source_tree_sha256"
+                        ],
+                        require_test_result=True,
                     )
                     self.store.insert_row(
                         "review_change_resolutions",
@@ -1552,6 +2435,7 @@ class CompanyOS:
                             "source_tree_sha256": _repair_manifest[
                                 "source_tree_sha256"
                             ],
+                            "evidence_policy_version": 1,
                             "evidence_json": self._json(
                                 sorted(
                                     set(canonical_evidence_ids + run_evidence_ids)
@@ -2001,7 +2885,6 @@ class CompanyOS:
                     "reason": "RESOLUTION_STRUCTURE_INVALID",
                 }
             ]
-        evidence_ids: set[str] = set()
         for resolution in resolutions:
             if not isinstance(resolution, dict) or not isinstance(
                 resolution.get("evidence_ids"), list
@@ -2016,27 +2899,50 @@ class CompanyOS:
                         "reason": "RESOLUTION_STRUCTURE_INVALID",
                     }
                 ]
-            evidence_ids.update(str(item) for item in resolution["evidence_ids"])
-        if not evidence_ids:
-            return []
-        try:
-            self._canonical_repair_evidence_ids(
-                str(review_row["work_order_id"]),
-                sorted(evidence_ids),
-                connection=connection,
+            policy = resolution.get("evidence_policy", {})
+            require_test_result = (
+                isinstance(policy, dict)
+                and policy.get("required_kind") == "TEST_RESULT"
             )
-        except ValidationError as exc:
-            return [
-                {
-                    "source_table": "review_change_resolutions",
-                    "record_id": str(review_row["id"]),
-                    "path": None,
-                    "expected_sha256": None,
-                    "observed_sha256": None,
-                    "reason": "RESOLUTION_EVIDENCE_INVALID",
-                    "message": str(exc),
-                }
-            ]
+            try:
+                self._canonical_repair_evidence_ids(
+                    str(review_row["work_order_id"]),
+                    [str(item) for item in resolution["evidence_ids"]],
+                    connection=connection,
+                    review_id=(
+                        str(resolution["origin_review_id"])
+                        if resolution.get("origin_review_id") is not None
+                        else None
+                    ),
+                    required_change_id=(
+                        str(resolution["required_change_id"])
+                        if resolution.get("required_change_id") is not None
+                        else None
+                    ),
+                    source_commit=(
+                        str(resolution["source_commit"])
+                        if resolution.get("source_commit") is not None
+                        else None
+                    ),
+                    source_tree_sha256=(
+                        str(resolution["source_tree_sha256"])
+                        if resolution.get("source_tree_sha256") is not None
+                        else None
+                    ),
+                    require_test_result=require_test_result,
+                )
+            except ValidationError as exc:
+                return [
+                    {
+                        "source_table": "review_change_resolutions",
+                        "record_id": str(review_row["id"]),
+                        "path": None,
+                        "expected_sha256": None,
+                        "observed_sha256": None,
+                        "reason": "RESOLUTION_EVIDENCE_INVALID",
+                        "message": str(exc),
+                    }
+                ]
         return []
 
     def _review_attachment_integrity_issues(
@@ -2255,7 +3161,8 @@ class CompanyOS:
                 raise ValidationError("Review parent lineage contains a cycle")
             seen.add(current_id)
             row = connection.execute(
-                "SELECT id, work_order_id, run_id, parent_review_id, status "
+                "SELECT id, work_order_id, run_id, parent_review_id, status, "
+                "schema_version "
                 "FROM reviews WHERE id = ?",
                 (current_id,),
             ).fetchone()
@@ -2607,7 +3514,8 @@ class CompanyOS:
                         resolution_rows = connection.execute(
                             """
                             SELECT required_change_id, repair_run_id, source_commit,
-                                   source_tree_sha256, evidence_json, created_at
+                                   source_tree_sha256, evidence_policy_version,
+                                   evidence_json, created_at
                             FROM review_change_resolutions
                             WHERE review_id = ? AND repair_run_id = ?
                             ORDER BY required_change_id, created_at
@@ -2619,7 +3527,8 @@ class CompanyOS:
                         resolution_rows = connection.execute(
                             """
                             SELECT required_change_id, repair_run_id, source_commit,
-                                   source_tree_sha256, evidence_json, created_at
+                                   source_tree_sha256, evidence_policy_version,
+                                   evidence_json, created_at
                             FROM review_change_resolutions
                             WHERE review_id = ? AND repair_run_id = ?
                             ORDER BY required_change_id, created_at
@@ -2648,10 +3557,22 @@ class CompanyOS:
                                 "Rereview resolution source does not match current source"
                             )
                         evidence_ids = json.loads(resolution["evidence_json"])
+                        test_result_required = (
+                            int(resolution["evidence_policy_version"]) >= 1
+                        )
                         canonical_evidence_ids = self._canonical_repair_evidence_ids(
                             work_order_id,
                             evidence_ids,
                             connection=connection,
+                            review_id=lineage_review_id,
+                            required_change_id=str(
+                                resolution["required_change_id"]
+                            ),
+                            source_commit=str(resolution["source_commit"]),
+                            source_tree_sha256=str(
+                                resolution["source_tree_sha256"]
+                            ),
+                            require_test_result=test_result_required,
                         )
                         required_status = next(
                             row["status"]
@@ -2678,6 +3599,16 @@ class CompanyOS:
                                     "source_tree_sha256"
                                 ],
                                 "evidence_ids": canonical_evidence_ids,
+                                "evidence_policy": {
+                                    "version": int(
+                                        resolution["evidence_policy_version"]
+                                    ),
+                                    "required_kind": (
+                                        "TEST_RESULT"
+                                        if test_result_required
+                                        else None
+                                    ),
+                                },
                                 "created_at": resolution["created_at"],
                             }
                         )
@@ -2693,7 +3624,7 @@ class CompanyOS:
                 )
                 requested_evidence_rows = connection.execute(
                     f"""
-                    SELECT id, kind, path, sha256, run_id, trusted
+                    SELECT id, kind, path, sha256, run_id, trusted, payload_json
                     FROM evidence
                     WHERE id IN ({evidence_placeholders})
                     ORDER BY id
@@ -2714,6 +3645,7 @@ class CompanyOS:
                         "sha256": evidence_row["sha256"],
                         "run_id": evidence_row["run_id"],
                         "trusted": bool(evidence_row["trusted"]),
+                        "metadata": json.loads(evidence_row["payload_json"]),
                         "size_bytes": len(content_bytes),
                     }
                     try:
@@ -2800,6 +3732,13 @@ class CompanyOS:
                         "required_changes",
                     ],
                     "verdicts": ["PASS", "CHANGES_REQUIRED"],
+                    "required_values": {
+                        "schema_version": 2,
+                        "reviewed_commit": source_snapshot.source_commit,
+                        "reviewed_tree_sha256": (
+                            source_snapshot.source_tree_sha256
+                        ),
+                    },
                 },
             }
             request_digest = payload_hash(request_core)
@@ -3163,6 +4102,11 @@ class CompanyOS:
         evidence_ids: Any,
         *,
         connection: sqlite3.Connection | None = None,
+        review_id: str | None = None,
+        required_change_id: str | None = None,
+        source_commit: str | None = None,
+        source_tree_sha256: str | None = None,
+        require_test_result: bool = False,
     ) -> list[str]:
         if not isinstance(evidence_ids, list) or not evidence_ids:
             raise ValidationError("Repair change requires canonical Evidence ids")
@@ -3176,34 +4120,32 @@ class CompanyOS:
             raise ValidationError("Repair Evidence ids must be unique")
 
         conn = connection or self.store.connection
+        found_test_result = False
         for evidence_id in normalized:
             row = conn.execute(
                 """
                 SELECT evidence.id, evidence.work_order_id, evidence.run_id,
-                       evidence.path, evidence.sha256, evidence.trusted,
+                       evidence.kind, evidence.path, evidence.sha256,
+                       evidence.trusted, evidence.payload_json,
                        runs.work_order_id AS run_work_order_id,
                        runs.status AS run_status
                 FROM evidence
-                JOIN runs ON runs.id = evidence.run_id
+                LEFT JOIN runs ON runs.id = evidence.run_id
                 WHERE evidence.id = ?
                 """,
                 (evidence_id,),
             ).fetchone()
             if row is None:
                 raise ValidationError(
-                    f"Repair Evidence is not a canonical run record: {evidence_id}"
+                    f"Repair Evidence is not a canonical record: {evidence_id}"
                 )
-            if (
-                row["work_order_id"] != work_order_id
-                or row["run_work_order_id"] != work_order_id
-                or not row["run_id"]
-            ):
+            if row["work_order_id"] != work_order_id:
                 raise ValidationError(
                     f"Repair Evidence is not linked to this WorkOrder: {evidence_id}"
                 )
-            if int(row["trusted"]) != 1 or row["run_status"] != "PASS":
+            if int(row["trusted"]) != 1:
                 raise ValidationError(
-                    f"Repair Evidence must be trusted and from a PASS Run: {evidence_id}"
+                    f"Repair Evidence must be trusted: {evidence_id}"
                 )
             issue = self._file_integrity_issue(
                 source_table="evidence",
@@ -3215,6 +4157,69 @@ class CompanyOS:
                 raise ValidationError(
                     f"Repair Evidence content is missing or changed: {evidence_id}"
                 )
+            if row["kind"] == "TEST_RESULT":
+                found_test_result = True
+                if row["run_id"] is not None:
+                    raise ValidationError(
+                        f"TEST_RESULT must not masquerade as Run Evidence: {evidence_id}"
+                    )
+                try:
+                    payload = json.loads(row["payload_json"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValidationError(
+                        f"TEST_RESULT metadata is invalid: {evidence_id}"
+                    ) from exc
+                nodes = payload.get("test_node_ids") if isinstance(payload, dict) else None
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("schema_version") != 1
+                    or payload.get("trusted") is not True
+                    or payload.get("trust_basis")
+                    != "LOCAL_TEST_RESULT_REGISTRATION"
+                    or payload.get("result_file_sha256") != row["sha256"]
+                    or payload.get("receipt_kind") != "PYTEST_RESULT"
+                    or payload.get("receipt_status") != "PASSED"
+                    or type(payload.get("receipt_exit_code")) is not int
+                    or payload.get("receipt_exit_code") != 0
+                    or not isinstance(nodes, list)
+                    or not nodes
+                    or not all(isinstance(node, str) and node.strip() for node in nodes)
+                    or len(nodes) != len(set(nodes))
+                ):
+                    raise ValidationError(
+                        f"TEST_RESULT metadata is incomplete or inconsistent: {evidence_id}"
+                    )
+                validate_test_result_receipt(
+                    self._absolute(str(row["path"])).read_bytes(),
+                    selected_node_ids=nodes,
+                    source_commit=str(payload.get("source_commit")),
+                    source_tree_sha256=str(
+                        payload.get("source_tree_sha256")
+                    ),
+                )
+                expected_values = (
+                    ("review_id", review_id),
+                    ("required_change_id", required_change_id),
+                    ("source_commit", source_commit),
+                    ("source_tree_sha256", source_tree_sha256),
+                )
+                for field, expected in expected_values:
+                    if expected is not None and payload.get(field) != expected:
+                        raise ValidationError(
+                            f"TEST_RESULT {field} does not match repair change: {evidence_id}"
+                        )
+            elif (
+                row["run_id"] is None
+                or row["run_work_order_id"] != work_order_id
+                or row["run_status"] != "PASS"
+            ):
+                raise ValidationError(
+                    f"Repair Evidence must be TEST_RESULT or trusted PASS Run Evidence: {evidence_id}"
+                )
+        if require_test_result and not found_test_result:
+            raise ValidationError(
+                "Each repair change requires change-specific TEST_RESULT Evidence"
+            )
         return sorted(normalized)
 
     def _validate_repair_manifest(
@@ -3308,6 +4313,11 @@ class CompanyOS:
             normalized_evidence_ids = self._canonical_repair_evidence_ids(
                 work_order_id,
                 change.get("evidence_ids"),
+                review_id=str(review_row["id"]),
+                required_change_id=str(change["id"]),
+                source_commit=snapshot.source_commit,
+                source_tree_sha256=snapshot.source_tree_sha256,
+                require_test_result=True,
             )
             normalized_changes.append(
                 {

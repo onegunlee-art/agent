@@ -123,19 +123,56 @@ def test_repair_requires_change_and_only_rereview_pass_completes(
         )
 
         def manifest() -> dict:
+            manifest_changes = []
+            for item in changes:
+                node_id = f"tests/test_review_rereview.py::{item['id']}"
+                test_result_path = (
+                    tmp_path
+                    / (
+                        f"test-result-{item['id']}-"
+                        f"{source.snapshot.source_commit[:8]}.json"
+                    )
+                )
+                test_result = company.register_test_result(
+                    work_order.id,
+                    required_change_id=item["id"],
+                    result_file=_write_result(
+                        test_result_path,
+                        {
+                            "schema_version": 1,
+                            "kind": "PYTEST_RESULT",
+                            "status": "PASSED",
+                            "exit_code": 0,
+                            "source_commit": source.snapshot.source_commit,
+                            "source_tree_sha256": (
+                                source.snapshot.source_tree_sha256
+                            ),
+                            "tests": [
+                                {"node_id": node_id, "outcome": "PASSED"}
+                            ],
+                        },
+                    ),
+                    test_node_ids=[node_id],
+                    review_id=review.id,
+                    source_commit=source.snapshot.source_commit,
+                    idempotency_key=(
+                        f"rereview-test-result:{review.id}:{item['id']}:"
+                        f"{source.snapshot.source_commit}"
+                    ),
+                )
+                manifest_changes.append(
+                    {
+                        "id": item["id"],
+                        "commit": source.snapshot.source_commit,
+                        "evidence_ids": [evidence_id, test_result["id"]],
+                    }
+                )
             return {
                 "schema_version": 1,
                 "review_id": review.id,
                 "source_commit": source.snapshot.source_commit,
                 "source_tree_sha256": source.snapshot.source_tree_sha256,
-                "changes": [
-                    {
-                        "id": item["id"],
-                        "commit": source.snapshot.source_commit,
-                        "evidence_ids": [evidence_id],
-                    }
-                    for item in changes
-                ],
+                "changes": manifest_changes,
             }
 
         with pytest.raises(ValidationError, match="no substantive change"):
@@ -170,6 +207,26 @@ def test_repair_requires_change_and_only_rereview_pass_completes(
         rereview = company.review(rereview_row["id"])
         rerequest = read_json(rereview.json_path)
         assert rerequest["change_resolutions"]
+        assert all(
+            resolution["evidence_policy"]["required_kind"] == "TEST_RESULT"
+            for resolution in rerequest["change_resolutions"]
+        )
+        embedded_test_results = [
+            evidence
+            for evidence in rerequest["evidence"]
+            if evidence["kind"] == "TEST_RESULT"
+        ]
+        assert len(embedded_test_results) == len(changes)
+        assert {
+            evidence["metadata"]["required_change_id"]
+            for evidence in embedded_test_results
+        } == {item["id"] for item in changes}
+        assert all(
+            evidence["metadata"]["test_node_ids"]
+            and evidence["metadata"]["source_commit"]
+            == source.snapshot.source_commit
+            for evidence in embedded_test_results
+        )
         assert {
             row["status"]
             for row in company.store.query_all(

@@ -29,6 +29,7 @@ python -m venv .venv
 ```powershell
 company init
 company idea create "Create one synthetic artifact and verify it."
+company evidence add --idea <idea_id> --file <source_document> --external-ref <ref>
 company council prepare <idea_id>
 company council ingest <idea_id> --role cto --file <cto_response.json>
 company council ingest <idea_id> --role cpo --file <cpo_response.json>
@@ -65,6 +66,9 @@ state defaults to `var/state/company.db` below that root.
 Corrected executive responses can be ingested again; the prior version is
 retained as `SUPERSEDED`. If a genuinely shared Council field conflicts, use
 `company council resolve <idea_id> --contract-file <complete_contract.json>`.
+Non-owner opinions are retained as hash-only Council provenance; disagreements
+with the field owner's value are also shown in `company inbox` without
+silently replacing the owner value.
 
 ## State and artifacts
 
@@ -90,7 +94,16 @@ retained as `SUPERSEDED`. If a genuinely shared Council field conflicts, use
 - Both the JSON and Markdown ReviewRequest files are hash-bound and rechecked
   before a ReviewResult can change state.
 - A repair requires one hash-checked resolution per required-change ID and
-  always returns to independent rereview before completion.
+  a change-specific `TEST_RESULT` Evidence record bound to test node IDs and
+  the current source commit. Register it with
+  `company evidence add-test-result <work_order_id> --review <review_id>
+  --change <change_id> --file <test_result> --node-id <pytest_node_id>
+  --source-commit <commit>`.
+  Every repair always returns to independent rereview before completion.
+- The automatic synthetic fixture can support only its exact fixture-exists
+  statement. Other FACTs require an explicitly registered, hash-bound CEO
+  document; registration records a claimed actor but does not authenticate a
+  human identity.
 - A stale, legacy, or damaged pending review is preserved as `SUPERSEDED` and
   reissued against current clean source; it cannot strand the WorkOrder in an
   unrecoverable `WAITING_FOR_OPUS` state.

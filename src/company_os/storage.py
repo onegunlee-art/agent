@@ -256,6 +256,7 @@ CREATE TABLE IF NOT EXISTS review_change_resolutions (
     repair_run_id       TEXT NOT NULL REFERENCES runs(id),
     source_commit       TEXT NOT NULL,
     source_tree_sha256  TEXT NOT NULL,
+    evidence_policy_version INTEGER NOT NULL DEFAULT 0,
     evidence_json       TEXT NOT NULL CHECK (json_valid(evidence_json)),
     created_at          TEXT NOT NULL,
     UNIQUE (review_id, required_change_id, repair_run_id)
@@ -360,7 +361,7 @@ END;
 """
 
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 _VERSIONED_INDEXES = r"""
 CREATE UNIQUE INDEX IF NOT EXISTS ux_council_active_role
@@ -622,6 +623,16 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
                         row["created_at"],
                     ),
                 )
+
+        resolution_columns = _column_names(
+            connection,
+            "review_change_resolutions",
+        )
+        if "evidence_policy_version" not in resolution_columns:
+            connection.execute(
+                "ALTER TABLE review_change_resolutions ADD COLUMN "
+                "evidence_policy_version INTEGER NOT NULL DEFAULT 0"
+            )
 
         # Import legacy ReviewResult requirements as explicit OPEN records.
         for review_row in connection.execute(

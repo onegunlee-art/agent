@@ -134,6 +134,78 @@ def test_shared_field_conflict_can_be_resolved_by_ceo_contract(
         }
         inbox_items = company.inbox()["file_items"]
         assert any(item["payload"].get("status") == "RESOLVED" for item in inbox_items)
+        advisory = next(
+            item["payload"]
+            for item in inbox_items
+            if item["payload"].get("type") == "COUNCIL_NON_OWNER_CONFLICT"
+        )
+        assert advisory["status"] == "RESOLVED_BY_CEO"
+        assert advisory["contract_id"] == outcome.contract_id
+        assert advisory["conflicts"]
+        assert all(
+            item["owner_source_path"] and item["opinion_source_path"]
+            for item in advisory["conflicts"]
+        )
+        assert all(item["selected_contract_value_hash"] for item in advisory["conflicts"])
+        resolved_event = next(
+            event
+            for event in company.events()
+            if event["event_type"] == "COUNCIL_NON_OWNER_CONFLICT_RESOLVED"
+        )
+        assert resolved_event["payload"]["contract_id"] == outcome.contract_id
+
+
+def test_shared_field_conflict_is_closed_after_role_response_resubmission(
+    tmp_path: Path,
+) -> None:
+    with CompanyOS(tmp_path) as company:
+        idea = company.create_idea("Synthetic response resolution.", idempotency_key="i")
+        company.prepare_council(idea.id)
+        payloads = _payloads(idea)
+        payloads["cmo"]["contract_contribution"]["decision_level"] = "FP_FULL"
+        _ingest(company, idea, payloads, tmp_path / "responses-v1")
+
+        with pytest.raises(ConflictError, match="conflict"):
+            company.compile_council(idea.id, idempotency_key="compile-conflict")
+        shared_item = next(
+            item["payload"]
+            for item in company.inbox()["file_items"]
+            if item["payload"].get("type") == "COUNCIL_SHARED_FIELD_CONFLICT"
+        )
+        assert shared_item["status"] == "CEO_DECISION_REQUIRED"
+
+        corrected = deepcopy(payloads["cmo"])
+        corrected["contract_contribution"]["decision_level"] = payloads["cto"][
+            "contract_contribution"
+        ]["decision_level"]
+        corrected_path = tmp_path / "cmo-corrected.json"
+        atomic_write_json(corrected_path, corrected)
+        company.ingest_council_response(
+            idea.id,
+            role="cmo",
+            response_file=corrected_path,
+        )
+        outcome = company.compile_council(
+            idea.id,
+            idempotency_key="compile-corrected",
+        )
+
+        assert outcome.gate_result.passed is True
+        shared_item = next(
+            item["payload"]
+            for item in company.inbox()["file_items"]
+            if item["payload"].get("type") == "COUNCIL_SHARED_FIELD_CONFLICT"
+        )
+        assert shared_item["status"] == "RESOLVED_BY_ROLE_RESUBMISSION"
+        assert shared_item["contract_id"] == outcome.contract_id
+        resolved_event = next(
+            event
+            for event in company.events()
+            if event["event_type"] == "COUNCIL_CONFLICT_RESOLVED"
+            and event["payload"].get("resolution_method")
+            == "ROLE_RESPONSE_RESUBMISSION"
+        )
+        assert resolved_event["payload"]["contract_id"] == outcome.contract_id
 
 
 def test_policy_minimum_rejects_model_declared_lower_level(tmp_path: Path) -> None:

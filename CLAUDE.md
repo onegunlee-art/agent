@@ -38,9 +38,43 @@ request file, request hash, source binding, structure, and correlation; it
 does not cryptographically prove the reviewer's identity.
 
 After `CHANGES_REQUIRED`, create a repair-manifest JSON covering every change
-ID with its commit and canonical trusted Evidence IDs. The program resolves
-those IDs to the same WorkOrder's PASS Runs and rechecks every Evidence file
-hash, then run:
+ID with its commit and canonical trusted Evidence IDs. First register at least
+one test result for each change:
+
+```powershell
+company evidence add-test-result <work_order_id> `
+  --review <review_id> `
+  --change <change_id> `
+  --file <test_result_file> `
+  --node-id <pytest_node_id> `
+  --source-commit <current_commit>
+```
+
+The resulting `TEST_RESULT` ID must be in that change's `evidence_ids`. Its
+immutable file SHA-256, test node IDs, review/change identity, source commit,
+and source-tree SHA-256 are revalidated. Generic Run Evidence may be included
+as additional context but cannot replace change-specific test evidence.
+
+The result file is a UTF-8 JSON PASS receipt; opaque logs and failed reports
+are rejected:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "PYTEST_RESULT",
+  "status": "PASSED",
+  "exit_code": 0,
+  "source_commit": "<current Git commit>",
+  "source_tree_sha256": "<current tracked-tree SHA-256>",
+  "tests": [
+    {"node_id": "tests/test_example.py::test_change", "outcome": "PASSED"}
+  ]
+}
+```
+
+Every selected `--node-id` must occur as `PASSED` in that receipt. The command
+requires the explicit execution-time `--source-commit`; neither the CLI nor
+the receipt may silently relabel an older run. Then run:
 
 ```powershell
 company work resume <work_order_id> --repair-manifest <repair_manifest.json>
@@ -48,6 +82,9 @@ company work resume <work_order_id> --repair-manifest <repair_manifest.json>
 
 A successful repair creates a new ReviewRequest. It does not complete the
 WorkOrder; only PASS on the new request can do that.
+
+Every schema-v2 request's `response_schema.required_values` states the exact
+required `schema_version`, `reviewed_commit`, and `reviewed_tree_sha256`.
 
 Review and repair handoffs require a clean Git source state. Commit the code
 first; untracked source, tracked modifications, unsafe index flags, and

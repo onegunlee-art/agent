@@ -42,6 +42,25 @@ def build_parser() -> argparse.ArgumentParser:
     idea_create.add_argument("text")
     idea_create.add_argument("--idempotency-key")
 
+    evidence = commands.add_parser("evidence", help="Register trusted local Evidence")
+    evidence_commands = evidence.add_subparsers(
+        dest="evidence_command",
+        required=True,
+    )
+    evidence_add = evidence_commands.add_parser("add")
+    evidence_add.add_argument("--idea", required=True)
+    evidence_add.add_argument("--file", required=True, type=Path)
+    evidence_add.add_argument("--external-ref")
+    evidence_add.add_argument("--idempotency-key")
+    evidence_test = evidence_commands.add_parser("add-test-result")
+    evidence_test.add_argument("work_order_id")
+    evidence_test.add_argument("--review")
+    evidence_test.add_argument("--change", required=True)
+    evidence_test.add_argument("--file", required=True, type=Path)
+    evidence_test.add_argument("--node-id", required=True, action="append")
+    evidence_test.add_argument("--source-commit", required=True)
+    evidence_test.add_argument("--idempotency-key")
+
     council = commands.add_parser("council", help="Manual executive handoffs")
     council_commands = council.add_subparsers(dest="council_command", required=True)
     council_prepare = council_commands.add_parser("prepare")
@@ -130,6 +149,37 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
     if args.command == "idea" and args.idea_command == "create":
         key = args.idempotency_key or f"cli-idea:{payload_hash({'text': args.text})}"
         return company.create_idea(args.text, idempotency_key=key)
+    if args.command == "evidence" and args.evidence_command == "add":
+        file_digest = (
+            sha256_file(args.file.resolve()) if args.file.is_file() else "MISSING"
+        )
+        key = args.idempotency_key or (
+            f"cli-idea-evidence:{args.idea}:"
+            f"{payload_hash({'sha256': file_digest, 'external_ref': args.external_ref})}"
+        )
+        return company.register_idea_evidence(
+            args.idea,
+            evidence_file=args.file,
+            external_ref=args.external_ref,
+            idempotency_key=key,
+        )
+    if args.command == "evidence" and args.evidence_command == "add-test-result":
+        file_digest = (
+            sha256_file(args.file.resolve()) if args.file.is_file() else "MISSING"
+        )
+        key = args.idempotency_key or (
+            f"cli-test-result:{args.work_order_id}:{args.change}:"
+            f"{payload_hash({'sha256': file_digest, 'nodes': sorted(args.node_id), 'review': args.review, 'source_commit': args.source_commit})}"
+        )
+        return company.register_test_result(
+            args.work_order_id,
+            required_change_id=args.change,
+            result_file=args.file,
+            test_node_ids=args.node_id,
+            review_id=args.review,
+            source_commit=args.source_commit,
+            idempotency_key=key,
+        )
     if args.command == "council" and args.council_command == "prepare":
         return company.prepare_council(args.idea_id)
     if args.command == "council" and args.council_command == "ingest":
@@ -147,11 +197,14 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
             """,
             (args.idea_id,),
         )
+        idea_row = company.store.get_row("ideas", args.idea_id)
         fingerprint = payload_hash(
             {
                 "idea_id": args.idea_id,
                 "min_level": args.min_level,
                 "responses": [dict(row) for row in active],
+                "evidence_grants": company.idea_evidence_fingerprint(args.idea_id),
+                "idea_status": idea_row["status"] if idea_row is not None else None,
             }
         )
         key = args.idempotency_key or f"cli-compile:{args.idea_id}:{fingerprint}"
@@ -169,8 +222,17 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         }
     if args.command == "council" and args.council_command == "resolve":
         contract_fingerprint = sha256_file(args.contract_file.resolve())
+        idea_row = company.store.get_row("ideas", args.idea_id)
+        resolution_context = payload_hash(
+            {
+                "contract": contract_fingerprint,
+                "min_level": args.min_level,
+                "evidence_grants": company.idea_evidence_fingerprint(args.idea_id),
+                "idea_status": idea_row["status"] if idea_row is not None else None,
+            }
+        )
         key = args.idempotency_key or (
-            f"cli-resolve:{args.idea_id}:{contract_fingerprint}:{args.min_level}"
+            f"cli-resolve:{args.idea_id}:{resolution_context}"
         )
         outcome = company.resolve_council(
             args.idea_id,

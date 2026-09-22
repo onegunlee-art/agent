@@ -26,16 +26,21 @@ CPO owns the observable problem and metric, and CMO owns the validating
 experiment and strategy fields. Shared-field disagreement creates an Inbox
 artifact and stops compilation until `company council resolve` receives a
 complete CEO-supplied contract. A corrected role response creates a new
-version and marks the prior response `SUPERSEDED`.
+version and marks the prior response `SUPERSEDED`. Every role's unowned fields
+remain in provenance as value hashes. A non-owner value that differs from the
+owner's value is surfaced as an advisory Inbox item with both source values;
+the owner value remains authoritative.
 
 ## Component boundaries
 
 - `roles.py`: the only three RoleSpecs and deterministic synthetic test data.
 - `council.py`: pure role-field ownership and deterministic contract synthesis.
 - `first_principles.py`: pure structural validation for FP_LITE, FP_STANDARD,
-  and FP_FULL. FACT references must resolve to externally supplied trusted
-  Evidence, source types use a positive allowlist, and policy supplies the
-  minimum decision level. It does not determine real-world truth.
+  and FP_FULL. FACT references must resolve to canonical trusted Evidence and
+  source types use a positive allowlist. The automatic synthetic fixture is
+  exact-statement scoped; explicit CEO-registered documents are hash-bound
+  general-document grants. Policy supplies the minimum decision level. The
+  gate does not determine real-world truth or authenticate the claimed CEO.
 - `source_snapshot.py`: local Git commit/tree capture and a deterministic
   SHA-256 manifest of tracked source bytes. Review binding is fail-closed: the
   tracked source must match HEAD, untracked source and unsafe index flags are
@@ -101,8 +106,12 @@ by a CLI flag or environment variable.
 
 `CHANGES_REQUIRED` creates one durable OPEN record per change ID. Repair needs
 an explicit manifest that covers every ID with the current commit, source-tree
-SHA-256, and canonical trusted Evidence IDs whose files are rehashed. An
-unchanged retry is rejected. A passing
+SHA-256, and canonical trusted Evidence IDs whose files are rehashed. Every
+change must cite its own `TEST_RESULT`, bound to the origin Review, change ID,
+test node IDs, result-file SHA-256, and current source snapshot. An unchanged
+retry is rejected. Only a UTF-8 JSON receipt with exit code zero and explicit
+PASSED outcomes for every selected node is eligible; opaque or failed output
+cannot be trusted repair Evidence. A passing
 repair moves the WorkOrder to `AWAITING_REREVIEW`, records the resolutions as
 SUBMITTED, and creates a new bound ReviewRequest. Only a reviewer PASS on that
 new request marks the changes VERIFIED and the WorkOrder COMPLETED.
@@ -110,6 +119,10 @@ new request marks the changes VERIFIED and the WorkOrder COMPLETED.
 Each Review uses
 `var/handoffs/reviews/<work_order_id>/<review_id>/`, so a later request or
 response cannot overwrite prior audit material.
+
+Schema-v2 ReviewRequests state the exact required response schema version,
+reviewed commit, and reviewed tree SHA-256 under
+`response_schema.required_values`.
 
 If a pending request becomes stale because its bound source changed, or its
 JSON/Markdown handoff no longer passes integrity checks, the old Review is

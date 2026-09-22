@@ -104,6 +104,36 @@ def _manifest(
     *,
     change_id: str = "CHANGE-X",
 ) -> dict:
+    node_id = f"tests/test_review_adversarial.py::{change_id}"
+    result_path = (
+        company.root
+        / "test-results"
+        / f"{review.id}-{change_id}-{source.snapshot.source_commit[:8]}.json"
+    )
+    atomic_write_json(
+        result_path,
+        {
+            "schema_version": 1,
+            "kind": "PYTEST_RESULT",
+            "status": "PASSED",
+            "exit_code": 0,
+            "source_commit": source.snapshot.source_commit,
+            "source_tree_sha256": source.snapshot.source_tree_sha256,
+            "tests": [{"node_id": node_id, "outcome": "PASSED"}],
+        },
+    )
+    test_result = company.register_test_result(
+        review.work_order_id,
+        required_change_id=change_id,
+        result_file=result_path,
+        test_node_ids=[node_id],
+        review_id=review.id,
+        source_commit=source.snapshot.source_commit,
+        idempotency_key=(
+            f"adversarial-test-result:{review.id}:{change_id}:"
+            f"{source.snapshot.source_commit}"
+        ),
+    )
     # The legacy path/hash member makes this same test exercise the vulnerable
     # implementation before the Evidence-ID-only schema is installed.
     return {
@@ -115,7 +145,7 @@ def _manifest(
             {
                 "id": change_id,
                 "commit": source.snapshot.source_commit,
-                "evidence_ids": [evidence_id],
+                "evidence_ids": [evidence_id, test_result["id"]],
                 "evidence": [
                     {
                         "path": str(evidence_path),
@@ -509,6 +539,72 @@ def test_exact_repair_replay_returns_stored_run_after_source_changes(
 
         assert replayed.id == repaired.id
         assert len(company.runs_for_work_order(work_order.id)) == 2
+
+
+def test_legacy_v2_resolution_without_test_result_remains_rereviewable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = MutableSnapshot(_snapshot())
+    with CompanyOS(tmp_path, source_snapshotter=source) as company:
+        work_order, run, review = _verified_review(company, "legacy-v2-resolution")
+        _require_change(company, tmp_path, review)
+        source.snapshot = _snapshot("d" * 40, "e" * 64)
+        evidence = next(
+            item
+            for item in company.evidence_for_run(run.id)
+            if item.kind == "VERIFIER_OUTPUT"
+        )
+        manifest = _manifest(company, review, source, evidence.id, evidence.path)
+        original_prepare = company.prepare_review
+
+        def simulated_crash(*args, **kwargs):
+            raise RuntimeError("simulated legacy cutover")
+
+        monkeypatch.setattr(company, "prepare_review", simulated_crash)
+        with pytest.raises(RuntimeError, match="legacy cutover"):
+            company.repair_once(
+                work_order.id,
+                executor=FakeExecutor(),
+                idempotency_key="legacy-v2-repair",
+                repair_manifest=manifest,
+            )
+        monkeypatch.setattr(company, "prepare_review", original_prepare)
+
+        resolution = company.store.query_one(
+            """
+            SELECT * FROM review_change_resolutions
+            WHERE review_id = ? AND required_change_id = 'CHANGE-X'
+            """,
+            (review.id,),
+        )
+        assert resolution is not None
+        evidence_ids = json.loads(resolution["evidence_json"])
+        legacy_ids = [
+            evidence_id
+            for evidence_id in evidence_ids
+            if company.store.get_row("evidence", evidence_id)["kind"]
+            != "TEST_RESULT"
+        ]
+        company.store.update_row(
+            "review_change_resolutions",
+            resolution["id"],
+            {
+                "evidence_policy_version": 0,
+                "evidence_json": company._json(legacy_ids),
+            },
+        )
+
+        rereview = company.prepare_review(
+            work_order.id,
+            idempotency_key="legacy-v2-rereview",
+        )
+        request = read_json(rereview.json_path)
+        assert request["change_resolutions"][0]["evidence_policy"] == {
+            "version": 0,
+            "required_kind": None,
+        }
+        assert company.work_order(work_order.id).status == "WAITING_FOR_OPUS"
 
 
 def test_only_latest_changes_required_review_can_be_repaired(tmp_path: Path) -> None:
