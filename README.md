@@ -1,9 +1,9 @@
 # AI Company OS V0.2
 
-Status: **V0.2 implementation branch**. A real Codex CLI call has edited a
-synthetic chatbot worktree and passed its acceptance test. V0.2 is not final
-until the CEO approves the evaluation cases and an independent Claude review
-returns PASS.
+Status: **V0.2 implementation candidate**. Real Codex CLI calls have edited
+both synthetic FAQ data and preview program code in isolated worktrees and
+passed their acceptance tests. V0.2 is not final until the CEO approves the
+evaluation cases and an independent Claude review returns PASS.
 
 AI Company OS is a local, on-demand operating kernel that turns a one-line
 idea into a venture-scoped workspace, a mechanically checked WorkOrder,
@@ -13,6 +13,8 @@ The operating kernel remains an on-demand Python CLI. V0.2 adds an explicitly
 invoked Codex CLI executor, rubric evaluation, a deterministic synthetic FAQ
 bot, a loopback-only status page, execution leases, and online ledger backup.
 CTO, CPO, CMO, and Claude interactions still use structured file handoffs.
+The preview bot itself is deterministic FAQ retrieval; Codex is the coding
+executor, not the model generating each preview answer.
 
 ## Requirements
 
@@ -83,11 +85,15 @@ company --root C:\dev\ai-company-os work model-run <work_order_id> `
   --idempotency-key <unique-key>
 ```
 
-The WorkOrder supplies the time, model-call, token, and USD limits. ChatGPT
-login runs may not expose per-run USD: this is recorded as
-`cost_status=UNAVAILABLE`, while the independently measurable call, token, and
-time limits remain enforced. A known dollar overrun is recorded separately as
-`COST_LIMIT_EXCEEDED`.
+The WorkOrder supplies the time, model-call, token, and USD limits. One model
+call means one coding-agent CLI process, not a count of provider-internal model
+turns. Token accounting is `input_tokens + output_tokens`; cached input and
+reasoning output are reported as subtotals and are not added twice. The time
+limit hard-stops the process tree during execution. The token limit is checked
+after the CLI returns and rejects an over-limit result; it cannot stop a
+generation mid-call. ChatGPT login runs may not expose per-run USD: this is
+recorded as `cost_status=UNAVAILABLE`. A known dollar overrun is recorded
+separately as `COST_LIMIT_EXCEEDED`.
 
 Local browser surfaces bind only to `127.0.0.1`:
 
@@ -98,6 +104,8 @@ company --root C:\dev\ai-company-os dashboard --port 8780
 
 Open `http://127.0.0.1:8765/` for the chatbot and
 `http://127.0.0.1:8780/` for the work dashboard.
+Known FAQ answers show an explicit `출처 보기` control; the source is collapsed
+until the user expands it. Refusals do not display a source control.
 
 Back up and verify the external ledger without copying a live SQLite file:
 
@@ -106,6 +114,23 @@ company --root C:\dev\ai-company-os ledger backup --dir C:\safe-backups
 company --root C:\dev\ai-company-os ledger verify --backup <backup.sqlite3>
 company --root C:\dev\ai-company-os ledger restore --backup <backup.sqlite3> --to <new-ledger.sqlite3>
 ```
+
+Those commands protect SQLite only. For full recovery of the ledger plus every
+referenced Evidence, Artifact, verifier, context manifest, and review handoff,
+use a hash-bound recovery bundle and restore it into empty locations:
+
+```powershell
+company --root C:\dev\ai-company-os ledger recovery-backup --dir C:\safe-backups
+company --root C:\dev\ai-company-os ledger recovery-verify --bundle <company-recovery.zip>
+company --root C:\dev\ai-company-os ledger recovery-restore `
+  --bundle <company-recovery.zip> `
+  --to-db <new-ledger.sqlite3> `
+  --to-root <empty-company-root>
+```
+
+Bundle creation fails closed if any ledger-referenced runtime file is missing
+or outside the company root. Verification checks the ZIP sidecar, database
+hash and integrity, table counts, every file hash, and unexpected entries.
 
 Corrected executive responses can be ingested again; the prior version is
 retained as `SUPERSEDED`. If a genuinely shared Council field conflicts, use

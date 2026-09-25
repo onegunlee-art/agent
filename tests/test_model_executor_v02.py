@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -28,7 +29,7 @@ from .helpers import build_venture
 
 FAKE_CLI = textwrap.dedent(
     """
-    import json, pathlib, sys, time
+    import json, pathlib, subprocess, sys, time
     mode = sys.argv[1]
     if mode == "edit":
         pathlib.Path("hello.py").write_text("def hello():\\n    return 'hi'\\n")
@@ -42,6 +43,9 @@ FAKE_CLI = textwrap.dedent(
     elif mode == "denied":
         print(json.dumps({"type":"turn.completed","usage":{"input_tokens":2,"output_tokens":1}}))
         print("patch rejected: writing is blocked by read-only sandbox", file=sys.stderr)
+    elif mode == "spawn-late":
+        subprocess.Popen([sys.executable, "-c", "import pathlib,time; time.sleep(2.5); pathlib.Path('late.txt').write_text('late')"])
+        time.sleep(5)
     """
 )
 
@@ -157,6 +161,25 @@ def test_token_limit_is_enforced_independently_of_dollar_cost() -> None:
         assert result.label == "USAGE_LIMIT_EXCEEDED"
         assert result.usage_status == "EXCEEDED"
         assert result.usage_total_tokens == 1100
+        assert result.token_accounting == "INPUT_PLUS_OUTPUT"
+        assert result.token_limit_enforcement == "POST_EXECUTION_REJECTION"
+        assert result.model_call_unit == "CODING_AGENT_CLI_PROCESS"
+
+
+def test_timeout_kills_process_tree_before_late_side_effect() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        repo = _repo(root)
+        workspace = create_worktree(
+            repo,
+            "wo/WO-hard-timeout",
+            root / "worktrees" / "WO-hard-timeout",
+        )
+        result = _executor("spawn-late").run(_request(workspace, limit=1))
+        assert not result.ok and result.label == "TIMEOUT"
+        assert result.time_limit_enforcement == "HARD_PROCESS_TREE_STOP"
+        time.sleep(3)
+        assert not (workspace / "late.txt").exists()
 
 
 def test_failed_tests_no_changes_timeout_and_unknown_cost_are_explicit() -> None:

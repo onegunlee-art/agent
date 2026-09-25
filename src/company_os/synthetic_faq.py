@@ -58,6 +58,8 @@ def answer(question: str, data: dict[str, Any]) -> dict[str, Any]:
     if best is None or best_score < MATCH_THRESHOLD:
         return {
             "text": data["refusal_text"],
+            "answer_text": data["refusal_text"],
+            "source_details": [],
             "sources": [],
             "refused": True,
             "matched_id": None,
@@ -65,6 +67,8 @@ def answer(question: str, data: dict[str, Any]) -> dict[str, Any]:
         }
     return {
         "text": f"{best['answer']}\n\n출처: {best['source']}",
+        "answer_text": best["answer"],
+        "source_details": [best["source"]],
         "sources": [best["id"]],
         "refused": False,
         "matched_id": best["id"],
@@ -99,12 +103,19 @@ body{font-family:system-ui,sans-serif;max-width:700px;margin:2rem auto;padding:0
 form{display:flex;gap:.5rem;margin-top:1rem}input{flex:1;padding:.7rem}</style></head>
 <body><h1 id="title"></h1><p>로컬 합성 데이터 전용 미리보기입니다.</p><div id="log"></div>
 <form id="form"><input id="question" maxlength="500" placeholder="질문을 입력하세요"><button>질문</button></form>
-<script>const title=document.getElementById('title'),log=document.getElementById('log');
+<script>const title=document.getElementById('title'),log=document.getElementById('log');let sourceCount=0;
 title.textContent=%CUSTOMER%;document.getElementById('form').addEventListener('submit',async(e)=>{
 e.preventDefault();const input=document.getElementById('question'),q=input.value.trim();if(!q)return;
 const qn=document.createElement('p');qn.textContent='Q. '+q;log.appendChild(qn);
 const response=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
-const data=await response.json(),an=document.createElement('p');an.textContent=data.text;log.appendChild(an);input.value='';});</script>
+const data=await response.json(),an=document.createElement('p');an.textContent=data.answer_text;log.appendChild(an);
+if(!data.refused&&data.source_details.length){
+const button=document.createElement('button'),sources=document.createElement('div');
+sources.id='sources-'+(++sourceCount);button.type='button';button.textContent='출처 보기';button.setAttribute('aria-expanded','false');button.setAttribute('aria-controls',sources.id);
+sources.hidden=true;data.source_details.forEach(detail=>{const item=document.createElement('p');item.textContent=detail;sources.appendChild(item);});
+button.addEventListener('click',()=>{const expanded=button.getAttribute('aria-expanded')==='true';button.setAttribute('aria-expanded',String(!expanded));sources.hidden=expanded;button.textContent=expanded?'출처 보기':'출처 접기';});
+log.appendChild(button);log.appendChild(sources);}
+input.value='';});</script>
 </body></html>"""
 
 

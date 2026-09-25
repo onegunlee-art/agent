@@ -11,7 +11,14 @@ from typing import Any, Sequence
 from .application import CompanyOS, ExistingArtifactExecutor
 from .dashboard import serve_dashboard
 from .errors import CompanyOSError
-from .ledger_backup import backup, restore, verify
+from .ledger_backup import (
+    backup,
+    backup_recovery_bundle,
+    restore,
+    restore_recovery_bundle,
+    verify,
+    verify_recovery_bundle,
+)
 from .model_executor import (
     CliCodingExecutor,
     ExecutorRequest,
@@ -170,6 +177,14 @@ def build_parser() -> argparse.ArgumentParser:
     ledger_restore = ledger_commands.add_parser("restore")
     ledger_restore.add_argument("--backup", type=Path, required=True)
     ledger_restore.add_argument("--to", type=Path, required=True)
+    recovery_backup = ledger_commands.add_parser("recovery-backup")
+    recovery_backup.add_argument("--dir", type=Path, required=True)
+    recovery_verify = ledger_commands.add_parser("recovery-verify")
+    recovery_verify.add_argument("--bundle", type=Path, required=True)
+    recovery_restore = ledger_commands.add_parser("recovery-restore")
+    recovery_restore.add_argument("--bundle", type=Path, required=True)
+    recovery_restore.add_argument("--to-db", type=Path, required=True)
+    recovery_restore.add_argument("--to-root", type=Path, required=True)
     commands.add_parser("status", help="Show durable company state")
     commands.add_parser("inbox", help="Show pending Decision and Approval items")
 
@@ -433,6 +448,21 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         if args.to.resolve() == company.db_path.resolve():
             raise ValueError("restore target must be separate from the live ledger")
         return {"status": "RESTORED", "table_counts": restore(args.backup, args.to)}
+    if args.command == "ledger" and args.ledger_command == "recovery-backup":
+        return backup_recovery_bundle(company.db_path, company.root, args.dir)
+    if args.command == "ledger" and args.ledger_command == "recovery-verify":
+        return verify_recovery_bundle(args.bundle)
+    if args.command == "ledger" and args.ledger_command == "recovery-restore":
+        if args.to_db.resolve() == company.db_path.resolve():
+            raise ValueError("restore database must be separate from the live ledger")
+        if args.to_root.resolve() == company.root.resolve():
+            raise ValueError("restore root must be separate from the live company root")
+        restored = restore_recovery_bundle(
+            args.bundle,
+            new_db_path=args.to_db,
+            new_root=args.to_root,
+        )
+        return {"status": "RESTORED", "recovery": restored}
     if args.command == "status":
         waiting = company.store.query_all(
             "SELECT id, work_order_id, binding_status, request_json_path, "

@@ -89,13 +89,30 @@ Codex CLI 실제 실행은 `company work model-run --help`에서 인자를 확�
 작업마다 새 `wo/<id>` 브랜치와 worktree를 사용하며, 수리 실행에서만
 `--reuse-worktree`를 명시한다. ChatGPT 로그인 실행은 USD가 제공되지 않을 수
 있으므로 원장은 `cost_status=UNAVAILABLE`을 그대로 보존하고, 대신 기본
-1회 호출·250,000토큰·WorkOrder 시간 제한을 강제한다.
+1회 호출·250,000토큰·WorkOrder 시간 제한을 적용한다. 여기서 호출 1회는
+Codex CLI 프로세스 1회이며 내부 모델 turn 수가 아니다. 토큰은 입력+출력을
+합산하고 캐시·추론 subtotal은 중복 합산하지 않는다. 시간 상한은 실행 중
+프로세스 트리를 종료하지만 토큰 상한은 CLI 종료 후 초과 결과를 거부한다.
+
+현재 `preview`는 LLM이 매 질문의 문장을 생성하는 챗봇이 아니라 합성 자료를
+결정적으로 검색하는 FAQ 미리보기다. 실제 모델 Codex는 이 프로그램과 데이터를
+수정하는 코딩 실행자로 사용된다. 알려진 답변의 출처는 `출처 보기` 버튼을
+눌렀을 때만 펼쳐지고 자료 밖 질문에는 버튼이 나오지 않아야 한다.
+
+SQLite만 복구하려면 `company ledger backup/verify/restore`를 사용한다. 원장과
+연결된 Evidence·Artifact·handoff까지 재해 복구하려면 아래 묶음을 사용한다.
+
+```powershell
+.\.venv\Scripts\company.exe --root C:\dev\ai-company-os ledger recovery-backup --dir C:\safe-backups
+.\.venv\Scripts\company.exe --root C:\dev\ai-company-os ledger recovery-verify --bundle <company-recovery.zip>
+.\.venv\Scripts\company.exe --root C:\dev\ai-company-os ledger recovery-restore --bundle <company-recovery.zip> --to-db <new-ledger.sqlite3> --to-root <empty-company-root>
+```
 
 ## 현재 구축 수준
 
 V0.2 구현 브랜치는 아이디어, CTO/CPO/CMO handoff, 계약, WorkOrder,
 Evidence, 독립 리뷰, 중단·재개에 더해 실행 lease, 실제 Codex CLI 실행,
-rubric 평가, 로컬 챗봇·현황판, 외부 원장 백업·복원을 구현했다.
+rubric 평가, 로컬 챗봇·현황판, 외부 원장과 전체 참조 파일 복구를 구현했다.
 
 합성 챗봇 코드 수정과 DRAFT 평가 통과는 확인됐지만, CEO의 평가 세트 APPROVED와
 Claude 독립 PASS가 남아 있으므로 V0.2 final은 아니다.

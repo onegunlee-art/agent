@@ -102,10 +102,11 @@ def test_preview_keeps_answer_sources_collapsed_until_user_expands_them() -> Non
             result = json.loads(response.read())
 
         assert result["answer_text"]
-        assert result["source_details"] == ["합성 카페 A 운영안내 - 주차"]
+        assert result["source_details"] == ["매장 안내문 v3 - 주차"]
         assert "출처 보기" in page
         assert "aria-expanded" in page
         assert ".hidden=true" in page
+        assert "sources.hidden=expanded" in page
         assert "addEventListener('click'" in page
         assert "data.answer_text" in page
         assert "data.source_details" in page

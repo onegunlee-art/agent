@@ -5,9 +5,23 @@ from pathlib import Path
 
 import pytest
 
-from company_os.ledger_backup import backup, migrate_ledger, restore, verify
+from company_os.application import CompanyOS
+from company_os.cli import build_parser
+from company_os.fakes import FakeExecutor
+from company_os.ledger_backup import (
+    backup,
+    backup_recovery_bundle,
+    migrate_ledger,
+    restore,
+    restore_recovery_bundle,
+    sha256_file,
+    verify,
+    verify_recovery_bundle,
+)
 from company_os.paths import default_ledger_path, validate_live_db_path
 from company_os.storage import SQLiteStateStore
+
+from .helpers import CleanSourceSnapshotter, build_venture
 
 
 def _ledger(path: Path) -> None:
@@ -72,3 +86,108 @@ def test_default_path_is_outside_git_repo_and_onedrive_live_db_is_rejected(
     assert local_data in path.parents
     with pytest.raises(ValueError, match="synchron"):
         validate_live_db_path(tmp_path / "OneDrive" / "ledger.sqlite3")
+
+
+def test_recovery_bundle_restores_run_evidence_hash_and_allows_next_work(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source-company"
+    source_db = tmp_path / "source-state" / "ledger.sqlite3"
+    with CompanyOS(
+        source_root,
+        db_path=source_db,
+        source_snapshotter=CleanSourceSnapshotter(),
+    ) as company:
+        _, _, _, work_order = build_venture(company, "recovery-bundle")
+        run = company.execute_work_order(
+            work_order.id,
+            executor=FakeExecutor(),
+            idempotency_key="recovery-bundle-run",
+        )
+        evidence = company.evidence_for_run(run.id)
+        assert evidence
+
+        bundle = backup_recovery_bundle(
+            source_db,
+            source_root,
+            tmp_path / "backups",
+            timestamp="20260925-130000",
+        )
+
+    checked = verify_recovery_bundle(bundle.path)
+    assert checked.ok
+    assert checked.file_count >= len(evidence)
+
+    restored_root = tmp_path / "restored-company"
+    restored_db = tmp_path / "restored-state" / "ledger.sqlite3"
+    restored = restore_recovery_bundle(
+        bundle.path,
+        new_db_path=restored_db,
+        new_root=restored_root,
+    )
+    assert restored.db_path == restored_db.resolve()
+
+    with CompanyOS(
+        restored_root,
+        db_path=restored_db,
+        source_snapshotter=CleanSourceSnapshotter(),
+    ) as company:
+        assert company.run(run.id).status == "PASS"
+        assert company.work_order(work_order.id).status == "VERIFIED"
+        restored_evidence = company.evidence_for_run(run.id)
+        assert [item.id for item in restored_evidence] == [
+            item.id for item in evidence
+        ]
+        for item in restored_evidence:
+            assert item.path.is_file()
+            assert sha256_file(item.path) == item.sha256
+
+        next_idea = company.create_idea(
+            "Continue after a full synthetic recovery.",
+            idempotency_key="recovery-bundle-next-work",
+        )
+        assert company.idea(next_idea.id).text == next_idea.text
+
+
+def test_recovery_bundle_rejects_missing_referenced_file(tmp_path: Path) -> None:
+    source_root = tmp_path / "source-company"
+    source_db = tmp_path / "source-state" / "ledger.sqlite3"
+    with CompanyOS(
+        source_root,
+        db_path=source_db,
+        source_snapshotter=CleanSourceSnapshotter(),
+    ) as company:
+        _, _, venture, _ = build_venture(company, "missing-recovery-file")
+        venture.context_manifest_path.unlink()
+        with pytest.raises(FileNotFoundError, match="referenced runtime file"):
+            backup_recovery_bundle(
+                source_db,
+                source_root,
+                tmp_path / "backups",
+                timestamp="20260925-130001",
+            )
+
+
+def test_cli_exposes_full_recovery_bundle_commands() -> None:
+    parser = build_parser()
+    backup_args = parser.parse_args(
+        ["ledger", "recovery-backup", "--dir", "backups"]
+    )
+    verify_args = parser.parse_args(
+        ["ledger", "recovery-verify", "--bundle", "backup.zip"]
+    )
+    restore_args = parser.parse_args(
+        [
+            "ledger",
+            "recovery-restore",
+            "--bundle",
+            "backup.zip",
+            "--to-db",
+            "state/ledger.sqlite3",
+            "--to-root",
+            "restored-company",
+        ]
+    )
+    assert backup_args.ledger_command == "recovery-backup"
+    assert verify_args.ledger_command == "recovery-verify"
+    assert restore_args.ledger_command == "recovery-restore"

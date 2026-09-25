@@ -12,16 +12,24 @@
   safe environment allowlist, and a separate acceptance command.
 - Functional outcome, USD cost status, and measurable usage status are separate.
   A ChatGPT-login run can be `DONE` with `cost_status=UNAVAILABLE` only when its
-  one-call, token, and time limits pass.
+  one-process-call, token, and time limits pass. The time limit kills the
+  process tree during execution. Token accounting is input plus output and is
+  enforced as post-execution rejection because the CLI does not expose a
+  mid-generation cancellation meter.
 - Rubric reports support weighted deterministic checks, critical hard failures,
   fail-closed judge criteria, and hash-bound Evidence. DRAFT reports are marked
   `official=false` until CEO approval.
-- Canonical SQLite state defaults outside the repository. Backup uses SQLite's
-  online backup API, a SHA-256 sidecar, integrity check, table counts, and
-  restore to a new path only.
+- Canonical SQLite state defaults outside the repository. SQLite-only backup
+  uses the online backup API, a SHA-256 sidecar, integrity check, table counts,
+  and restore to a new path only. Full recovery additionally creates a ZIP
+  manifest containing the database and every ledger-referenced Evidence,
+  Artifact, verifier, context manifest, council response, and review handoff.
+  Restore accepts only a verified bundle and empty destination paths.
 - Loopback-only preview and dashboard servers provide the browser surfaces;
   the dashboard uses read-only SQLite snapshots and hash-bound approval or
   revision actions.
+- The preview answer engine is deterministic FAQ retrieval, not an LLM answer
+  generator. Codex is the coding executor that changes the preview program.
 
 ## Vertical slice
 

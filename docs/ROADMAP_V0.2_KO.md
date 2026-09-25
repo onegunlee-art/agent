@@ -36,6 +36,14 @@ fence token, rubric, 합성 챗봇, 실제 Codex CLI 실행자, 로컬 현황판
 155,520토큰으로 수용 테스트를 통과했다. USD는 ChatGPT 로그인에서 제공되지
 않아 `UNAVAILABLE`이고, 기능 outcome은 `DONE`으로 별도 기록됐다.
 
+프로그램 코드 변경 시험에서는 첫 실행
+`run_3c736c848323458289bb354e7e4d6b18`이 359,324토큰으로 상한을 넘어
+`USAGE_LIMIT_EXCEEDED`로 거부됐다. sparse worktree 재실행
+`run_e1037947ca3e4b80b2cc48f2c5341dbc`는 211,901토큰, 172.084초,
+Codex CLI 프로세스 1회로 `synthetic_faq.py`를 수정하고 수용 테스트를
+통과했다. 독립 diff 검토에서 토글 상태 오류를 발견해 실패 테스트를 보강하고
+교정했다. 미리보기는 실제 LLM 답변형이 아니라 결정형 FAQ 검색형이다.
+
 12건 rubric은 DRAFT 상태에서 12/12 PASS하고 Evidence로 결속됐다. 이는 개발
 증거이며 CEO 승인 평가나 Claude 독립 검수 PASS를 대신하지 않는다.
 
@@ -43,9 +51,12 @@ fence token, rubric, 합성 챗봇, 실제 Codex CLI 실행자, 로컬 현황판
 
 - 완료: 실행 중 DB 잠금 제거, lease/fence/만료 회수, 실패 원인 분리
 - 완료: `WRITE_PERMISSION_DENIED`, `COST_LIMIT_EXCEEDED`, 비용 `UNAVAILABLE` 분리
-- 완료: 호출 1회·250,000토큰·시간 제한의 ChatGPT 로그인 대체 예산 정책
-- 완료: 실제 모델의 합성 챗봇 수정, 수용 테스트, DRAFT rubric PASS
-- 완료: 외부 원장 온라인 백업·해시 검증·별도 경로 복원
+- 완료: Codex CLI 프로세스 1회·250,000토큰·시간 제한의 ChatGPT 로그인 대체 예산 정책
+- 완료: 시간 상한의 프로세스 트리 종료와 토큰 상한의 사후 결과 거부 시험
+- 완료: 실제 모델의 합성 챗봇 데이터·프로그램 코드 수정과 수용 테스트
+- 완료: 외부 원장 온라인 백업과 34개 참조 파일의 해시 결속 복구 묶음
+- 완료: 빈 경로 복원 뒤 Run/Evidence 해시 조회와 다음 Idea 생성
+- 대기: 수정된 동일 소스에서 DRAFT rubric 재실행
 - 대기: CEO가 평가 사례를 검토하고 `_status=APPROVED`로 승인
 - 대기: 수정 diff·테스트·rubric·소스 ZIP에 대한 Claude 독립 PASS
 - 대기: CEO의 main 병합 승인
@@ -72,7 +83,7 @@ fence token, rubric, 합성 챗봇, 실제 Codex CLI 실행자, 로컬 현황판
 - 자료 밖 질문을 거절하는가
 - 비공개 표식을 노출하지 않는가
 - 명절 휴무와 신규 메뉴 수정 요구를 반영했는가
-- 실행 시간·호출·토큰 상한을 지켰는가
+- 실행 시간·Codex CLI 프로세스 호출·입력+출력 토큰 상한을 지켰는가
 
 CEO가 질문·정답·금지어·threshold를 검토하기 전까지 공식 평가가 아니다.
 
@@ -84,7 +95,8 @@ Deep Agents는 후보이지 확정 의존성이 아니다. 채택 전에는 기�
 도입하지 않는다.
 
 완료 기준: 한 번의 승인된 지시로 합성 챗봇 코드를 수정하고, 자동 시험,
-rubric Evidence, 브라우저 확인, 독립 검수를 끝낸다.
+동일 소스의 rubric Evidence, 브라우저 확인, 독립 검수를 끝낸다. 실제 LLM
+답변형 제품을 만들었다고 표현하지 않고 결정형 FAQ 미리보기임을 명시한다.
 
 ### 4. 스킬 축적 루프
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import time
@@ -40,6 +41,10 @@ class ExecutorOutcome:
     usage_status: str = "UNAVAILABLE"
     usage_total_tokens: int = 0
     model_calls: int = 1
+    model_call_unit: str = "CODING_AGENT_CLI_PROCESS"
+    token_accounting: str = "INPUT_PLUS_OUTPUT"
+    token_limit_enforcement: str = "POST_EXECUTION_REJECTION"
+    time_limit_enforcement: str = "HARD_PROCESS_TREE_STOP"
 
 
 CostParser = Callable[[str], tuple[float | None, dict[str, int]]]
@@ -288,7 +293,10 @@ class CliCodingExecutor:
                     check=False,
                 )
             else:
-                process.kill()
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             stdout, stderr = process.communicate()
             exc.stdout = stdout
             exc.stderr = stderr
