@@ -1,0 +1,4 @@
+interface:
+  display_name: "Company OS Build"
+  short_description: "Build one audited Company OS change safely"
+  default_prompt: "Use $company-os-build to implement one bounded Company OS change with tests and verification."

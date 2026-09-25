@@ -153,7 +153,10 @@ not sandbox the executor, restrict reads, or detect every write outside the
 workspace. Only a trusted local executor with synthetic, non-confidential
 data is supported; real Ventures and untrusted executors are out of scope.
 
-The executor still runs inside the SQLite write transaction in this alpha.
-Long-running or externally blocking executors are unsupported because they
-can hold the local write lock. Decoupled execution claiming is deferred to a
-later version.
+The V0.2 execution foundation claims a WorkOrder with a short `EXECUTING`
+transition, commits that transaction, invokes the ExecutorPort without a
+SQLite write lock, and then finalizes the Run in a second short transaction.
+Handled executor failures restore the prior resumable status and append a
+failure Event. A hard process termination during the unlocked interval can
+still leave an `EXECUTING` claim; explicit abandoned-claim recovery remains a
+follow-up before real external executors are enabled.

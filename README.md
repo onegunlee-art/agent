@@ -109,7 +109,10 @@ silently replacing the owner value.
   unrecoverable `WAITING_FOR_OPUS` state.
 
 See [architecture](docs/architecture.md) for the implemented flow and
-invariants, and [CLAUDE.md](CLAUDE.md) for manual review handoff rules.
+invariants, [개인 에이전트 코딩 업무 환경](docs/OPERATING_GUIDE_KO.md) for the
+exact conversation and operating entry points, [V0.2 방향과 구현 순서](docs/ROADMAP_V0.2_KO.md)
+for the approved build sequence, and [CLAUDE.md](CLAUDE.md) for manual review
+handoff rules.
 
 ## V0.1 boundaries
 

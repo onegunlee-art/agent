@@ -114,6 +114,17 @@ class ExistingArtifactExecutor:
         return ExecutionOutput(artifact_path=path)
 
 
+class _PreparedExecutionOutputExecutor:
+    """Return an output already produced outside the SQLite transaction."""
+
+    def __init__(self, name: str, output: ExecutionOutput):
+        self.name = name
+        self._output = output
+
+    def execute(self, work_order: WorkOrder, workspace_path: Path) -> ExecutionOutput:
+        return self._output
+
+
 class CompanyOS:
     def __init__(
         self,
@@ -2152,7 +2163,151 @@ class CompanyOS:
         _repair_mode: bool = False,
         _repair_manifest: dict[str, Any] | None = None,
     ) -> Run:
+        """Claim quickly, execute without a DB lock, then finalize atomically."""
+
         if _repair_mode:
+            if _repair_manifest is None:
+                raise ValidationError("Repair execution requires a repair manifest")
+            _repair_manifest = self._validate_repair_manifest(
+                work_order_id,
+                _repair_manifest,
+            )
+        if self.is_stopped():
+            raise CompanyStoppedError("Company execution is stopped; run company resume")
+
+        work_order = self.work_order(work_order_id)
+        permitted_statuses = (
+            {"REPAIR_REQUIRED"}
+            if _repair_mode
+            else {"READY", "VERIFICATION_FAILED"}
+        )
+        existing = self.store.get_row("idempotency", idempotency_key)
+        if existing is not None or work_order.status not in permitted_statuses:
+            return self._finalize_work_order_execution(
+                work_order_id,
+                executor=executor,
+                idempotency_key=idempotency_key,
+                _repair_mode=_repair_mode,
+                _repair_manifest=_repair_manifest,
+            )
+        try:
+            observed_verifier = verifier_hash(work_order.verifier_path)
+        except OSError:
+            observed_verifier = "MISSING"
+        if observed_verifier != work_order.verifier_hash:
+            return self._finalize_work_order_execution(
+                work_order_id,
+                executor=executor,
+                idempotency_key=idempotency_key,
+                _repair_mode=_repair_mode,
+                _repair_manifest=_repair_manifest,
+            )
+
+        execution_id = new_id("execution")
+        claimed_at = utc_now()
+        with self.store.transaction() as connection:
+            current_row = connection.execute(
+                "SELECT * FROM work_orders WHERE id = ?", (work_order_id,)
+            ).fetchone()
+            if current_row is None:
+                raise NotFoundError(f"WorkOrder not found: {work_order_id}")
+            current_work = self._work_order_from_row(current_row)
+            if current_work.status not in permitted_statuses:
+                raise ValidationError(
+                    f"WorkOrder cannot execute from status {current_work.status}"
+                )
+            claimed = connection.execute(
+                """
+                UPDATE work_orders
+                SET status = 'EXECUTING', updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (claimed_at, work_order_id, current_work.status),
+            )
+            if claimed.rowcount != 1:
+                raise ConflictError(
+                    f"WorkOrder execution could not be claimed: {work_order_id}"
+                )
+            self.store.append_event(
+                "WORK_ORDER_EXECUTION_STARTED",
+                aggregate_type="WorkOrder",
+                aggregate_id=work_order_id,
+                venture_id=current_work.venture_id,
+                payload={
+                    "execution_id": execution_id,
+                    "executor": executor.name,
+                    "repair_mode": _repair_mode,
+                    "prior_status": current_work.status,
+                },
+                connection=connection,
+            )
+
+        venture = self.venture(current_work.venture_id)
+        try:
+            output = executor.execute(current_work, venture.workspace_path)
+            prepared_executor = _PreparedExecutionOutputExecutor(
+                executor.name,
+                output,
+            )
+            return self._finalize_work_order_execution(
+                work_order_id,
+                executor=prepared_executor,
+                idempotency_key=idempotency_key,
+                _repair_mode=_repair_mode,
+                _repair_manifest=_repair_manifest,
+                _claimed_from_status=current_work.status,
+            )
+        except BaseException as error:
+            try:
+                with self.store.transaction() as connection:
+                    restored = connection.execute(
+                        """
+                        UPDATE work_orders SET status = ?, updated_at = ?
+                        WHERE id = ? AND status = 'EXECUTING'
+                        """,
+                        (current_work.status, utc_now(), work_order_id),
+                    )
+                    if restored.rowcount == 1:
+                        self.store.append_event(
+                            "WORK_ORDER_EXECUTION_FAILED",
+                            aggregate_type="WorkOrder",
+                            aggregate_id=work_order_id,
+                            venture_id=current_work.venture_id,
+                            payload={
+                                "execution_id": execution_id,
+                                "error_type": type(error).__name__,
+                                "restored_status": current_work.status,
+                            },
+                            connection=connection,
+                        )
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "Execution state cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+
+    def _finalize_work_order_execution(
+        self,
+        work_order_id: str,
+        *,
+        executor: ExecutorPort,
+        idempotency_key: str,
+        _repair_mode: bool = False,
+        _repair_manifest: dict[str, Any] | None = None,
+        _claimed_from_status: str | None = None,
+    ) -> Run:
+        original_permitted_statuses = (
+            {"REPAIR_REQUIRED"}
+            if _repair_mode
+            else {"READY", "VERIFICATION_FAILED"}
+        )
+        if _claimed_from_status is not None and (
+            _claimed_from_status not in original_permitted_statuses
+            or not isinstance(executor, _PreparedExecutionOutputExecutor)
+        ):
+            raise ValidationError("Invalid prepared execution finalization")
+        if _repair_mode and _claimed_from_status is None:
             if _repair_manifest is None:
                 raise ValidationError("Repair execution requires a repair manifest")
             # The execution boundary validates again even when its caller is an
@@ -2166,9 +2321,9 @@ class CompanyOS:
             raise CompanyStoppedError("Company execution is stopped; run company resume")
         work_order = self.work_order(work_order_id)
         permitted_statuses = (
-            {"REPAIR_REQUIRED"}
-            if _repair_mode
-            else {"READY", "VERIFICATION_FAILED"}
+            {"EXECUTING"}
+            if _claimed_from_status is not None
+            else original_permitted_statuses
         )
         if work_order.status not in permitted_statuses:
             # Exact idempotent replays still return the original result.

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 
@@ -22,6 +22,36 @@ class UnrelatedArtifactExecutor:
         unrelated = workspace_path / "artifacts" / "synthetic-unrelated.txt"
         atomic_write_text(unrelated, "synthetic unrelated output\n")
         return ExecutionOutput(artifact_path=unrelated)
+
+
+class BlockingExecutor:
+    name = "synthetic-blocking-executor"
+
+    def __init__(self, entered: Event, release: Event):
+        self.entered = entered
+        self.release = release
+
+    def execute(self, work_order, workspace_path: Path) -> ExecutionOutput:
+        self.entered.set()
+        if not self.release.wait(timeout=10):
+            raise RuntimeError("synthetic blocking executor timed out")
+        artifact = workspace_path / work_order.artifact_relative_path
+        atomic_write_text(artifact, work_order.expected_content)
+        return ExecutionOutput(artifact_path=artifact)
+
+
+class FailingExecutor:
+    name = "synthetic-failing-executor"
+
+    def execute(self, work_order, workspace_path: Path) -> ExecutionOutput:
+        raise RuntimeError("synthetic executor failure")
+
+
+class NeverExecute:
+    name = "synthetic-never-execute"
+
+    def execute(self, work_order, workspace_path: Path) -> ExecutionOutput:
+        raise AssertionError("executor must not run after preflight rejection")
 
 
 def test_stale_expected_file_cannot_validate_an_unrelated_executor_artifact(
@@ -57,7 +87,7 @@ def test_deleted_verifier_invalidates_run_and_records_untrusted_evidence(
 
         run = company.execute_work_order(
             work_order.id,
-            executor=FakeExecutor(),
+            executor=NeverExecute(),
             idempotency_key="missing-verifier-hardening-run",
         )
 
@@ -118,23 +148,8 @@ def test_concurrent_execute_allows_exactly_one_passing_transition(
     second_company = CompanyOS(tmp_path).initialize()
     barrier = Barrier(2)
     try:
-        for company in (first_company, second_company):
-            original_run_idempotent = company.store.run_idempotent
-
-            def synchronized_run_idempotent(
-                key,
-                command,
-                payload,
-                operation,
-                *,
-                _original=original_run_idempotent,
-            ):
-                barrier.wait(timeout=10)
-                return _original(key, command, payload, operation)
-
-            company.store.run_idempotent = synchronized_run_idempotent
-
         def execute(company: CompanyOS, key: str):
+            barrier.wait(timeout=10)
             try:
                 return company.execute_work_order(
                     work_order.id,
@@ -162,6 +177,74 @@ def test_concurrent_execute_allows_exactly_one_passing_transition(
     finally:
         first_company.close()
         second_company.close()
+
+
+def test_long_executor_does_not_hold_the_sqlite_write_lock(tmp_path: Path) -> None:
+    with CompanyOS(tmp_path) as seed:
+        _, _, _, work_order = build_venture(seed, "executor-outside-transaction")
+
+    runner = CompanyOS(tmp_path).initialize()
+    writer = CompanyOS(tmp_path).initialize()
+    entered = Event()
+    release = Event()
+    blocking_executor = BlockingExecutor(entered, release)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            run_future = pool.submit(
+                runner.execute_work_order,
+                work_order.id,
+                executor=blocking_executor,
+                idempotency_key="executor-outside-transaction-run",
+            )
+            assert entered.wait(timeout=5)
+            write_future = pool.submit(
+                writer.create_idea,
+                "A separate synthetic idea while execution is in progress.",
+                idempotency_key="executor-outside-transaction-write",
+            )
+            try:
+                idea = write_future.result(timeout=2)
+            finally:
+                release.set()
+            run = run_future.result(timeout=10)
+
+        assert idea.text.startswith("A separate synthetic idea")
+        assert run.status == "PASS"
+        assert runner.work_order(work_order.id).status == "VERIFIED"
+    finally:
+        release.set()
+        runner.close()
+        writer.close()
+
+
+def test_executor_failure_restores_resumable_status_and_records_event(
+    tmp_path: Path,
+) -> None:
+    with CompanyOS(tmp_path) as company:
+        _, _, _, work_order = build_venture(company, "executor-failure-recovery")
+
+        with pytest.raises(RuntimeError, match="synthetic executor failure"):
+            company.execute_work_order(
+                work_order.id,
+                executor=FailingExecutor(),
+                idempotency_key="executor-failure-recovery-run",
+            )
+
+        failure_events = [
+            event
+            for event in company.events()
+            if event["event_type"] == "WORK_ORDER_EXECUTION_FAILED"
+            and event["aggregate_id"] == work_order.id
+        ]
+        assert company.work_order(work_order.id).status == "READY"
+        assert failure_events
+
+        retried = company.execute_work_order(
+            work_order.id,
+            executor=FakeExecutor(),
+            idempotency_key="executor-failure-recovery-run",
+        )
+        assert retried.status == "PASS"
 
 
 def test_repair_without_manifest_cannot_create_a_second_run(
