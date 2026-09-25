@@ -2,14 +2,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
 from .application import CompanyOS, ExistingArtifactExecutor
+from .dashboard import serve_dashboard
 from .errors import CompanyOSError
+from .ledger_backup import backup, restore, verify
+from .model_executor import (
+    CliCodingExecutor,
+    ExecutorRequest,
+    build_instructions,
+    create_worktree,
+    validate_worktree,
+)
 from .roles import list_role_specs, serialize_role_spec
+from .synthetic_faq import serve as serve_synthetic_faq
 from .utils import payload_hash, read_json, sha256_file
 
 
@@ -28,7 +39,7 @@ def _print(value: Any) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="company",
-        description="Local, resumable AI Company OS V0.1",
+        description="Local, resumable AI Company OS V0.2",
     )
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--db", type=Path)
@@ -119,6 +130,18 @@ def build_parser() -> argparse.ArgumentParser:
     work_resume = work_commands.add_parser("resume")
     work_resume.add_argument("work_order_id")
     work_resume.add_argument("--repair-manifest", type=Path)
+    model_run = work_commands.add_parser(
+        "model-run",
+        help="Run one bounded coding-agent CLI in a Git worktree",
+    )
+    model_run.add_argument("work_order_id")
+    model_run.add_argument("--repository", required=True, type=Path)
+    model_run.add_argument("--worktree", required=True, type=Path)
+    model_run.add_argument("--branch", required=True)
+    model_run.add_argument("--instructions-file", required=True, type=Path)
+    model_run.add_argument("--test-arg", required=True, action="append")
+    model_run.add_argument("--reuse-worktree", action="store_true")
+    model_run.add_argument("--idempotency-key", required=True)
 
     review = commands.add_parser("review", help="Ingest a supplied ReviewResult")
     review_commands = review.add_subparsers(dest="review_command", required=True)
@@ -128,6 +151,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser("stop", help="Persistently disable new execution")
     commands.add_parser("resume", help="Re-enable execution")
+    commands.add_parser("reclaim-expired", help="Reclaim expired execution leases")
+    preview = commands.add_parser("preview", help="Serve the synthetic chatbot locally")
+    preview.add_argument("--data", type=Path)
+    preview.add_argument("--port", type=int, default=8765)
+    dashboard = commands.add_parser("dashboard", help="Serve the local work dashboard")
+    dashboard.add_argument("--port", type=int, default=8780)
+    dashboard.add_argument(
+        "--preview-url", default="http://127.0.0.1:8765/"
+    )
+
+    ledger = commands.add_parser("ledger", help="Back up, verify, or restore the ledger")
+    ledger_commands = ledger.add_subparsers(dest="ledger_command", required=True)
+    ledger_backup = ledger_commands.add_parser("backup")
+    ledger_backup.add_argument("--dir", type=Path, required=True)
+    ledger_verify = ledger_commands.add_parser("verify")
+    ledger_verify.add_argument("--backup", type=Path, required=True)
+    ledger_restore = ledger_commands.add_parser("restore")
+    ledger_restore.add_argument("--backup", type=Path, required=True)
+    ledger_restore.add_argument("--to", type=Path, required=True)
     commands.add_parser("status", help="Show durable company state")
     commands.add_parser("inbox", help="Show pending Decision and Approval items")
 
@@ -262,6 +304,66 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         )
     if args.command == "work" and args.work_command == "status":
         return company.work_order(args.work_order_id)
+    if args.command == "work" and args.work_command == "model-run":
+        prior = company.store.query_one(
+            "SELECT status FROM idempotency WHERE key = ?",
+            (args.idempotency_key,),
+        )
+        if prior is not None:
+            raise ValueError(
+                "model-run idempotency key already exists; refusing a repeated model call"
+            )
+        instructions_path = args.instructions_file.resolve()
+        if (
+            instructions_path.is_symlink()
+            or not instructions_path.is_file()
+            or instructions_path.stat().st_size > 64 * 1024
+        ):
+            raise ValueError("instructions file must be a regular file of at most 64 KiB")
+        work_order = company.work_order(args.work_order_id)
+        repository = args.repository.resolve()
+        worktree = args.worktree.resolve()
+        if worktree.exists():
+            if not args.reuse_worktree:
+                raise ValueError(
+                    "worktree already exists; pass --reuse-worktree only for an intentional repair"
+                )
+            workspace = validate_worktree(repository, args.branch, worktree)
+        else:
+            workspace = create_worktree(repository, args.branch, worktree)
+        test_command = tuple(args.test_arg)
+        instructions = build_instructions(
+            instructions_path.read_text(encoding="utf-8"),
+            subprocess.list2cmdline(test_command),
+        )
+        outcome = CliCodingExecutor().run(
+            ExecutorRequest(
+                work_order_id=work_order.id,
+                workspace=workspace,
+                instructions=instructions,
+                time_limit_seconds=work_order.time_limit_seconds,
+                cost_limit_usd=work_order.cost_limit_usd,
+                model_call_limit=work_order.model_call_limit,
+                token_limit=work_order.token_limit,
+                test_command=test_command,
+            )
+        )
+        run = company.record_model_execution(
+            work_order.id,
+            outcome,
+            idempotency_key=args.idempotency_key,
+        )
+        return {
+            "run": run,
+            "executor_outcome": outcome.label,
+            "executor_ok": outcome.ok,
+            "cost_status": run.payload.get("cost_status"),
+            "usage_status": run.payload.get("usage_status"),
+            "budget_basis": run.payload.get("budget_basis"),
+            "changed_files": outcome.changed_files,
+            "usage": outcome.usage,
+            "worktree": workspace,
+        }
     if args.command == "work" and args.work_command == "verify":
         work_order = company.work_order(args.work_order_id)
         workspace = company.venture(work_order.venture_id).workspace_path
@@ -306,6 +408,31 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
     if args.command == "resume":
         company.resume()
         return {"stopped": False}
+    if args.command == "reclaim-expired":
+        reclaimed = company.reclaim_expired()
+        return {"status": "RECLAIMED", "count": len(reclaimed), "items": reclaimed}
+    if args.command == "preview":
+        data_path = args.data or (
+            company.root / "examples" / "synthetic-cafe-a" / "faq_data.json"
+        )
+        serve_synthetic_faq(data_path, port=args.port)
+        return {"status": "STOPPED"}
+    if args.command == "dashboard":
+        serve_dashboard(
+            company.root,
+            company.db_path,
+            port=args.port,
+            preview_url=args.preview_url,
+        )
+        return {"status": "STOPPED"}
+    if args.command == "ledger" and args.ledger_command == "backup":
+        return backup(company.db_path, args.dir)
+    if args.command == "ledger" and args.ledger_command == "verify":
+        return verify(args.backup)
+    if args.command == "ledger" and args.ledger_command == "restore":
+        if args.to.resolve() == company.db_path.resolve():
+            raise ValueError("restore target must be separate from the live ledger")
+        return {"status": "RESTORED", "table_counts": restore(args.backup, args.to)}
     if args.command == "status":
         waiting = company.store.query_all(
             "SELECT id, work_order_id, binding_status, request_json_path, "

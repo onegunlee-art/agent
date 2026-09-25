@@ -1,16 +1,18 @@
-# AI Company OS V0.1
+# AI Company OS V0.2
 
-Status: **V0.1-alpha**. This repository proves the synthetic local workflow;
-it is not ready for a real Venture.
+Status: **V0.2 implementation branch**. A real Codex CLI call has edited a
+synthetic chatbot worktree and passed its acceptance test. V0.2 is not final
+until the CEO approves the evaluation cases and an independent Claude review
+returns PASS.
 
 AI Company OS is a local, on-demand operating kernel that turns a one-line
 idea into a venture-scoped workspace, a mechanically checked WorkOrder,
 durable Evidence, and an auditable Decision trail.
 
-V0.1 is intentionally a Python CLI, not a chatbot or background service. It
-does not call the OpenAI or Anthropic APIs and does not invoke Codex
-recursively. CTO, CPO, CMO, and Claude Opus interactions use structured JSON
-and Markdown file handoffs.
+The operating kernel remains an on-demand Python CLI. V0.2 adds an explicitly
+invoked Codex CLI executor, rubric evaluation, a deterministic synthetic FAQ
+bot, a loopback-only status page, execution leases, and online ledger backup.
+CTO, CPO, CMO, and Claude interactions still use structured file handoffs.
 
 ## Requirements
 
@@ -60,8 +62,50 @@ company review ingest <review_id> --file <review_result.json>
 company events export --output <events.jsonl>
 ```
 
-Use `--root <path>` on any command to select a Company OS root. Canonical
-state defaults to `var/state/company.db` below that root.
+Use `--root <path>` on any command to select a Company OS root. For a Git
+repository, canonical state defaults to
+`%LOCALAPPDATA%\ai-company-os\ledger.sqlite3`, outside the repository and
+OneDrive. A legacy `var/state/company.db` is migrated online and preserved.
+
+## V0.2 execution and browser entry points
+
+Create a UTF-8 instruction file in the editor, then run one coding agent in a
+new Git worktree. Each `--test-arg` is one subprocess argument.
+
+```powershell
+company --root C:\dev\ai-company-os work model-run <work_order_id> `
+  --repository C:\path\to\synthetic-repo `
+  --worktree C:\dev\ai-company-os\var\worktrees\<work_order_id> `
+  --branch wo/<work_order_id> `
+  --instructions-file C:\path\to\work-order.txt `
+  --test-arg C:\dev\ai-company-os\.venv\Scripts\python.exe `
+  --test-arg acceptance_test.py `
+  --idempotency-key <unique-key>
+```
+
+The WorkOrder supplies the time, model-call, token, and USD limits. ChatGPT
+login runs may not expose per-run USD: this is recorded as
+`cost_status=UNAVAILABLE`, while the independently measurable call, token, and
+time limits remain enforced. A known dollar overrun is recorded separately as
+`COST_LIMIT_EXCEEDED`.
+
+Local browser surfaces bind only to `127.0.0.1`:
+
+```powershell
+company --root C:\dev\ai-company-os preview --port 8765
+company --root C:\dev\ai-company-os dashboard --port 8780
+```
+
+Open `http://127.0.0.1:8765/` for the chatbot and
+`http://127.0.0.1:8780/` for the work dashboard.
+
+Back up and verify the external ledger without copying a live SQLite file:
+
+```powershell
+company --root C:\dev\ai-company-os ledger backup --dir C:\safe-backups
+company --root C:\dev\ai-company-os ledger verify --backup <backup.sqlite3>
+company --root C:\dev\ai-company-os ledger restore --backup <backup.sqlite3> --to <new-ledger.sqlite3>
+```
 
 Corrected executive responses can be ingested again; the prior version is
 retained as `SUPERSEDED`. If a genuinely shared Council field conflicts, use
@@ -114,21 +158,19 @@ exact conversation and operating entry points, [V0.2 방향과 구현 순서](do
 for the approved build sequence, and [CLAUDE.md](CLAUDE.md) for manual review
 handoff rules.
 
-## V0.1 boundaries
+## V0.2 boundaries
 
-V0.1 has exactly three C-level RoleSpecs: CTO, CPO, and CMO. It does not
-include a web dashboard, scheduler, daemon, external database or queue,
-vector database, web crawler, external messaging, production deployment, or
-real customer data. All automated tests and the bootstrap smoke test use
-synthetic data.
+The OS still has exactly three C-level RoleSpecs: CTO, CPO, and CMO. It does
+not include a scheduler, daemon, external queue, vector database, web crawler,
+external messaging, payments, production deployment, or real customer data.
+All automated tests and the first model cycle use synthetic data.
 
-The built-in exact-text verifier is `SYNTHETIC_ONLY`. A PASS proves only that
+The built-in exact-text verifier remains `SYNTHETIC_ONLY`. A PASS proves only that
 the declared local path contains the expected bytes. It does not evaluate a
-VentureContract's metric, experiment, or real-world pass/fail outcome, so V0.1
+VentureContract's metric, experiment, or real-world pass/fail outcome, so V0.2
 must not be used to validate a real Venture.
 
-The Context Manifest provides `LOGICAL_NAMESPACE_ONLY` organization. It is
-not a sandbox: a local executor may still read the repository or modify files
-outside its Venture workspace. V0.1 therefore permits only a trusted local
-executor operating on synthetic, non-confidential data; untrusted executors
-and confidential multi-Venture workloads are out of scope.
+The Context Manifest provides `LOGICAL_NAMESPACE_ONLY` organization. The
+coding executor therefore also uses a Git worktree plus Codex
+`workspace-write` sandboxing. Worktrees are isolation aids, not security
+boundaries. Confidential multi-tenant workloads remain out of scope.

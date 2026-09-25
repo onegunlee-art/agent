@@ -185,6 +185,15 @@ CREATE TABLE IF NOT EXISTS work_orders (
     specification_json  TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(specification_json)),
     verifier_path       TEXT,
     verifier_sha256     TEXT,
+    execution_id        TEXT,
+    fence_token         INTEGER NOT NULL DEFAULT 0,
+    lease_expires_at    TEXT,
+    time_limit_seconds  INTEGER NOT NULL DEFAULT 1200 CHECK (time_limit_seconds > 0),
+    cost_limit_usd      REAL NOT NULL DEFAULT 2.0 CHECK (cost_limit_usd >= 0),
+    model_call_limit    INTEGER NOT NULL DEFAULT 1 CHECK (model_call_limit > 0),
+    token_limit         INTEGER NOT NULL DEFAULT 250000 CHECK (token_limit > 0),
+    side_effect_class   TEXT NOT NULL DEFAULT 'WORKSPACE_ONLY'
+                        CHECK (side_effect_class IN ('WORKSPACE_ONLY', 'EXTERNAL')),
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
 );
@@ -195,6 +204,11 @@ CREATE TABLE IF NOT EXISTS runs (
     status              TEXT NOT NULL,
     executor            TEXT NOT NULL,
     verifier_sha256     TEXT,
+    execution_id        TEXT,
+    fence_token         INTEGER,
+    outcome             TEXT,
+    cost_usd            REAL,
+    duration_seconds    REAL,
     payload_json        TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload_json)),
     started_at          TEXT NOT NULL,
     finished_at         TEXT,
@@ -361,7 +375,7 @@ END;
 """
 
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 6
 
 _VERSIONED_INDEXES = r"""
 CREATE UNIQUE INDEX IF NOT EXISTS ux_council_active_role
@@ -542,6 +556,62 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         if "external_ref" not in assumption_columns:
             connection.execute("ALTER TABLE assumptions ADD COLUMN external_ref TEXT")
             connection.execute("UPDATE assumptions SET external_ref = id")
+
+        work_order_columns = _column_names(connection, "work_orders")
+        for statement, column in (
+            ("ALTER TABLE work_orders ADD COLUMN execution_id TEXT", "execution_id"),
+            (
+                "ALTER TABLE work_orders ADD COLUMN fence_token INTEGER "
+                "NOT NULL DEFAULT 0",
+                "fence_token",
+            ),
+            (
+                "ALTER TABLE work_orders ADD COLUMN lease_expires_at TEXT",
+                "lease_expires_at",
+            ),
+            (
+                "ALTER TABLE work_orders ADD COLUMN time_limit_seconds INTEGER "
+                "NOT NULL DEFAULT 1200 CHECK (time_limit_seconds > 0)",
+                "time_limit_seconds",
+            ),
+            (
+                "ALTER TABLE work_orders ADD COLUMN cost_limit_usd REAL "
+                "NOT NULL DEFAULT 2.0 CHECK (cost_limit_usd >= 0)",
+                "cost_limit_usd",
+            ),
+            (
+                "ALTER TABLE work_orders ADD COLUMN model_call_limit INTEGER "
+                "NOT NULL DEFAULT 1 CHECK (model_call_limit > 0)",
+                "model_call_limit",
+            ),
+            (
+                "ALTER TABLE work_orders ADD COLUMN token_limit INTEGER "
+                "NOT NULL DEFAULT 250000 CHECK (token_limit > 0)",
+                "token_limit",
+            ),
+            (
+                "ALTER TABLE work_orders ADD COLUMN side_effect_class TEXT "
+                "NOT NULL DEFAULT 'WORKSPACE_ONLY' CHECK (side_effect_class IN "
+                "('WORKSPACE_ONLY', 'EXTERNAL'))",
+                "side_effect_class",
+            ),
+        ):
+            if column not in work_order_columns:
+                connection.execute(statement)
+
+        run_columns = _column_names(connection, "runs")
+        for statement, column in (
+            ("ALTER TABLE runs ADD COLUMN execution_id TEXT", "execution_id"),
+            ("ALTER TABLE runs ADD COLUMN fence_token INTEGER", "fence_token"),
+            ("ALTER TABLE runs ADD COLUMN outcome TEXT", "outcome"),
+            ("ALTER TABLE runs ADD COLUMN cost_usd REAL", "cost_usd"),
+            (
+                "ALTER TABLE runs ADD COLUMN duration_seconds REAL",
+                "duration_seconds",
+            ),
+        ):
+            if column not in run_columns:
+                connection.execute(statement)
 
         review_columns = _column_names(connection, "reviews")
         for statement, column in (

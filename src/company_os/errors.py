@@ -20,3 +20,7 @@ class CompanyStoppedError(CompanyOSError):
 
 class VerifierTamperError(CompanyOSError):
     """The verifier changed after the WorkOrder was approved."""
+
+
+class StaleExecutionError(CompanyOSError):
+    """A late execution result no longer owns the WorkOrder lease."""

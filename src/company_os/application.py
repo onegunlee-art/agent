@@ -4,7 +4,9 @@ import json
 import re
 import shutil
 import sqlite3
+import time
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterable
@@ -13,6 +15,7 @@ from .errors import (
     CompanyStoppedError,
     ConflictError,
     NotFoundError,
+    StaleExecutionError,
     ValidationError,
 )
 from .evidence import validate_test_result_receipt
@@ -36,6 +39,7 @@ from .handoffs import (
     validate_council_response,
     validate_review_result,
 )
+from .ledger_backup import migrate_ledger
 from .models import (
     CompileOutcome,
     CouncilRequest,
@@ -48,7 +52,10 @@ from .models import (
     Venture,
     WorkOrder,
 )
+from .model_executor import ExecutorOutcome
 from .roles import get_role_spec, list_role_specs, serialize_role_spec
+from .rubric import RubricReport, report_as_dict
+from .paths import default_ledger_path, validate_live_db_path
 from .source_snapshot import (
     GitSourceSnapshot,
     SourceSnapshot,
@@ -83,6 +90,18 @@ _VENTURE_ID = re.compile(r"^venture_[0-9a-f]{32}$")
 _EVIDENCE_EXTERNAL_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _ROLES = ("cto", "cpo", "cmo")
 _MAX_REGISTERED_EVIDENCE_BYTES = 16 * 1024 * 1024
+
+
+def _cost_status(
+    cost_usd: float | None,
+    cost_unknown: bool,
+    cost_limit_usd: float,
+) -> str:
+    if cost_unknown or cost_usd is None:
+        return "UNAVAILABLE"
+    if cost_usd > cost_limit_usd:
+        return "EXCEEDED"
+    return "WITHIN_LIMIT"
 
 
 def _read_bounded_evidence_file(source: Path, *, label: str) -> bytes:
@@ -135,8 +154,17 @@ class CompanyOS:
         allow_test_reviewers: bool = False,
     ):
         self.root = Path(root).resolve()
-        default_db = self.root / "var" / "state" / "company.db"
-        self.db_path = Path(db_path).resolve() if db_path else default_db
+        self.legacy_db_path = self.root / "var" / "state" / "company.db"
+        self.db_path = (
+            validate_live_db_path(db_path)
+            if db_path is not None
+            else default_ledger_path(self.root)
+        )
+        self._migrate_legacy_ledger = (
+            self.db_path != self.legacy_db_path.resolve()
+            and not self.db_path.exists()
+            and self.legacy_db_path.is_file()
+        )
         self.store = SQLiteStateStore(self.db_path)
         self.gate = FirstPrinciplesGate()
         code_root = Path(__file__).resolve().parents[2]
@@ -147,7 +175,24 @@ class CompanyOS:
 
     def initialize(self) -> CompanyOS:
         self.root.mkdir(parents=True, exist_ok=True)
+        migrated_counts: dict[str, int] | None = None
+        if self._migrate_legacy_ledger:
+            migrated_counts = migrate_ledger(self.legacy_db_path, self.db_path)
+            self._migrate_legacy_ledger = False
         self.store.initialize()
+        if migrated_counts is not None:
+            self.store.append_event(
+                "LEDGER_MIGRATED",
+                aggregate_type="Company",
+                aggregate_id="global",
+                payload={
+                    "source": str(self.legacy_db_path),
+                    "target": str(self.db_path),
+                    "table_counts": migrated_counts,
+                    "source_preserved": True,
+                },
+            )
+        self.reclaim_expired()
         return self
 
     def close(self) -> None:
@@ -2133,6 +2178,14 @@ class CompanyOS:
             expected_content=spec["expected_content"],
             verifier_path=self._absolute(row["verifier_path"]),
             verifier_hash=row["verifier_sha256"],
+            execution_id=row["execution_id"],
+            fence_token=int(row["fence_token"]),
+            lease_expires_at=row["lease_expires_at"],
+            time_limit_seconds=int(row["time_limit_seconds"]),
+            cost_limit_usd=float(row["cost_limit_usd"]),
+            model_call_limit=int(row["model_call_limit"]),
+            token_limit=int(row["token_limit"]),
+            side_effect_class=row["side_effect_class"],
         )
 
     def execute_work_order(
@@ -2205,46 +2258,152 @@ class CompanyOS:
 
         execution_id = new_id("execution")
         claimed_at = utc_now()
+        claim_rejected = False
+        fence_token = 0
+        lease_expires_at = ""
         with self.store.transaction() as connection:
-            current_row = connection.execute(
-                "SELECT * FROM work_orders WHERE id = ?", (work_order_id,)
+            stopped_row = connection.execute(
+                "SELECT value_json FROM global_state WHERE key = 'stopped'"
             ).fetchone()
-            if current_row is None:
-                raise NotFoundError(f"WorkOrder not found: {work_order_id}")
-            current_work = self._work_order_from_row(current_row)
-            if current_work.status not in permitted_statuses:
-                raise ValidationError(
-                    f"WorkOrder cannot execute from status {current_work.status}"
+            if stopped_row is not None and bool(json.loads(stopped_row["value_json"])):
+                self.store.append_event(
+                    "WORK_ORDER_CLAIM_REJECTED",
+                    aggregate_type="WorkOrder",
+                    aggregate_id=work_order_id,
+                    venture_id=work_order.venture_id,
+                    payload={"reason": "COMPANY_STOPPED"},
+                    connection=connection,
                 )
-            claimed = connection.execute(
-                """
-                UPDATE work_orders
-                SET status = 'EXECUTING', updated_at = ?
-                WHERE id = ? AND status = ?
-                """,
-                (claimed_at, work_order_id, current_work.status),
-            )
-            if claimed.rowcount != 1:
-                raise ConflictError(
-                    f"WorkOrder execution could not be claimed: {work_order_id}"
+                claim_rejected = True
+            if claim_rejected:
+                current_work = work_order
+            else:
+                current_row = connection.execute(
+                    "SELECT * FROM work_orders WHERE id = ?", (work_order_id,)
+                ).fetchone()
+                if current_row is None:
+                    raise NotFoundError(f"WorkOrder not found: {work_order_id}")
+                current_work = self._work_order_from_row(current_row)
+                if current_work.status not in permitted_statuses:
+                    raise ValidationError(
+                        f"WorkOrder cannot execute from status {current_work.status}"
+                    )
+                fence_token = current_work.fence_token + 1
+                lease_expires_at = (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=current_work.time_limit_seconds)
+                ).isoformat()
+                claimed = connection.execute(
+                    """
+                    UPDATE work_orders
+                    SET status = 'EXECUTING', execution_id = ?, fence_token = ?,
+                        lease_expires_at = ?, updated_at = ?
+                    WHERE id = ? AND status = ? AND fence_token = ?
+                    """,
+                    (
+                        execution_id,
+                        fence_token,
+                        lease_expires_at,
+                        claimed_at,
+                        work_order_id,
+                        current_work.status,
+                        current_work.fence_token,
+                    ),
                 )
-            self.store.append_event(
-                "WORK_ORDER_EXECUTION_STARTED",
-                aggregate_type="WorkOrder",
-                aggregate_id=work_order_id,
-                venture_id=current_work.venture_id,
-                payload={
-                    "execution_id": execution_id,
-                    "executor": executor.name,
-                    "repair_mode": _repair_mode,
-                    "prior_status": current_work.status,
-                },
-                connection=connection,
-            )
+                if claimed.rowcount != 1:
+                    raise ConflictError(
+                        f"WorkOrder execution could not be claimed: {work_order_id}"
+                    )
+                self.store.append_event(
+                    "WORK_ORDER_EXECUTION_STARTED",
+                    aggregate_type="WorkOrder",
+                    aggregate_id=work_order_id,
+                    venture_id=current_work.venture_id,
+                    payload={
+                        "execution_id": execution_id,
+                        "fence_token": fence_token,
+                        "lease_expires_at": lease_expires_at,
+                        "executor": executor.name,
+                        "repair_mode": _repair_mode,
+                        "prior_status": current_work.status,
+                    },
+                    connection=connection,
+                )
+
+        if claim_rejected:
+            raise CompanyStoppedError("Company execution is stopped; run company resume")
 
         venture = self.venture(current_work.venture_id)
+        started_monotonic = time.monotonic()
         try:
             output = executor.execute(current_work, venture.workspace_path)
+            measured_duration = time.monotonic() - started_monotonic
+            if output.duration_seconds is None:
+                output = ExecutionOutput(
+                    artifact_path=output.artifact_path,
+                    ok=output.ok,
+                    label=output.label,
+                    cost_usd=output.cost_usd,
+                    cost_unknown=output.cost_unknown,
+                    duration_seconds=measured_duration,
+                    error=output.error,
+                )
+            if datetime.now(timezone.utc) > datetime.fromisoformat(lease_expires_at):
+                return self._record_execution_outcome(
+                    current_work,
+                    executor_name=executor.name,
+                    execution_id=execution_id,
+                    fence_token=fence_token,
+                    lease_expires_at=lease_expires_at,
+                    prior_status=current_work.status,
+                    label="EXPIRED",
+                    error="execution result arrived after lease expiry",
+                    cost_usd=output.cost_usd,
+                    cost_unknown=output.cost_unknown,
+                    duration_seconds=output.duration_seconds,
+                )
+            if not output.ok:
+                return self._record_execution_outcome(
+                    current_work,
+                    executor_name=executor.name,
+                    execution_id=execution_id,
+                    fence_token=fence_token,
+                    lease_expires_at=lease_expires_at,
+                    prior_status=current_work.status,
+                    label=output.label or "ERROR",
+                    error=output.error,
+                    cost_usd=output.cost_usd,
+                    cost_unknown=output.cost_unknown,
+                    duration_seconds=output.duration_seconds,
+                )
+            if output.cost_unknown or output.cost_usd is None:
+                return self._record_execution_outcome(
+                    current_work,
+                    executor_name=executor.name,
+                    execution_id=execution_id,
+                    fence_token=fence_token,
+                    lease_expires_at=lease_expires_at,
+                    prior_status=current_work.status,
+                    label="COST_UNAVAILABLE",
+                    error="execution cost could not be measured",
+                    cost_usd=output.cost_usd,
+                    cost_unknown=output.cost_unknown,
+                    duration_seconds=output.duration_seconds,
+                )
+            if output.cost_usd > current_work.cost_limit_usd:
+                return self._record_execution_outcome(
+                    current_work,
+                    executor_name=executor.name,
+                    execution_id=execution_id,
+                    fence_token=fence_token,
+                    lease_expires_at=lease_expires_at,
+                    prior_status=current_work.status,
+                    label="COST_LIMIT_EXCEEDED",
+                    error="execution cost exceeded WorkOrder limit",
+                    cost_usd=output.cost_usd,
+                    cost_unknown=False,
+                    duration_seconds=output.duration_seconds,
+                )
             prepared_executor = _PreparedExecutionOutputExecutor(
                 executor.name,
                 output,
@@ -2256,36 +2415,219 @@ class CompanyOS:
                 _repair_mode=_repair_mode,
                 _repair_manifest=_repair_manifest,
                 _claimed_from_status=current_work.status,
+                _execution_id=execution_id,
+                _fence_token=fence_token,
+                _lease_expires_at=lease_expires_at,
+                _execution_output=output,
             )
+        except StaleExecutionError:
+            raise
         except BaseException as error:
             try:
-                with self.store.transaction() as connection:
-                    restored = connection.execute(
-                        """
-                        UPDATE work_orders SET status = ?, updated_at = ?
-                        WHERE id = ? AND status = 'EXECUTING'
-                        """,
-                        (current_work.status, utc_now(), work_order_id),
-                    )
-                    if restored.rowcount == 1:
-                        self.store.append_event(
-                            "WORK_ORDER_EXECUTION_FAILED",
-                            aggregate_type="WorkOrder",
-                            aggregate_id=work_order_id,
-                            venture_id=current_work.venture_id,
-                            payload={
-                                "execution_id": execution_id,
-                                "error_type": type(error).__name__,
-                                "restored_status": current_work.status,
-                            },
-                            connection=connection,
-                        )
+                label = (
+                    "MISSING_ARTIFACT"
+                    if isinstance(executor, ExistingArtifactExecutor)
+                    and isinstance(error, ValidationError)
+                    else "ERROR"
+                )
+                self._record_execution_outcome(
+                    current_work,
+                    executor_name=executor.name,
+                    execution_id=execution_id,
+                    fence_token=fence_token,
+                    lease_expires_at=lease_expires_at,
+                    prior_status=current_work.status,
+                    label=label,
+                    error=f"{type(error).__name__}: {error}",
+                    cost_usd=None,
+                    cost_unknown=True,
+                    duration_seconds=time.monotonic() - started_monotonic,
+                )
             except BaseException as cleanup_error:
                 error.add_note(
                     "Execution state cleanup also failed: "
                     f"{type(cleanup_error).__name__}: {cleanup_error}"
                 )
             raise
+
+    def _record_execution_outcome(
+        self,
+        work_order: WorkOrder,
+        *,
+        executor_name: str,
+        execution_id: str,
+        fence_token: int,
+        lease_expires_at: str,
+        prior_status: str,
+        label: str,
+        error: str | None,
+        cost_usd: float | None,
+        cost_unknown: bool,
+        duration_seconds: float | None,
+    ) -> Run:
+        """Persist a failed/expired execution without losing retry history."""
+
+        venture = self.venture(work_order.venture_id)
+        run_id = new_id("run")
+        occurred_at = utc_now()
+        cost_status = _cost_status(
+            cost_usd,
+            cost_unknown,
+            work_order.cost_limit_usd,
+        )
+        evidence_path = contained_path(
+            venture.workspace_path,
+            "runs",
+            run_id,
+            "execution_failure.json",
+        )
+        evidence_payload = {
+            "run_id": run_id,
+            "work_order_id": work_order.id,
+            "execution_id": execution_id,
+            "fence_token": fence_token,
+            "lease_expires_at": lease_expires_at,
+            "outcome": label,
+            "error": error,
+            "cost_usd": cost_usd,
+            "cost_unknown": cost_unknown,
+            "cost_status": cost_status,
+            "cost_limit_usd": work_order.cost_limit_usd,
+            "duration_seconds": duration_seconds,
+        }
+        atomic_write_json(evidence_path, evidence_payload)
+        stale = False
+        with self.store.transaction() as connection:
+            current = connection.execute(
+                "SELECT * FROM work_orders WHERE id = ?", (work_order.id,)
+            ).fetchone()
+            if current is None:
+                raise NotFoundError(f"WorkOrder not found: {work_order.id}")
+            if (
+                current["status"] != "EXECUTING"
+                or current["execution_id"] != execution_id
+                or int(current["fence_token"]) != fence_token
+            ):
+                stale = True
+                self.store.append_event(
+                    "STALE_RESULT_REJECTED",
+                    aggregate_type="WorkOrder",
+                    aggregate_id=work_order.id,
+                    venture_id=work_order.venture_id,
+                    payload={
+                        "execution_id": execution_id,
+                        "fence_token": fence_token,
+                        "current_execution_id": current["execution_id"],
+                        "current_fence_token": int(current["fence_token"]),
+                    },
+                    connection=connection,
+                )
+            else:
+                attempt = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM runs WHERE work_order_id = ?",
+                        (work_order.id,),
+                    ).fetchone()[0]
+                ) + 1
+                if label in {"COST_UNAVAILABLE", "COST_LIMIT_EXCEEDED"}:
+                    next_status = "FAILED"
+                elif work_order.side_effect_class == "EXTERNAL":
+                    next_status = "MANUAL_RECOVERY_REQUIRED"
+                else:
+                    next_status = prior_status
+                finalized = connection.execute(
+                    """
+                    UPDATE work_orders
+                    SET status = ?, execution_id = NULL, lease_expires_at = NULL,
+                        fence_token = fence_token + 1, updated_at = ?
+                    WHERE id = ? AND status = 'EXECUTING'
+                      AND execution_id = ? AND fence_token = ?
+                    """,
+                    (
+                        next_status,
+                        occurred_at,
+                        work_order.id,
+                        execution_id,
+                        fence_token,
+                    ),
+                )
+                if finalized.rowcount != 1:
+                    raise StaleExecutionError(
+                        f"Execution lease changed while recording {work_order.id}"
+                    )
+                self.store.insert_row(
+                    "runs",
+                    {
+                        "id": run_id,
+                        "work_order_id": work_order.id,
+                        "status": label,
+                        "executor": executor_name,
+                        "verifier_sha256": work_order.verifier_hash,
+                        "execution_id": execution_id,
+                        "fence_token": fence_token,
+                        "outcome": label,
+                        "cost_usd": cost_usd,
+                        "duration_seconds": duration_seconds,
+                        "payload_json": self._json(
+                            {
+                                "attempt": attempt,
+                                "error": error,
+                                "cost_unknown": cost_unknown,
+                                "cost_status": cost_status,
+                                "cost_limit_usd": work_order.cost_limit_usd,
+                                "lease_expires_at": lease_expires_at,
+                            }
+                        ),
+                        "started_at": occurred_at,
+                        "finished_at": occurred_at,
+                        "created_at": occurred_at,
+                    },
+                    connection=connection,
+                )
+                self.store.insert_row(
+                    "evidence",
+                    {
+                        "id": new_id("evidence"),
+                        "idea_id": None,
+                        "venture_id": work_order.venture_id,
+                        "work_order_id": work_order.id,
+                        "run_id": run_id,
+                        "external_ref": None,
+                        "kind": "EXECUTION_FAILURE",
+                        "path": self._relative(evidence_path),
+                        "sha256": sha256_file(evidence_path),
+                        "trusted": 1,
+                        "payload_json": self._json(
+                            {
+                                "trusted": True,
+                                "outcome": label,
+                                "cost_status": cost_status,
+                            }
+                        ),
+                        "created_at": occurred_at,
+                    },
+                    connection=connection,
+                )
+                self.store.append_event(
+                    "WORK_ORDER_EXECUTION_FAILED",
+                    aggregate_type="WorkOrder",
+                    aggregate_id=work_order.id,
+                    venture_id=work_order.venture_id,
+                    payload={
+                        "run_id": run_id,
+                        "execution_id": execution_id,
+                        "fence_token": fence_token,
+                        "outcome": label,
+                        "cost_status": cost_status,
+                        "restored_status": next_status,
+                    },
+                    connection=connection,
+                )
+        if stale:
+            raise StaleExecutionError(
+                f"Late execution result rejected for {work_order.id}/{execution_id}"
+            )
+        return self.run(run_id)
 
     def _finalize_work_order_execution(
         self,
@@ -2296,6 +2638,10 @@ class CompanyOS:
         _repair_mode: bool = False,
         _repair_manifest: dict[str, Any] | None = None,
         _claimed_from_status: str | None = None,
+        _execution_id: str | None = None,
+        _fence_token: int | None = None,
+        _lease_expires_at: str | None = None,
+        _execution_output: ExecutionOutput | None = None,
     ) -> Run:
         original_permitted_statuses = (
             {"REPAIR_REQUIRED"}
@@ -2305,6 +2651,10 @@ class CompanyOS:
         if _claimed_from_status is not None and (
             _claimed_from_status not in original_permitted_statuses
             or not isinstance(executor, _PreparedExecutionOutputExecutor)
+            or _execution_id is None
+            or _fence_token is None
+            or _lease_expires_at is None
+            or _execution_output is None
         ):
             raise ValidationError("Invalid prepared execution finalization")
         if _repair_mode and _claimed_from_status is None:
@@ -2317,7 +2667,7 @@ class CompanyOS:
                 work_order_id,
                 _repair_manifest,
             )
-        if self.is_stopped():
+        if _claimed_from_status is None and self.is_stopped():
             raise CompanyStoppedError("Company execution is stopped; run company resume")
         work_order = self.work_order(work_order_id)
         permitted_statuses = (
@@ -2325,7 +2675,7 @@ class CompanyOS:
             if _claimed_from_status is not None
             else original_permitted_statuses
         )
-        if work_order.status not in permitted_statuses:
+        if _claimed_from_status is None and work_order.status not in permitted_statuses:
             # Exact idempotent replays still return the original result.
             existing = self.store.get_row("idempotency", idempotency_key)
             if existing is None or existing["status"] != "COMPLETED":
@@ -2340,6 +2690,8 @@ class CompanyOS:
             "repair_manifest_hash": (
                 payload_hash(_repair_manifest) if _repair_manifest is not None else None
             ),
+            "execution_id": _execution_id,
+            "fence_token": _fence_token,
         }
 
         def operation(connection: sqlite3.Connection) -> dict[str, str]:
@@ -2349,11 +2701,43 @@ class CompanyOS:
             if current_row is None:
                 raise NotFoundError(f"WorkOrder not found: {work_order_id}")
             current_work = self._work_order_from_row(current_row)
+            if _claimed_from_status is not None and (
+                current_work.execution_id != _execution_id
+                or current_work.fence_token != _fence_token
+            ):
+                self.store.append_event(
+                    "STALE_RESULT_REJECTED",
+                    aggregate_type="WorkOrder",
+                    aggregate_id=work_order_id,
+                    venture_id=current_work.venture_id,
+                    payload={
+                        "execution_id": _execution_id,
+                        "fence_token": _fence_token,
+                        "current_execution_id": current_work.execution_id,
+                        "current_fence_token": current_work.fence_token,
+                    },
+                    connection=connection,
+                )
+                return {"run_id": "", "stale": "true"}
             if current_work.status not in permitted_statuses:
                 raise ValidationError(
                     f"WorkOrder cannot execute from status {current_work.status}"
                 )
             venture = self.venture(current_work.venture_id)
+
+            def clear_claim_after_terminal_result() -> None:
+                if _claimed_from_status is None:
+                    return
+                connection.execute(
+                    """
+                    UPDATE work_orders
+                    SET execution_id = NULL, lease_expires_at = NULL,
+                        fence_token = fence_token + 1
+                    WHERE id = ? AND execution_id = ? AND fence_token = ?
+                    """,
+                    (work_order_id, _execution_id, _fence_token),
+                )
+
             attempt = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM runs WHERE work_order_id = ?",
@@ -2367,7 +2751,7 @@ class CompanyOS:
             except OSError:
                 observed_before = "MISSING"
             if observed_before != current_work.verifier_hash:
-                return self._record_tampered_run(
+                recorded = self._record_tampered_run(
                     connection,
                     current_work,
                     venture,
@@ -2378,6 +2762,8 @@ class CompanyOS:
                     occurred_at=now,
                     artifact_path=None,
                 )
+                clear_claim_after_terminal_result()
+                return recorded
 
             output = executor.execute(current_work, venture.workspace_path)
             artifact = output.artifact_path.resolve()
@@ -2388,7 +2774,7 @@ class CompanyOS:
                 venture.workspace_path, current_work.artifact_relative_path
             )
             if artifact != expected_artifact:
-                return self._record_invalid_artifact_run(
+                recorded = self._record_invalid_artifact_run(
                     connection,
                     current_work,
                     venture,
@@ -2398,13 +2784,15 @@ class CompanyOS:
                     artifact_path=artifact,
                     occurred_at=now,
                 )
+                clear_claim_after_terminal_result()
+                return recorded
 
             try:
                 observed_after = verifier_hash(current_work.verifier_path)
             except OSError:
                 observed_after = "MISSING"
             if observed_after != current_work.verifier_hash:
-                return self._record_tampered_run(
+                recorded = self._record_tampered_run(
                     connection,
                     current_work,
                     venture,
@@ -2415,6 +2803,8 @@ class CompanyOS:
                     occurred_at=now,
                     artifact_path=artifact,
                 )
+                clear_claim_after_terminal_result()
+                return recorded
 
             verification = run_verifier(
                 current_work.verifier_path, venture.workspace_path
@@ -2441,6 +2831,19 @@ class CompanyOS:
                     "status": verification.status,
                     "executor": executor.name,
                     "verifier_sha256": current_work.verifier_hash,
+                    "execution_id": _execution_id,
+                    "fence_token": _fence_token,
+                    "outcome": verification.status,
+                    "cost_usd": (
+                        _execution_output.cost_usd
+                        if _execution_output is not None
+                        else 0.0
+                    ),
+                    "duration_seconds": (
+                        _execution_output.duration_seconds
+                        if _execution_output is not None
+                        else None
+                    ),
                     "payload_json": self._json(
                         {
                             "attempt": attempt,
@@ -2549,10 +2952,32 @@ class CompanyOS:
                     if verification.status == "PASS"
                     else "VERIFICATION_FAILED"
                 )
-            connection.execute(
-                "UPDATE work_orders SET status = ?, updated_at = ? WHERE id = ?",
-                (next_work_status, finished, work_order_id),
-            )
+            if _claimed_from_status is None:
+                connection.execute(
+                    "UPDATE work_orders SET status = ?, updated_at = ? WHERE id = ?",
+                    (next_work_status, finished, work_order_id),
+                )
+            else:
+                finalized = connection.execute(
+                    """
+                    UPDATE work_orders
+                    SET status = ?, execution_id = NULL, lease_expires_at = NULL,
+                        fence_token = fence_token + 1, updated_at = ?
+                    WHERE id = ? AND status = 'EXECUTING'
+                      AND execution_id = ? AND fence_token = ?
+                    """,
+                    (
+                        next_work_status,
+                        finished,
+                        work_order_id,
+                        _execution_id,
+                        _fence_token,
+                    ),
+                )
+                if finalized.rowcount != 1:
+                    raise StaleExecutionError(
+                        f"Execution lease changed while finalizing {work_order_id}"
+                    )
             if _repair_mode and verification.status == "PASS":
                 if _repair_manifest is None:
                     raise ValidationError("Repair PASS requires a repair manifest")
@@ -2664,6 +3089,10 @@ class CompanyOS:
             )
         except IdempotencyConflict as exc:
             raise ConflictError(str(exc)) from exc
+        if result.get("stale") == "true":
+            raise StaleExecutionError(
+                f"Late execution result rejected for {work_order_id}/{_execution_id}"
+            )
         return self.run(str(result["run_id"]))
 
     def _record_tampered_run(
@@ -2836,6 +3265,20 @@ class CompanyOS:
             status=row["status"],
             attempt=int(payload.get("attempt", 1)),
             verifier_hash=row["verifier_sha256"] or "",
+            execution_id=row["execution_id"],
+            fence_token=(
+                int(row["fence_token"]) if row["fence_token"] is not None else None
+            ),
+            outcome=row["outcome"],
+            cost_usd=(
+                float(row["cost_usd"]) if row["cost_usd"] is not None else None
+            ),
+            duration_seconds=(
+                float(row["duration_seconds"])
+                if row["duration_seconds"] is not None
+                else None
+            ),
+            payload=payload,
         )
 
     def runs_for_work_order(self, work_order_id: str) -> tuple[Run, ...]:
@@ -2868,6 +3311,323 @@ class CompanyOS:
                 )
             )
         return tuple(items)
+
+    def record_rubric_report(
+        self,
+        work_order_id: str,
+        run_id: str,
+        report: RubricReport,
+        *,
+        idempotency_key: str,
+        evaluation_status: str = "DRAFT",
+    ) -> Evidence:
+        """Bind a rubric report file and its hash to a canonical Run."""
+
+        if evaluation_status not in {"DRAFT", "APPROVED"}:
+            raise ValidationError("evaluation_status must be DRAFT or APPROVED")
+        work_order = self.work_order(work_order_id)
+        venture = self.venture(work_order.venture_id)
+        report_payload = report_as_dict(report)
+        report_payload["evaluation_status"] = evaluation_status
+        report_payload["official"] = evaluation_status == "APPROVED"
+        report_path = contained_path(
+            venture.workspace_path,
+            "runs",
+            run_id,
+            f"rubric_report_{report.evidence_sha256[:12]}.json",
+        )
+        atomic_write_json(report_path, report_payload)
+        report_file_sha = sha256_file(report_path)
+        command_payload = {
+            "work_order_id": work_order_id,
+            "run_id": run_id,
+            "rubric_evidence_sha256": report.evidence_sha256,
+            "report_file_sha256": report_file_sha,
+            "evaluation_status": evaluation_status,
+        }
+
+        def operation(connection: sqlite3.Connection) -> dict[str, str]:
+            run_row = connection.execute(
+                "SELECT work_order_id FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if run_row is None or run_row["work_order_id"] != work_order_id:
+                raise ValidationError("Rubric report Run does not belong to WorkOrder")
+            evidence_id = new_id("evidence")
+            now = utc_now()
+            self.store.insert_row(
+                "evidence",
+                {
+                    "id": evidence_id,
+                    "idea_id": None,
+                    "venture_id": venture.id,
+                    "work_order_id": work_order_id,
+                    "run_id": run_id,
+                    "external_ref": None,
+                    "kind": "RUBRIC_REPORT",
+                    "path": self._relative(report_path),
+                    "sha256": report_file_sha,
+                    "trusted": 1,
+                    "payload_json": self._json(
+                        {
+                            "trusted": True,
+                            "verdict": report.verdict,
+                            "score": report.score,
+                            "threshold": report.threshold,
+                            "rubric_evidence_sha256": report.evidence_sha256,
+                            "verifier_semantics": "RUBRIC_V1",
+                            "evaluation_status": evaluation_status,
+                            "official": evaluation_status == "APPROVED",
+                        }
+                    ),
+                    "created_at": now,
+                },
+                connection=connection,
+            )
+            self.store.append_event(
+                "RUBRIC_EVALUATED",
+                aggregate_type="Run",
+                aggregate_id=run_id,
+                venture_id=venture.id,
+                payload={
+                    "work_order_id": work_order_id,
+                    "evidence_id": evidence_id,
+                    "verdict": report.verdict,
+                    "score": report.score,
+                    "threshold": report.threshold,
+                    "evaluation_status": evaluation_status,
+                    "official": evaluation_status == "APPROVED",
+                },
+                connection=connection,
+            )
+            return {"evidence_id": evidence_id}
+
+        try:
+            result = self.store.run_idempotent(
+                idempotency_key,
+                "record_rubric_report",
+                command_payload,
+                operation,
+            )
+        except IdempotencyConflict as exc:
+            raise ConflictError(str(exc)) from exc
+        evidence_id = str(result["evidence_id"])
+        return next(
+            item
+            for item in self.evidence_for_run(run_id)
+            if item.id == evidence_id
+        )
+
+    def record_model_execution(
+        self,
+        work_order_id: str,
+        outcome: ExecutorOutcome,
+        *,
+        idempotency_key: str,
+    ) -> Run:
+        """Record an isolated coding-agent execution without advancing the WorkOrder."""
+
+        work_order = self.work_order(work_order_id)
+        venture = self.venture(work_order.venture_id)
+        run_id = new_id("run")
+        cost_status = _cost_status(
+            outcome.cost_usd,
+            outcome.cost_unknown,
+            work_order.cost_limit_usd,
+        )
+        usage_status = outcome.usage_status
+        if usage_status == "UNAVAILABLE" and outcome.usage:
+            usage_status = (
+                "EXCEEDED"
+                if outcome.usage_total_tokens > work_order.token_limit
+                else "WITHIN_LIMIT"
+            )
+        budget_basis = (
+            "TIME_CALL_TOKEN" if cost_status == "UNAVAILABLE" else "USD"
+        )
+        if not outcome.ok:
+            recorded_label = outcome.label
+        elif usage_status == "UNAVAILABLE":
+            recorded_label = "USAGE_UNAVAILABLE"
+        elif usage_status == "EXCEEDED":
+            recorded_label = "USAGE_LIMIT_EXCEEDED"
+        elif cost_status == "EXCEEDED":
+            recorded_label = "COST_LIMIT_EXCEEDED"
+        else:
+            recorded_label = outcome.label
+        policy_error = (
+            outcome.error
+            if not outcome.ok
+            else (
+                "execution usage could not be measured"
+                if usage_status == "UNAVAILABLE"
+                else (
+                    "execution token usage exceeded WorkOrder limit"
+                    if usage_status == "EXCEEDED"
+                    else (
+                        "execution cost exceeded WorkOrder limit"
+                        if cost_status == "EXCEEDED"
+                        else outcome.error
+                    )
+                )
+            )
+        )
+
+        def redact(value: str) -> str:
+            return re.sub(
+                r"(?:sk|ghp|github_pat)-?[A-Za-z0-9_-]{16,}",
+                "[REDACTED]",
+                value,
+            )
+
+        report_payload = {
+            "run_id": run_id,
+            "work_order_id": work_order_id,
+            "outcome": recorded_label,
+            "executor_outcome": outcome.label,
+            "ok": (
+                outcome.ok
+                and usage_status == "WITHIN_LIMIT"
+                and cost_status != "EXCEEDED"
+            ),
+            "cost_usd": outcome.cost_usd,
+            "cost_unknown": outcome.cost_unknown,
+            "cost_status": cost_status,
+            "cost_limit_usd": work_order.cost_limit_usd,
+            "budget_basis": budget_basis,
+            "model_call_limit": work_order.model_call_limit,
+            "model_calls": outcome.model_calls,
+            "token_limit": work_order.token_limit,
+            "usage_status": usage_status,
+            "usage_total_tokens": outcome.usage_total_tokens,
+            "duration_seconds": outcome.duration_seconds,
+            "changed_files": outcome.changed_files,
+            "usage": outcome.usage,
+            "error": policy_error,
+            "stdout_tail": redact(outcome.stdout_tail),
+            "stderr_tail": redact(outcome.stderr_tail),
+        }
+        report_path = contained_path(
+            venture.workspace_path,
+            "runs",
+            run_id,
+            "model_execution.json",
+        )
+        atomic_write_json(report_path, report_payload)
+        report_sha = sha256_file(report_path)
+        command_payload = {
+            "work_order_id": work_order_id,
+            "outcome": recorded_label,
+            "report_sha256": report_sha,
+        }
+
+        def operation(connection: sqlite3.Connection) -> dict[str, str]:
+            attempt = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM runs WHERE work_order_id = ?",
+                    (work_order_id,),
+                ).fetchone()[0]
+            ) + 1
+            now = utc_now()
+            self.store.insert_row(
+                "runs",
+                {
+                    "id": run_id,
+                    "work_order_id": work_order_id,
+                    "status": recorded_label,
+                    "executor": "codex_cli",
+                    "verifier_sha256": work_order.verifier_hash,
+                    "execution_id": None,
+                    "fence_token": None,
+                    "outcome": recorded_label,
+                    "cost_usd": outcome.cost_usd,
+                    "duration_seconds": outcome.duration_seconds,
+                    "payload_json": self._json(
+                        {
+                            "attempt": attempt,
+                            "cost_unknown": outcome.cost_unknown,
+                            "cost_status": cost_status,
+                            "cost_limit_usd": work_order.cost_limit_usd,
+                            "budget_basis": budget_basis,
+                            "model_call_limit": work_order.model_call_limit,
+                            "model_calls": outcome.model_calls,
+                            "token_limit": work_order.token_limit,
+                            "usage_status": usage_status,
+                            "usage_total_tokens": outcome.usage_total_tokens,
+                            "executor_outcome": outcome.label,
+                            "usage": outcome.usage,
+                            "changed_files": outcome.changed_files,
+                            "diagnostic_only": True,
+                        }
+                    ),
+                    "started_at": now,
+                    "finished_at": now,
+                    "created_at": now,
+                },
+                connection=connection,
+            )
+            evidence_id = new_id("evidence")
+            self.store.insert_row(
+                "evidence",
+                {
+                    "id": evidence_id,
+                    "idea_id": None,
+                    "venture_id": venture.id,
+                    "work_order_id": work_order_id,
+                    "run_id": run_id,
+                    "external_ref": None,
+                    "kind": "MODEL_EXECUTION",
+                    "path": self._relative(report_path),
+                    "sha256": report_sha,
+                    "trusted": 1,
+                    "payload_json": self._json(
+                        {
+                            "trusted": True,
+                            "diagnostic_only": True,
+                            "outcome": recorded_label,
+                            "cost_unknown": outcome.cost_unknown,
+                            "cost_status": cost_status,
+                            "cost_limit_usd": work_order.cost_limit_usd,
+                            "budget_basis": budget_basis,
+                            "usage_status": usage_status,
+                        }
+                    ),
+                    "created_at": now,
+                },
+                connection=connection,
+            )
+            self.store.append_event(
+                "MODEL_EXECUTION_RECORDED",
+                aggregate_type="Run",
+                aggregate_id=run_id,
+                venture_id=venture.id,
+                payload={
+                    "work_order_id": work_order_id,
+                    "evidence_id": evidence_id,
+                    "outcome": recorded_label,
+                    "executor_outcome": outcome.label,
+                    "cost_usd": outcome.cost_usd,
+                    "cost_unknown": outcome.cost_unknown,
+                    "cost_status": cost_status,
+                    "cost_limit_usd": work_order.cost_limit_usd,
+                    "budget_basis": budget_basis,
+                    "usage_status": usage_status,
+                    "usage_total_tokens": outcome.usage_total_tokens,
+                    "diagnostic_only": True,
+                },
+                connection=connection,
+            )
+            return {"run_id": run_id}
+
+        try:
+            result = self.store.run_idempotent(
+                idempotency_key,
+                "record_model_execution",
+                command_payload,
+                operation,
+            )
+        except IdempotencyConflict as exc:
+            raise ConflictError(str(exc)) from exc
+        return self.run(str(result["run_id"]))
 
     def _file_integrity_issue(
         self,
@@ -3487,6 +4247,27 @@ class CompanyOS:
         preflight_work = self.work_order(work_order_id)
         if preflight_work.status == "WAITING_FOR_OPUS":
             return self._refresh_waiting_review(work_order_id)
+        try:
+            observed_verifier_hash = verifier_hash(preflight_work.verifier_path)
+        except OSError:
+            observed_verifier_hash = "MISSING"
+        if observed_verifier_hash != preflight_work.verifier_hash:
+            with self.store.transaction() as connection:
+                self.store.append_event(
+                    "VERIFIER_TAMPERED",
+                    aggregate_type="WorkOrder",
+                    aggregate_id=work_order_id,
+                    venture_id=preflight_work.venture_id,
+                    payload={
+                        "approved_hash": preflight_work.verifier_hash,
+                        "observed_hash": observed_verifier_hash,
+                        "stage": "PREPARE_REVIEW",
+                    },
+                    connection=connection,
+                )
+            raise ValidationError(
+                "ReviewRequest cannot be created because the verifier definition changed"
+            )
         source_snapshot = self._source_snapshot()
         if preflight_work.status in {"VERIFIED", "AWAITING_REREVIEW"}:
             preflight_run, preflight_evidence, preflight_artifacts = (
@@ -3581,6 +4362,24 @@ class CompanyOS:
             json_path = directory / "opus_review_request.json"
             markdown_path = directory / "opus_review_request.md"
             specification = json.loads(current_row["specification_json"])
+            try:
+                current_verifier_hash = verifier_hash(current_work.verifier_path)
+            except OSError:
+                current_verifier_hash = "MISSING"
+            if current_verifier_hash != current_work.verifier_hash:
+                self.store.append_event(
+                    "VERIFIER_TAMPERED",
+                    aggregate_type="WorkOrder",
+                    aggregate_id=work_order_id,
+                    venture_id=current_work.venture_id,
+                    payload={
+                        "approved_hash": current_work.verifier_hash,
+                        "observed_hash": current_verifier_hash,
+                        "stage": "PREPARE_REVIEW_TRANSACTION",
+                    },
+                    connection=connection,
+                )
+                return {"tampered": True}
             verifier_spec = read_json(current_work.verifier_path)
             verifier_output_row = next(
                 (row for row in evidence_rows if row["kind"] == "VERIFIER_OUTPUT"),
@@ -3972,6 +4771,10 @@ class CompanyOS:
                 if directory.exists():
                     shutil.rmtree(directory)
             raise
+        if result.get("tampered") is True:
+            raise ValidationError(
+                "ReviewRequest cannot be created because the verifier definition changed"
+            )
         return self.review(str(result["review_id"]))
 
     def review(self, review_id: str) -> Review:
@@ -4647,6 +5450,111 @@ class CompanyOS:
 
     def is_stopped(self) -> bool:
         return self.store.is_stopped()
+
+    def reclaim_expired(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Reclaim expired EXECUTING leases during startup or on demand."""
+
+        observed = now or datetime.now(timezone.utc)
+        if observed.tzinfo is None:
+            raise ValueError("reclaim time must be timezone-aware")
+        observed_text = observed.astimezone(timezone.utc).isoformat()
+        reclaimed: list[dict[str, Any]] = []
+        with self.store.transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM work_orders
+                WHERE status = 'EXECUTING' AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                ORDER BY created_at, id
+                """,
+                (observed_text,),
+            ).fetchall()
+            for row in rows:
+                execution_id = str(row["execution_id"])
+                fence_token = int(row["fence_token"])
+                next_status = (
+                    "READY"
+                    if row["side_effect_class"] == "WORKSPACE_ONLY"
+                    else "MANUAL_RECOVERY_REQUIRED"
+                )
+                updated = connection.execute(
+                    """
+                    UPDATE work_orders
+                    SET status = ?, execution_id = NULL, lease_expires_at = NULL,
+                        fence_token = fence_token + 1, updated_at = ?
+                    WHERE id = ? AND status = 'EXECUTING'
+                      AND execution_id = ? AND fence_token = ?
+                    """,
+                    (
+                        next_status,
+                        observed_text,
+                        row["id"],
+                        execution_id,
+                        fence_token,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    continue
+                attempt = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM runs WHERE work_order_id = ?",
+                        (row["id"],),
+                    ).fetchone()[0]
+                ) + 1
+                run_id = new_id("run")
+                self.store.insert_row(
+                    "runs",
+                    {
+                        "id": run_id,
+                        "work_order_id": row["id"],
+                        "status": "EXPIRED",
+                        "executor": "lease_reclaimer",
+                        "verifier_sha256": row["verifier_sha256"],
+                        "execution_id": execution_id,
+                        "fence_token": fence_token,
+                        "outcome": "EXPIRED",
+                        "cost_usd": None,
+                        "duration_seconds": None,
+                        "payload_json": self._json(
+                            {
+                                "attempt": attempt,
+                                "reason": "lease expired; reclaimed",
+                                "lease_expires_at": row["lease_expires_at"],
+                                "side_effect_class": row["side_effect_class"],
+                            }
+                        ),
+                        "started_at": row["updated_at"],
+                        "finished_at": observed_text,
+                        "created_at": observed_text,
+                    },
+                    connection=connection,
+                )
+                self.store.append_event(
+                    "LEASE_RECLAIMED",
+                    aggregate_type="WorkOrder",
+                    aggregate_id=row["id"],
+                    venture_id=row["venture_id"],
+                    payload={
+                        "run_id": run_id,
+                        "execution_id": execution_id,
+                        "fence_token": fence_token,
+                        "new_status": next_status,
+                    },
+                    connection=connection,
+                )
+                reclaimed.append(
+                    {
+                        "work_order_id": row["id"],
+                        "execution_id": execution_id,
+                        "run_id": run_id,
+                        "new_status": next_status,
+                    }
+                )
+        return reclaimed
 
     def resume_work_order(
         self,

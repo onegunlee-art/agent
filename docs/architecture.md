@@ -1,4 +1,27 @@
-# V0.1 Implemented Architecture
+# AI Company OS Implemented Architecture
+
+## V0.2 execution additions
+
+- WorkOrder execution uses a short SQLite claim, `execution_id`, fence token,
+  expiry, and a short finalization transaction. Model work never holds a write
+  transaction open.
+- Expired `WORKSPACE_ONLY` claims return to retryable state; `EXTERNAL` claims
+  require manual recovery. Late results cannot overwrite a newer lease.
+- The Codex CLI executor runs once in a validated `wo/<id>` Git worktree with
+  `workspace-write`, Windows elevated sandboxing, a bounded process tree, a
+  safe environment allowlist, and a separate acceptance command.
+- Functional outcome, USD cost status, and measurable usage status are separate.
+  A ChatGPT-login run can be `DONE` with `cost_status=UNAVAILABLE` only when its
+  one-call, token, and time limits pass.
+- Rubric reports support weighted deterministic checks, critical hard failures,
+  fail-closed judge criteria, and hash-bound Evidence. DRAFT reports are marked
+  `official=false` until CEO approval.
+- Canonical SQLite state defaults outside the repository. Backup uses SQLite's
+  online backup API, a SHA-256 sidecar, integrity check, table counts, and
+  restore to a new path only.
+- Loopback-only preview and dashboard servers provide the browser surfaces;
+  the dashboard uses read-only SQLite snapshots and hash-bound approval or
+  revision actions.
 
 ## Vertical slice
 
@@ -135,28 +158,26 @@ carrying the old remediation claims onto a different commit.
 
 SQLite transactions make canonical state and Events atomic, but SQLite and
 the filesystem cannot share one transaction. Staging and failure cleanup
-close the ordinary rollback gap, while a hard process interruption can still
-leave a staging directory for later diagnosis. V0.1 ExecutorPorts are limited
-to reversible local work. External or irreversible actions remain out of
-scope.
+close the ordinary rollback gap. V0.2 leases reclaim interrupted
+`WORKSPACE_ONLY` execution and fence off late results; `EXTERNAL` work stops
+for manual recovery. External or irreversible actions remain out of scope.
 
 The built-in verifier is `SYNTHETIC_ONLY`. Its PASS result means only that the
 artifact at the declared local path exactly matches fixed expected bytes. It
 does not semantically evaluate the VentureContract metric, experiment, or
-business pass/fail condition. Contract-based verification for real Ventures
-is not implemented in V0.1.
+business pass/fail condition. Model-produced FAQ answers use the separate
+rubric verifier. Contract-based validation for real Ventures remains out of
+scope.
 
 Context Manifests provide `LOGICAL_NAMESPACE_ONLY` organization, not a
-security boundary. The runtime checks that the artifact returned by an
-ExecutorPort is the declared path inside that Venture workspace, but it does
-not sandbox the executor, restrict reads, or detect every write outside the
-workspace. Only a trusted local executor with synthetic, non-confidential
+security boundary. The coding executor adds a validated Git worktree and
+Codex `workspace-write` sandbox, but confidential multi-tenant isolation is
+still not claimed. Only a trusted local executor with synthetic, non-confidential
 data is supported; real Ventures and untrusted executors are out of scope.
 
 The V0.2 execution foundation claims a WorkOrder with a short `EXECUTING`
 transition, commits that transaction, invokes the ExecutorPort without a
 SQLite write lock, and then finalizes the Run in a second short transaction.
 Handled executor failures restore the prior resumable status and append a
-failure Event. A hard process termination during the unlocked interval can
-still leave an `EXECUTING` claim; explicit abandoned-claim recovery remains a
-follow-up before real external executors are enabled.
+failure Event. Startup and `company reclaim-expired` recover expired claims,
+while fence tokens reject any result arriving from the abandoned execution.
