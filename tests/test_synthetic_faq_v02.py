@@ -82,3 +82,33 @@ def test_preview_binds_loopback_and_answers() -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_preview_keeps_answer_sources_collapsed_until_user_expands_them() -> None:
+    server = create_server(CAFE_A / "faq_data.json", port=0)
+    host, port = server.server_address
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/", timeout=3) as response:
+            page = response.read().decode("utf-8")
+        request = urllib.request.Request(
+            f"http://{host}:{port}/ask",
+            data=json.dumps({"question": "주차 가능한가요?"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            result = json.loads(response.read())
+
+        assert result["answer_text"]
+        assert result["source_details"] == ["합성 카페 A 운영안내 - 주차"]
+        assert "출처 보기" in page
+        assert "aria-expanded" in page
+        assert ".hidden=true" in page
+        assert "addEventListener('click'" in page
+        assert "data.answer_text" in page
+        assert "data.source_details" in page
+    finally:
+        server.shutdown()
+        server.server_close()
