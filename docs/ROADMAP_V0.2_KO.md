@@ -44,7 +44,10 @@ Codex CLI 프로세스 1회로 `synthetic_faq.py`를 수정하고 수용 테스�
 통과했다. 독립 diff 검토에서 토글 상태 오류를 발견해 실패 테스트를 보강하고
 교정했다. 미리보기는 실제 LLM 답변형이 아니라 결정형 FAQ 검색형이다.
 
-12건 rubric은 DRAFT 상태에서 12/12 PASS하고 Evidence로 결속됐다. 이는 개발
+표현 변경 질문을 포함한 12건 rubric은 최종 후보 데이터에서 DRAFT 12/12,
+score 1.0으로 재실행됐다. rubric 내용 해시는
+`5b86449e6fb565f65de9907f1b53f9aa24d4dddaaad78831f462defb0ab47740`,
+원장 Evidence는 `evidence_a03ae43814fa420690fbbf2579849630`이다. 이는 개발
 증거이며 CEO 승인 평가나 Claude 독립 검수 PASS를 대신하지 않는다.
 
 ## 관문
@@ -56,7 +59,7 @@ Codex CLI 프로세스 1회로 `synthetic_faq.py`를 수정하고 수용 테스�
 - 완료: 실제 모델의 합성 챗봇 데이터·프로그램 코드 수정과 수용 테스트
 - 완료: 외부 원장 온라인 백업과 34개 참조 파일의 해시 결속 복구 묶음
 - 완료: 빈 경로 복원 뒤 Run/Evidence 해시 조회와 다음 Idea 생성
-- 대기: 수정된 동일 소스에서 DRAFT rubric 재실행
+- 완료: 수정된 동일 소스에서 표현 변경 질문 포함 DRAFT rubric 12/12 재실행
 - 대기: CEO가 평가 사례를 검토하고 `_status=APPROVED`로 승인
 - 대기: 수정 diff·테스트·rubric·소스 ZIP에 대한 Claude 독립 PASS
 - 대기: CEO의 main 병합 승인

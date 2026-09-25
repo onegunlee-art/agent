@@ -51,6 +51,16 @@ def test_every_known_answer_is_deterministic_and_cites_source() -> None:
         assert first["sources"] == [item["id"]] and "출처:" in first["text"]
 
 
+def test_review_paraphrases_match_holiday_and_black_sesame_answers() -> None:
+    holiday = answer("추석 당일에도 문 열어요?", DATA)
+    assert holiday["matched_id"] == "faq-hours"
+    assert "명절 당일과 다음 날 휴무" in holiday["text"]
+
+    menu = answer("검은깨 들어간 메뉴 있어요?", DATA)
+    assert menu["matched_id"] == "faq-black-sesame-latte"
+    assert "흑임자 라떼" in menu["text"]
+
+
 def test_customer_b_marker_is_never_read(tmp_path: Path) -> None:
     marker = ROOT / "examples" / "synthetic-cafe-b" / "private-marker.json"
     marker.write_text(json.dumps({"secret": "CUSTOMER-B-SECRET"}), encoding="utf-8")
