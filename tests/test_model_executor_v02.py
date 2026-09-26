@@ -20,6 +20,7 @@ from company_os.model_executor import (
     ExecutorOutcome,
     ExecutorRequest,
     build_instructions,
+    capture_workspace_diff,
     capture_workspace_identity,
     codex_jsonl_cost,
     create_worktree,
@@ -199,6 +200,21 @@ def test_sparse_checkout_patterns_are_captured_as_run_reproducibility() -> None:
         assert identity.branch == "wo/WO-sparse"
         assert len(identity.head_commit) == 40
         assert identity.sparse_checkout_patterns == ("src",)
+
+
+def test_git_diff_is_decoded_as_utf8_independent_of_windows_locale(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    (repo / "hello.py").write_text(
+        "def hello():\n    return '한글 안내'\n",
+        encoding="utf-8",
+    )
+
+    diff = capture_workspace_diff(repo)
+
+    assert isinstance(diff, str)
+    assert "한글 안내" in diff
 
 
 def test_cli_exposes_bounded_model_run_entrypoint() -> None:
