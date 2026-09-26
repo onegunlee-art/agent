@@ -10,7 +10,8 @@
 | 빌더 세션(Codex 작업 채팅) | 실행 lease, rubric, executor, 백업·복원, 현황판, 문서와 제품 테스트 | V0.2 OS 구현 및 결함 교정 |
 | AI 직원 실행 | Run `run_e1037947ca3e4b80b2cc48f2c5341dbc`; `synthetic_faq.py` 변경 보고; 211,901토큰; `DONE` | 제한된 sparse worktree에서 출처 펼치기 프로그램 코드를 수정한 실제 모델 실행 |
 | 빌더 자체 검토/내부 QA | 토글 상태 반전 실패 테스트와 `sources.hidden=expanded` 교정, source element id/`aria-controls` 보강 | AI 직원 산출물을 받은 뒤 빌더가 직접 검토·수정. Claude 독립 검수가 아님 |
-| 빌더 후속 평가 보강 | q02 “추석 당일”, q12 “검은깨”와 동의어 보강 | 모델 결과를 본 뒤 빌더가 직접 추가. AI 직원 Run 산출물로 주장하지 않음 |
+| 빌더 후속 평가 보강 | q02 “추석 당일”, q12 “검은깨”, q13 가격 추측 방지와 엄격한 1.00 기준 | 모델 결과와 승인 전 검토를 바탕으로 빌더가 직접 추가. AI 직원 Run 산출물로 주장하지 않음 |
+| 빌더 승인 관문 보강 | 평가 파일 SHA 결속 SQLite Decision/Approval/Event와 공식 Evidence 경로 | CEO 승인 입력 뒤 빌더가 실패 테스트부터 구현. AI 직원 Run이나 Claude 독립 검수 산출물이 아님 |
 | Claude 독립 검수 | 아직 없음 | 최종 ZIP과 요청서를 Claude 새 대화에서 검토해 PASS를 받아야 성립 |
 
 ## 실행 증거

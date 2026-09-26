@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -81,10 +82,18 @@ def evaluate(
     data_path: str | Path,
     *,
     require_approved: bool = False,
+    approved_spec_sha256: str | None = None,
 ) -> RubricReport:
-    spec = load_json(cases_path)
-    if require_approved and spec.get("_status") != "APPROVED":
-        raise RuntimeError("evaluation cases require CEO APPROVED status")
+    source = Path(cases_path).resolve()
+    if require_approved:
+        if approved_spec_sha256 is None:
+            raise RuntimeError(
+                "official evaluation requires canonical CEO APPROVED SHA-256"
+            )
+        actual_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+        if actual_sha256 != approved_spec_sha256:
+            raise RuntimeError("evaluation cases changed after CEO approval")
+    spec = load_json(source)
     data = load_json(data_path)
     answers = {case["id"]: answer(case["question"], data) for case in spec["cases"]}
     return run_rubric(

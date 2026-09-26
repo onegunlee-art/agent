@@ -107,6 +107,29 @@ Open `http://127.0.0.1:8765/` for the chatbot and
 Known FAQ answers show an explicit `출처 보기` control; the source is collapsed
 until the user expands it. Refusals do not display a source control.
 
+Hash-bound evaluation approval is stored only in SQLite. Keep the approved
+evaluation file byte-for-byte unchanged and place the CEO's exact sentence in
+a local, untracked text file before running:
+
+```powershell
+company --root C:\dev\ai-company-os evaluation approve <work-order-id> `
+  --cases C:\dev\ai-company-os\examples\synthetic-cafe-a\eval_cases.json `
+  --expected-sha256 <approved-sha256> `
+  --approval-file <local-ceo-approval.txt> `
+  --idempotency-key <unique-approval-key>
+
+company --root C:\dev\ai-company-os evaluation run <work-order-id> `
+  --run <accepted-run-id> `
+  --cases C:\dev\ai-company-os\examples\synthetic-cafe-a\eval_cases.json `
+  --data C:\dev\ai-company-os\examples\synthetic-cafe-a\faq_data.json `
+  --approval <approval-id> `
+  --idempotency-key <unique-official-evaluation-key>
+```
+
+The approval command fails if the file hash, case count, threshold, or exact
+approval sentence differs. The official report also binds a clean Git commit
+and tracked-tree SHA-256 and never overwrites an earlier DRAFT report.
+
 Back up and verify the external ledger without copying a live SQLite file:
 
 ```powershell

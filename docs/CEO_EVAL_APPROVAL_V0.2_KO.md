@@ -1,8 +1,13 @@
 # V0.2 평가 세트 CEO 승인서
 
-현재 상태는 `DRAFT`다. 이 문서는 CEO가 정답과 채점 기준을 읽기 위한 자료이며,
-문서를 여는 것만으로 승인되지 않는다. 승인 전에는 `--require-approved` 공식
-평가를 실행할 수 없다.
+평가 파일 자체는 승인 대상 바이트를 보존하기 위해 `DRAFT`로 동결한다. 문서를
+여는 것만으로 승인되지 않으며, 공식 승인 상태는 SQLite Decision/Approval과
+추가 전용 Event만 소유한다. 승인 ID와 현재 파일 SHA가 모두 일치해야 공식
+평가를 실행할 수 있다.
+
+2026-09-26 CEO가 아래의 정확한 SHA-256·13건·threshold 1.00 승인 문장을 작업
+채팅에 남겼다. 이 입력은 소스 커밋 뒤 `company evaluation approve`로 원장에
+기록하며, 파일 내용이 달라졌으면 명령이 실패해야 한다.
 
 승인 대상 `examples/synthetic-cafe-a/eval_cases.json`의 SHA-256은 다음과 같다.
 
@@ -62,7 +67,8 @@ CEO 승인 전 검토에서 가격 추측 방지를 자동 회귀 시험으로 �
 V0.2 평가 사례 13건(eval_cases.json SHA-256: d935536f9d147578d1f6ff794fae5e95090d4cec7d355774d6a5e02c8e7c7000)과 threshold 1.00을 APPROVED로 승인합니다.
 ```
 
-이 승인 뒤에만 승인한 DRAFT SHA-256, 승인자, 승인 시각과 승인 상태를 원장 및
-평가 메타데이터에 기록한다. 승인 입력 SHA가 현재 파일 SHA와 다르면 중단한다.
-그 뒤 `--require-approved`로 공식 평가를 재실행한다. 공식 평가 Evidence가
-결속된 새 소스 ZIP과 Claude 검수 요청서를 만든 뒤 독립 검수를 요청한다.
+이 승인 뒤에만 승인한 DRAFT SHA-256, 승인자, 승인 시각과 승인 상태를 원장에
+기록한다. 승인 입력 SHA가 현재 파일 SHA와 다르면 중단한다. 평가 파일의
+`_status`를 바꾸거나 원본을 덮어쓰지 않는다. 그 뒤 승인 ID로 공식 평가를
+실행한다. 공식 평가 Evidence가 결속된 새 소스 ZIP과 Claude 검수 요청서를 만든
+뒤 독립 검수를 요청한다.

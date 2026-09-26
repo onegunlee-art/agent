@@ -27,7 +27,11 @@
 - Rubric reports support weighted deterministic checks, critical hard failures,
   fail-closed judge criteria, and hash-bound Evidence. DRAFT reports are marked
   `official=false` until the CEO explicitly approves the exact evaluation-file
-  SHA-256 and threshold; any later byte change requires a new approval.
+  SHA-256 and threshold in a canonical SQLite Decision/Approval plus append-only
+  Event. The approved source file stays byte-for-byte DRAFT; official status is
+  never inferred from a mutable JSON field. An official report must cite that
+  approval ID, the unchanged specification hash, and a clean Git source
+  commit/tree digest. Any later byte change requires a new approval.
 - Canonical SQLite state defaults outside the repository. SQLite-only backup
   uses the online backup API, a SHA-256 sidecar, integrity check, table counts,
   and restore to a new path only. Full recovery additionally creates a ZIP

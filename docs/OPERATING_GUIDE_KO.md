@@ -116,6 +116,26 @@ SHA-256을 별도 `RUN_REPRODUCIBILITY` Evidence와 Event에 자동 기록한다
 수정하는 코딩 실행자로 사용된다. 알려진 답변의 출처는 `출처 보기` 버튼을
 눌렀을 때만 펼쳐지고 자료 밖 질문에는 버튼이 나오지 않아야 한다.
 
+평가 승인은 `eval_cases.json`의 `_status`를 직접 바꾸지 않는다. CEO가 승인한
+원시 파일 SHA-256과 정확한 승인 문장을 로컬 텍스트 파일에 보존한 뒤 다음 두
+명령으로 SQLite 원장 승인과 공식 평가를 분리해 실행한다.
+
+```powershell
+.\.venv\Scripts\company.exe --root C:\dev\ai-company-os evaluation approve <work-order-id> `
+  --cases C:\dev\ai-company-os\examples\synthetic-cafe-a\eval_cases.json `
+  --expected-sha256 <승인한-sha256> --approval-file <승인문.txt> `
+  --idempotency-key <고유-승인-key>
+
+.\.venv\Scripts\company.exe --root C:\dev\ai-company-os evaluation run <work-order-id> `
+  --run <채택-run-id> `
+  --cases C:\dev\ai-company-os\examples\synthetic-cafe-a\eval_cases.json `
+  --data C:\dev\ai-company-os\examples\synthetic-cafe-a\faq_data.json `
+  --approval <approval-id> --idempotency-key <고유-공식평가-key>
+```
+
+공식 Evidence는 승인 ID, 평가 파일 해시, clean Git commit/tree 해시를 함께
+기록한다. 승인 뒤 파일이 한 바이트라도 바뀌면 공식 평가는 실패한다.
+
 현황판의 승인 버튼은 기존 행을 직접 덮어쓰지 않는다. 현재 Run·Artifact·검수
 결속을 담은 Decision/Approval 행과 `CEO_WORK_ORDER_APPROVED` Event를 추가한다.
 현황판은 성공 재실행에 가려진 거부 시도까지 실행 이력 전체와 토큰 수로 보여

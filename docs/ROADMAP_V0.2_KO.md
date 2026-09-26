@@ -52,7 +52,10 @@ DRAFT 13/13, score 1.0이며 rubric 내용 해시는
 `e66788fb86c9ce57b2f5c6c84a4957707e60326b0cf7132898f2391afd0cda6a`다.
 평가 파일 SHA-256은
 `d935536f9d147578d1f6ff794fae5e95090d4cec7d355774d6a5e02c8e7c7000`이다.
-이는 아직 공식 평가 Evidence나 Claude 독립 검수 PASS를 대신하지 않는다.
+2026-09-26 CEO가 이 정확한 해시·13건·threshold 1.00을 작업 채팅에서
+승인했다. 승인 파일은 바이트 보존을 위해 DRAFT 그대로 두고, SQLite의
+Decision/Approval/Event를 유일한 승인 상태로 사용한다. 공식 평가 Evidence와
+Claude 독립 검수 PASS는 별도 관문이다.
 
 ## 관문
 
@@ -66,7 +69,8 @@ DRAFT 13/13, score 1.0이며 rubric 내용 해시는
 - 완료: 외부 원장 온라인 백업과 34개 참조 파일의 해시 결속 복구 묶음
 - 완료: 빈 경로 복원 뒤 Run/Evidence 해시 조회와 다음 Idea 생성
 - 완료: 수정된 동일 소스에서 엄격화한 DRAFT rubric 13/13 재실행
-- 대기: CEO가 평가 파일 SHA-256, 13건, threshold 1.00을 명시적으로 승인
+- 완료: CEO가 평가 파일 SHA-256, 13건, threshold 1.00을 명시적으로 승인
+- 대기: 원장 승인 ID에 결속한 공식 rubric 13/13, score 1.00 Evidence 기록
 - 대기: 수정 diff·테스트·rubric·소스 ZIP에 대한 Claude 독립 PASS
 - 대기: CEO의 main 병합 승인
 
@@ -94,7 +98,8 @@ DRAFT 13/13, score 1.0이며 rubric 내용 해시는
 - 명절 휴무와 신규 메뉴 수정 요구를 반영했는가
 - 실행 시간·Codex CLI 프로세스 호출·입력+출력 토큰 상한을 지켰는가
 
-CEO가 질문·정답·금지어·threshold를 검토하기 전까지 공식 평가가 아니다.
+CEO가 질문·정답·금지어·threshold와 정확한 파일 SHA-256을 승인했다. 파일 내부
+표시가 아니라 SQLite 승인 ID에 결속된 재실행만 공식 평가다.
 
 ### 3. 실제 실행자 한 명
 
@@ -146,8 +151,7 @@ Deep Agents는 후보이지 확정 의존성이 아니다. 채택 전에는 기�
 
 ## 다음 CEO 결정
 
-아래 세 가지 CEO 결정이 남아 있다.
+아래 두 가지 CEO 결정이 남아 있다.
 
-1. `eval_cases.json` SHA-256, 13건과 threshold 1.00을 검토해 APPROVED로 승인할지 결정
-2. 브라우저에서 명절 휴무·흑임자 라떼·자료 밖 질문을 직접 확인
-3. Claude 독립 검수 PASS 뒤 현재 브랜치를 main에 병합할지 결정
+1. 브라우저에서 명절 휴무·흑임자 라떼·자료 밖 질문을 직접 확인
+2. Claude 독립 검수 PASS 뒤 현재 브랜치를 main에 병합할지 결정

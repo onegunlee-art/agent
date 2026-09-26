@@ -3312,6 +3312,252 @@ class CompanyOS:
             )
         return tuple(items)
 
+    def record_evaluation_approval(
+        self,
+        work_order_id: str,
+        *,
+        cases_path: str | Path,
+        expected_sha256: str,
+        approval_text: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Record a CEO approval bound to the exact immutable DRAFT bytes."""
+
+        work_order = self.work_order(work_order_id)
+        source = Path(cases_path).resolve()
+        relative_path = self._relative(source)
+        if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+            raise ValidationError("expected evaluation SHA-256 must be lowercase hex")
+        content = _read_bounded_evidence_file(source, label="evaluation specification")
+        actual_sha256 = sha256(content).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValidationError(
+                "evaluation specification SHA-256 does not match CEO approval"
+            )
+        try:
+            specification = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValidationError(
+                "evaluation specification must be valid UTF-8 JSON"
+            ) from exc
+        if not isinstance(specification, dict):
+            raise ValidationError("evaluation specification must be a JSON object")
+        if specification.get("_status") != "DRAFT":
+            raise ValidationError("only an immutable DRAFT evaluation can be approved")
+        cases = specification.get("cases")
+        if not isinstance(cases, list) or not cases:
+            raise ValidationError("evaluation specification requires cases")
+        try:
+            threshold = float(specification["threshold"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValidationError(
+                "evaluation specification requires a numeric threshold"
+            ) from exc
+        normalized_approval_text = approval_text.strip()
+        required_approval_text = (
+            f"V0.2 평가 사례 {len(cases)}건({source.name} SHA-256: "
+            f"{actual_sha256})과 threshold {threshold:.2f}을 APPROVED로 승인합니다."
+        )
+        if normalized_approval_text != required_approval_text:
+            raise ValidationError(
+                "approval text does not exactly bind the evaluation SHA-256, "
+                "case count, and threshold"
+            )
+        command_payload = {
+            "work_order_id": work_order_id,
+            "evaluation_spec_path": relative_path,
+            "evaluation_spec_sha256": actual_sha256,
+            "case_count": len(cases),
+            "threshold": threshold,
+            "approval_text": normalized_approval_text,
+        }
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            decision_id = new_id("decision")
+            approval_id = new_id("approval")
+            now = utc_now()
+            decision_payload = {
+                "classification": "EVALUATION_SPEC_APPROVAL",
+                "evaluation_spec_path": relative_path,
+                "evaluation_spec_sha256": actual_sha256,
+                "case_count": len(cases),
+                "threshold": threshold,
+                "approval_text": normalized_approval_text,
+                "approval_text_sha256": sha256(
+                    normalized_approval_text.encode("utf-8")
+                ).hexdigest(),
+                "source": "user_supplied",
+            }
+            self.store.insert_row(
+                "decisions",
+                {
+                    "id": decision_id,
+                    "venture_id": work_order.venture_id,
+                    "work_order_id": work_order_id,
+                    "status": "RESOLVED",
+                    "payload_json": self._json(decision_payload),
+                    "created_at": now,
+                    "updated_at": now,
+                },
+                connection=connection,
+            )
+            self.store.insert_row(
+                "approvals",
+                {
+                    "id": approval_id,
+                    "contract_id": None,
+                    "decision_id": decision_id,
+                    "status": "APPROVED",
+                    "actor": "CEO",
+                    "payload_json": self._json(
+                        {
+                            "approval_type": "EVALUATION_SPEC",
+                            "evaluation_spec_sha256": actual_sha256,
+                            "case_count": len(cases),
+                            "threshold": threshold,
+                            "explicit_ceo_approval": True,
+                        }
+                    ),
+                    "created_at": now,
+                },
+                connection=connection,
+            )
+            self.store.append_event(
+                "EVALUATION_SPEC_APPROVED",
+                aggregate_type="Decision",
+                aggregate_id=decision_id,
+                venture_id=work_order.venture_id,
+                correlation_id=work_order_id,
+                payload={
+                    "approval_id": approval_id,
+                    "work_order_id": work_order_id,
+                    "evaluation_spec_path": relative_path,
+                    "evaluation_spec_sha256": actual_sha256,
+                    "case_count": len(cases),
+                    "threshold": threshold,
+                    "actor": "CEO",
+                },
+                connection=connection,
+            )
+            return {
+                "status": "APPROVED",
+                "decision_id": decision_id,
+                "approval_id": approval_id,
+                "evaluation_spec_sha256": actual_sha256,
+                "case_count": len(cases),
+                "threshold": threshold,
+            }
+
+        try:
+            return self.store.run_idempotent(
+                idempotency_key,
+                "record_evaluation_approval",
+                command_payload,
+                operation,
+            )
+        except IdempotencyConflict as exc:
+            raise ConflictError(str(exc)) from exc
+
+    def _validated_evaluation_approval(
+        self,
+        approval_id: str,
+        *,
+        work_order_id: str,
+        evaluation_spec_path: str,
+        evaluation_spec_sha256: str,
+    ) -> dict[str, Any]:
+        row = self.store.query_one(
+            """
+            SELECT a.status AS approval_status, a.actor,
+                   d.status AS decision_status, d.work_order_id,
+                   d.payload_json AS decision_payload_json
+            FROM approvals a
+            JOIN decisions d ON d.id = a.decision_id
+            WHERE a.id = ?
+            """,
+            (approval_id,),
+        )
+        if row is None:
+            raise ValidationError("canonical CEO evaluation approval was not found")
+        if (
+            row["approval_status"] != "APPROVED"
+            or row["actor"] != "CEO"
+            or row["decision_status"] != "RESOLVED"
+            or row["work_order_id"] != work_order_id
+        ):
+            raise ValidationError("canonical CEO evaluation approval is not valid")
+        payload = json.loads(row["decision_payload_json"])
+        if payload.get("classification") != "EVALUATION_SPEC_APPROVAL":
+            raise ValidationError("approval does not authorize an evaluation specification")
+        if (
+            payload.get("evaluation_spec_path") != evaluation_spec_path
+            or payload.get("evaluation_spec_sha256") != evaluation_spec_sha256
+        ):
+            raise ValidationError("evaluation changed after CEO approval")
+        return payload
+
+    def run_official_evaluation(
+        self,
+        work_order_id: str,
+        run_id: str,
+        *,
+        cases_path: str | Path,
+        data_path: str | Path,
+        approval_id: str,
+        idempotency_key: str,
+    ) -> Evidence:
+        """Evaluate exact approved bytes and persist source-bound official Evidence."""
+
+        from .synthetic_faq import evaluate
+
+        work_order = self.work_order(work_order_id)
+        run_row = self._row("runs", run_id)
+        if run_row["work_order_id"] != work_order_id:
+            raise ValidationError("Official evaluation Run does not belong to WorkOrder")
+        source = Path(cases_path).resolve()
+        relative_path = self._relative(source)
+        current_sha256 = sha256_file(source)
+        data_source = Path(data_path).resolve()
+        self._relative(data_source)
+        data_content = _read_bounded_evidence_file(
+            data_source,
+            label="evaluation data",
+        )
+        data_sha256 = sha256(data_content).hexdigest()
+        self._validated_evaluation_approval(
+            approval_id,
+            work_order_id=work_order_id,
+            evaluation_spec_path=relative_path,
+            evaluation_spec_sha256=current_sha256,
+        )
+        try:
+            report = evaluate(
+                source,
+                data_source,
+                require_approved=True,
+                approved_spec_sha256=current_sha256,
+            )
+        except RuntimeError as exc:
+            raise ValidationError(str(exc)) from exc
+        if sha256_file(source) != current_sha256:
+            raise ValidationError("evaluation changed after CEO approval")
+        if sha256_file(data_source) != data_sha256:
+            raise ValidationError("evaluation data changed during official evaluation")
+        snapshot = self._source_snapshot()
+        return self.record_rubric_report(
+            work_order_id,
+            run_id,
+            report,
+            idempotency_key=idempotency_key,
+            evaluation_status="APPROVED",
+            evaluation_approval_id=approval_id,
+            evaluation_spec_path=source,
+            evaluation_spec_sha256=current_sha256,
+            evaluation_data_path=data_source,
+            evaluation_data_sha256=data_sha256,
+            source_snapshot=snapshot,
+        )
+
     def record_rubric_report(
         self,
         work_order_id: str,
@@ -3320,6 +3566,12 @@ class CompanyOS:
         *,
         idempotency_key: str,
         evaluation_status: str = "DRAFT",
+        evaluation_approval_id: str | None = None,
+        evaluation_spec_path: str | Path | None = None,
+        evaluation_spec_sha256: str | None = None,
+        evaluation_data_path: str | Path | None = None,
+        evaluation_data_sha256: str | None = None,
+        source_snapshot: SourceSnapshot | None = None,
     ) -> Evidence:
         """Bind a rubric report file and its hash to a canonical Run."""
 
@@ -3327,14 +3579,64 @@ class CompanyOS:
             raise ValidationError("evaluation_status must be DRAFT or APPROVED")
         work_order = self.work_order(work_order_id)
         venture = self.venture(work_order.venture_id)
+        official = evaluation_status == "APPROVED"
+        evaluation_relative_path: str | None = None
+        if official:
+            if (
+                evaluation_approval_id is None
+                or evaluation_spec_path is None
+                or evaluation_spec_sha256 is None
+                or evaluation_data_path is None
+                or evaluation_data_sha256 is None
+                or source_snapshot is None
+            ):
+                raise ValidationError(
+                    "official rubric report requires canonical CEO approval"
+                )
+            evaluation_relative_path = self._relative(
+                Path(evaluation_spec_path).resolve()
+            )
+            self._validated_evaluation_approval(
+                evaluation_approval_id,
+                work_order_id=work_order_id,
+                evaluation_spec_path=evaluation_relative_path,
+                evaluation_spec_sha256=evaluation_spec_sha256,
+            )
+            evaluation_data_relative_path = self._relative(
+                Path(evaluation_data_path).resolve()
+            )
+        elif evaluation_approval_id is not None:
+            raise ValidationError("DRAFT rubric report cannot cite an approval")
+        else:
+            evaluation_data_relative_path = None
         report_payload = report_as_dict(report)
         report_payload["evaluation_status"] = evaluation_status
-        report_payload["official"] = evaluation_status == "APPROVED"
+        report_payload["official"] = official
+        report_payload["evaluation_approval_id"] = evaluation_approval_id
+        report_payload["evaluation_spec_path"] = evaluation_relative_path
+        report_payload["evaluation_spec_sha256"] = evaluation_spec_sha256
+        report_payload["evaluation_data_path"] = evaluation_data_relative_path
+        report_payload["evaluation_data_sha256"] = evaluation_data_sha256
+        report_payload["case_count"] = len(report.cases)
+        report_payload["source_commit"] = (
+            source_snapshot.source_commit if source_snapshot is not None else None
+        )
+        report_payload["source_tree_oid"] = (
+            source_snapshot.source_tree_oid if source_snapshot is not None else None
+        )
+        report_payload["source_tree_sha256"] = (
+            source_snapshot.source_tree_sha256 if source_snapshot is not None else None
+        )
+        report_suffix = (
+            f"_official_{evaluation_approval_id[-12:]}"
+            if evaluation_approval_id is not None
+            else ""
+        )
         report_path = contained_path(
             venture.workspace_path,
             "runs",
             run_id,
-            f"rubric_report_{report.evidence_sha256[:12]}.json",
+            f"rubric_report_{report.evidence_sha256[:12]}{report_suffix}.json",
         )
         atomic_write_json(report_path, report_payload)
         report_file_sha = sha256_file(report_path)
@@ -3344,6 +3646,13 @@ class CompanyOS:
             "rubric_evidence_sha256": report.evidence_sha256,
             "report_file_sha256": report_file_sha,
             "evaluation_status": evaluation_status,
+            "evaluation_approval_id": evaluation_approval_id,
+            "evaluation_spec_path": evaluation_relative_path,
+            "evaluation_spec_sha256": evaluation_spec_sha256,
+            "evaluation_data_path": evaluation_data_relative_path,
+            "evaluation_data_sha256": evaluation_data_sha256,
+            "source_commit": report_payload["source_commit"],
+            "source_tree_sha256": report_payload["source_tree_sha256"],
         }
 
         def operation(connection: sqlite3.Connection) -> dict[str, str]:
@@ -3376,7 +3685,18 @@ class CompanyOS:
                             "rubric_evidence_sha256": report.evidence_sha256,
                             "verifier_semantics": "RUBRIC_V1",
                             "evaluation_status": evaluation_status,
-                            "official": evaluation_status == "APPROVED",
+                            "official": official,
+                            "evaluation_approval_id": evaluation_approval_id,
+                            "evaluation_spec_path": evaluation_relative_path,
+                            "evaluation_spec_sha256": evaluation_spec_sha256,
+                            "evaluation_data_path": evaluation_data_relative_path,
+                            "evaluation_data_sha256": evaluation_data_sha256,
+                            "case_count": len(report.cases),
+                            "source_commit": report_payload["source_commit"],
+                            "source_tree_oid": report_payload["source_tree_oid"],
+                            "source_tree_sha256": report_payload[
+                                "source_tree_sha256"
+                            ],
                         }
                     ),
                     "created_at": now,
@@ -3395,7 +3715,14 @@ class CompanyOS:
                     "score": report.score,
                     "threshold": report.threshold,
                     "evaluation_status": evaluation_status,
-                    "official": evaluation_status == "APPROVED",
+                    "official": official,
+                    "evaluation_approval_id": evaluation_approval_id,
+                    "evaluation_spec_sha256": evaluation_spec_sha256,
+                    "evaluation_data_path": evaluation_data_relative_path,
+                    "evaluation_data_sha256": evaluation_data_sha256,
+                    "case_count": len(report.cases),
+                    "source_commit": report_payload["source_commit"],
+                    "source_tree_sha256": report_payload["source_tree_sha256"],
                 },
                 connection=connection,
             )

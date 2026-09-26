@@ -156,6 +156,28 @@ def build_parser() -> argparse.ArgumentParser:
     review_ingest.add_argument("review_id")
     review_ingest.add_argument("--file", required=True, type=Path)
 
+    evaluation = commands.add_parser(
+        "evaluation",
+        help="Approve and run a hash-bound rubric evaluation",
+    )
+    evaluation_commands = evaluation.add_subparsers(
+        dest="evaluation_command",
+        required=True,
+    )
+    evaluation_approve = evaluation_commands.add_parser("approve")
+    evaluation_approve.add_argument("work_order_id")
+    evaluation_approve.add_argument("--cases", required=True, type=Path)
+    evaluation_approve.add_argument("--expected-sha256", required=True)
+    evaluation_approve.add_argument("--approval-file", required=True, type=Path)
+    evaluation_approve.add_argument("--idempotency-key", required=True)
+    evaluation_run = evaluation_commands.add_parser("run")
+    evaluation_run.add_argument("work_order_id")
+    evaluation_run.add_argument("--run", required=True)
+    evaluation_run.add_argument("--cases", required=True, type=Path)
+    evaluation_run.add_argument("--data", required=True, type=Path)
+    evaluation_run.add_argument("--approval", required=True)
+    evaluation_run.add_argument("--idempotency-key", required=True)
+
     commands.add_parser("stop", help="Persistently disable new execution")
     commands.add_parser("resume", help="Re-enable execution")
     commands.add_parser("reclaim-expired", help="Reclaim expired execution leases")
@@ -431,6 +453,44 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         )
     if args.command == "review" and args.review_command == "ingest":
         return company.ingest_review_result(args.review_id, args.file)
+    if args.command == "evaluation" and args.evaluation_command == "approve":
+        approval_path = args.approval_file.resolve()
+        if (
+            approval_path.is_symlink()
+            or not approval_path.is_file()
+            or approval_path.stat().st_size > 64 * 1024
+        ):
+            raise ValueError("approval file must be a regular file of at most 64 KiB")
+        return company.record_evaluation_approval(
+            args.work_order_id,
+            cases_path=args.cases.resolve(),
+            expected_sha256=args.expected_sha256,
+            approval_text=approval_path.read_text(encoding="utf-8"),
+            idempotency_key=args.idempotency_key,
+        )
+    if args.command == "evaluation" and args.evaluation_command == "run":
+        evidence = company.run_official_evaluation(
+            args.work_order_id,
+            args.run,
+            cases_path=args.cases.resolve(),
+            data_path=args.data.resolve(),
+            approval_id=args.approval,
+            idempotency_key=args.idempotency_key,
+        )
+        report = read_json(evidence.path)
+        return {
+            "status": "OFFICIAL_EVALUATION_RECORDED",
+            "evidence": evidence,
+            "verdict": report["verdict"],
+            "score": report["score"],
+            "threshold": report["threshold"],
+            "case_count": report["case_count"],
+            "official": report["official"],
+            "evaluation_approval_id": report["evaluation_approval_id"],
+            "evaluation_spec_sha256": report["evaluation_spec_sha256"],
+            "source_commit": report["source_commit"],
+            "source_tree_sha256": report["source_tree_sha256"],
+        }
     if args.command == "stop":
         company.stop()
         return {"stopped": True}
