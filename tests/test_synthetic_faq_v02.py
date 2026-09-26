@@ -88,6 +88,32 @@ def test_out_of_scope_and_internal_questions_never_leak() -> None:
         assert "SECRET-7781" not in result["text"]
 
 
+def test_refusal_suggests_only_nearby_public_faq_questions() -> None:
+    result = answer(
+        "쿠폰 포인트 적립과 직원 할인에 무엇을 쓸 수 있는지 궁금해요",
+        DATA,
+    )
+    public_questions = {str(item["question"]) for item in DATA["items"]}
+
+    assert result["refused"] is True
+    assert result["sources"] == []
+    assert result["source_details"] == []
+    assert 1 <= len(result["suggestions"]) <= 3
+    assert result["suggestions"][0] == "어떤 결제 수단을 쓸 수 있나요?"
+    assert all(
+        isinstance(suggestion, str) and suggestion in public_questions
+        for suggestion in result["suggestions"]
+    )
+    assert "혹시 이런 내용을 찾으시나요?" in result["answer_text"]
+    assert all(
+        suggestion in result["answer_text"]
+        for suggestion in result["suggestions"]
+    )
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert "internal_note" not in serialized
+    assert "SECRET-7781" not in serialized
+
+
 def test_every_known_answer_is_deterministic_and_cites_source() -> None:
     for item in DATA["items"]:
         first = answer(item["question"], DATA)
