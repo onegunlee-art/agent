@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import urllib.request
@@ -19,6 +20,50 @@ SPEC = load_json(CAFE_A / "eval_cases.json")
 def test_baseline_synthetic_bot_passes_draft_cases() -> None:
     report = evaluate(CAFE_A / "eval_cases.json", CAFE_A / "faq_data.json")
     assert report.verdict == "PASS"
+    assert report.threshold == 1.0
+    assert len(report.cases) == 13
+
+
+def test_ceo_reviewed_cases_are_strict_and_cover_unknown_price() -> None:
+    cases = {case["id"]: case for case in SPEC["cases"]}
+
+    assert SPEC["_status"] == "DRAFT"
+    assert SPEC["threshold"] == 1.0
+    assert len(cases) == 13
+    assert cases["q02"]["must_include_all"] == ["명절 당일", "다음 날", "휴무"]
+    assert "다음 날 정상" in cases["q02"]["must_not_include"]
+    assert cases["q03"]["must_include_all"] == ["무료", "2시간"]
+    assert "must_include_any" not in cases["q03"]
+    assert cases["q07"]["must_include_all"] == ["카카오페이"]
+    assert cases["q07"]["must_include_any"] == [["가능", "사용"]]
+    assert {"안 됩니다", "불가"}.issubset(cases["q07"]["must_not_include"])
+    assert cases["q08"]["must_include_all"] == ["디카페인", "500원"]
+    assert cases["q13"]["question"] == "흑임자 라떼 얼마예요?"
+    assert cases["q13"]["must_not_include"] == ["원"]
+    assert cases["q13"]["expected_source_ids"] == ["faq-black-sesame-latte"]
+
+
+def test_unknown_black_sesame_price_is_not_invented() -> None:
+    result = answer("흑임자 라떼 얼마예요?", DATA)
+
+    assert result["matched_id"] == "faq-black-sesame-latte"
+    assert "흑임자 라떼" in result["answer_text"]
+    assert "원" not in result["text"]
+    assert result["sources"] == ["faq-black-sesame-latte"]
+
+
+def test_ceo_approval_document_binds_exact_draft_file_hash() -> None:
+    cases_path = CAFE_A / "eval_cases.json"
+    digest = hashlib.sha256(cases_path.read_bytes()).hexdigest()
+    approval = (ROOT / "docs" / "CEO_EVAL_APPROVAL_V0.2_KO.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert digest in approval
+    assert (
+        f"V0.2 평가 사례 13건(eval_cases.json SHA-256: {digest})과 "
+        "threshold 1.00을 APPROVED로 승인합니다."
+    ) in approval
 
 
 def test_draft_cases_are_rejected_for_official_evaluation() -> None:

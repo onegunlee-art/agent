@@ -45,11 +45,14 @@ Codex CLI 프로세스 1회로 `synthetic_faq.py`를 수정하고 수용 테스�
 보강하고 교정했다. 이것은 내부 QA이며 Claude의 독립 검수를 뜻하지 않는다.
 미리보기는 실제 LLM 답변형이 아니라 결정형 FAQ 검색형이다.
 
-표현 변경 질문을 포함한 12건 rubric은 최종 후보 데이터에서 DRAFT 12/12,
-score 1.0으로 재실행됐다. rubric 내용 해시는
-`5b86449e6fb565f65de9907f1b53f9aa24d4dddaaad78831f462defb0ab47740`,
-원장 Evidence는 `evidence_a03ae43814fa420690fbbf2579849630`이다. 이는 개발
-증거이며 CEO 승인 평가나 Claude 독립 검수 PASS를 대신하지 않는다.
+기존 12건 rubric의 원장 Evidence는
+`evidence_a03ae43814fa420690fbbf2579849630`이다. CEO 승인 전 검토에서 느슨한
+기준을 강화하고 가격 추측 방지 q13을 추가했다. 현재 후보는 threshold 1.00의
+DRAFT 13/13, score 1.0이며 rubric 내용 해시는
+`e66788fb86c9ce57b2f5c6c84a4957707e60326b0cf7132898f2391afd0cda6a`다.
+평가 파일 SHA-256은
+`d935536f9d147578d1f6ff794fae5e95090d4cec7d355774d6a5e02c8e7c7000`이다.
+이는 아직 공식 평가 Evidence나 Claude 독립 검수 PASS를 대신하지 않는다.
 
 ## 관문
 
@@ -62,8 +65,8 @@ score 1.0으로 재실행됐다. rubric 내용 해시는
   변경 파일 해시를 `RUN_REPRODUCIBILITY` Evidence로 자동 기록
 - 완료: 외부 원장 온라인 백업과 34개 참조 파일의 해시 결속 복구 묶음
 - 완료: 빈 경로 복원 뒤 Run/Evidence 해시 조회와 다음 Idea 생성
-- 완료: 수정된 동일 소스에서 표현 변경 질문 포함 DRAFT rubric 12/12 재실행
-- 대기: CEO가 평가 사례를 검토하고 `_status=APPROVED`로 승인
+- 완료: 수정된 동일 소스에서 엄격화한 DRAFT rubric 13/13 재실행
+- 대기: CEO가 평가 파일 SHA-256, 13건, threshold 1.00을 명시적으로 승인
 - 대기: 수정 diff·테스트·rubric·소스 ZIP에 대한 Claude 독립 PASS
 - 대기: CEO의 main 병합 승인
 
@@ -83,7 +86,7 @@ score 1.0으로 재실행됐다. rubric 내용 해시는
 ### 2. 합성 챗봇 평가 세트
 
 정답과 채점 근거를 알고 있는 합성 카페 FAQ 사례를 만든다. 현재 DRAFT 세트는
-기존 10건과 첫 수정 요구 2건을 포함하며 다음을 채점한다.
+기존 10건, 표현 변경 2건, 가격 추측 방지 1건을 포함하며 다음을 채점한다.
 
 - 알려진 답변에 source id가 있는가
 - 자료 밖 질문을 거절하는가
@@ -145,6 +148,6 @@ Deep Agents는 후보이지 확정 의존성이 아니다. 채택 전에는 기�
 
 아래 세 가지 CEO 결정이 남아 있다.
 
-1. `eval_cases.json` 12건과 threshold를 검토해 APPROVED로 바꿀지 결정
+1. `eval_cases.json` SHA-256, 13건과 threshold 1.00을 검토해 APPROVED로 승인할지 결정
 2. 브라우저에서 명절 휴무·흑임자 라떼·자료 밖 질문을 직접 확인
 3. Claude 독립 검수 PASS 뒤 현재 브랜치를 main에 병합할지 결정

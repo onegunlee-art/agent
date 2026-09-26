@@ -76,6 +76,27 @@ def test_judge_criteria_without_judge_never_fails_open() -> None:
     assert run_rubric(cases, answers, judge=lambda *_: (True, "ok")).verdict == "PASS"
 
 
+def test_payment_criterion_rejects_negative_answer_even_with_keyword() -> None:
+    cases = [
+        {
+            "id": "payment",
+            "question": "카카오페이 되나요?",
+            "must_include_all": ["카카오페이"],
+            "must_include_any": [["가능", "사용"]],
+            "must_not_include": ["안 됩니다", "불가"],
+        }
+    ]
+    answers = {
+        "payment": {
+            "text": "카카오페이는 안 됩니다.",
+            "sources": ["faq-payment"],
+            "refused": False,
+        }
+    }
+
+    assert run_rubric(cases, answers, threshold=1.0).verdict == "FAIL"
+
+
 def test_rubric_report_is_persisted_as_hashed_evidence(tmp_path: Path) -> None:
     with CompanyOS(tmp_path) as company:
         _, _, _, work_order = build_venture(company, "rubric-report-evidence")

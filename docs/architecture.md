@@ -26,7 +26,8 @@
   mid-generation cancellation meter.
 - Rubric reports support weighted deterministic checks, critical hard failures,
   fail-closed judge criteria, and hash-bound Evidence. DRAFT reports are marked
-  `official=false` until CEO approval.
+  `official=false` until the CEO explicitly approves the exact evaluation-file
+  SHA-256 and threshold; any later byte change requires a new approval.
 - Canonical SQLite state defaults outside the repository. SQLite-only backup
   uses the online backup API, a SHA-256 sidecar, integrity check, table counts,
   and restore to a new path only. Full recovery additionally creates a ZIP
