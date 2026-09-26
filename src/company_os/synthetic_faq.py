@@ -52,14 +52,28 @@ def _score(question: str, item: dict[str, Any]) -> float:
 def answer(question: str, data: dict[str, Any]) -> dict[str, Any]:
     best: dict[str, Any] | None = None
     best_score = 0.0
-    for item in data["items"]:
+    scored_items: list[tuple[float, int, dict[str, Any]]] = []
+    for index, item in enumerate(data["items"]):
         score = _score(question, item)
+        scored_items.append((score, index, item))
         if score > best_score:
             best, best_score = item, score
     if best is None or best_score < MATCH_THRESHOLD:
+        suggestions = [
+            str(item["question"])
+            for score, _, item in sorted(
+                scored_items, key=lambda scored: (-scored[0], scored[1])
+            )
+            if score > 0
+        ][:3]
+        suggestion_text = "\n".join(
+            [data["refusal_text"], "", "혹시 이런 내용을 찾으시나요?"]
+            + [f"- {suggestion}" for suggestion in suggestions]
+        )
         return {
-            "text": data["refusal_text"],
-            "answer_text": data["refusal_text"],
+            "text": suggestion_text,
+            "answer_text": suggestion_text,
+            "suggestions": suggestions,
             "source_details": [],
             "sources": [],
             "refused": True,

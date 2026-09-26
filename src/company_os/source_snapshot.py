@@ -20,7 +20,7 @@ from typing import Protocol, runtime_checkable
 
 
 _OBJECT_ID = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
-_MANIFEST_HEADER = b"ai-company-os-source-tree-v1\0"
+_MANIFEST_HEADER = b"ai-company-os-source-tree-v2\0"
 _ALLOWED_IGNORED_ROOTS = {
     b".mypy_cache",
     b".pytest_cache",
@@ -482,10 +482,12 @@ class GitSourceSnapshot:
         deleted_paths: set[bytes],
         filemode: bool,
     ) -> bytes:
-        """Encode sorted path, effective mode, and content SHA-256 entries.
+        """Encode sorted path, effective mode, and Git blob SHA-256 entries.
 
         Every variable-width field is length-prefixed, so all tracked Git
         path bytes—including newlines—have one unambiguous representation.
+        Blob bytes come from Git's object database rather than the checkout,
+        so line-ending conversion cannot change the manifest.
         """
 
         manifest = bytearray(_MANIFEST_HEADER)
@@ -523,16 +525,16 @@ class GitSourceSnapshot:
             raise SourceSnapshotError(
                 f"Tracked symlinks are not permitted in a review source snapshot: {path}"
             )
-        if path.is_file():
-            return self._sha256_file(path)
-        if not path.exists():
-            # A clean sparse-checkout path may be absent from the worktree. Its
-            # exact staged blob still belongs in the effective tracked tree.
-            blob = self._git(repository_root, "cat-file", "blob", entry.object_id)
-            return sha256(blob).digest()
-        raise SourceSnapshotError(
-            f"Tracked source path is not a file, symlink, or gitlink: {path}"
-        )
+        if path.exists() and not path.is_file():
+            raise SourceSnapshotError(
+                f"Tracked source path is not a file, symlink, or gitlink: {path}"
+            )
+        # Git blob bytes are the canonical tracked content. Reading the
+        # worktree here would make an otherwise identical tree hash differ
+        # after checkout-level CRLF/LF conversion. This also covers clean
+        # sparse-checkout paths that are intentionally absent from disk.
+        blob = self._git(repository_root, "cat-file", "blob", entry.object_id)
+        return sha256(blob).digest()
 
     @staticmethod
     def _effective_mode(index_mode: str, path: Path, *, filemode: bool) -> str:
@@ -547,19 +549,6 @@ class GitSourceSnapshot:
         except OSError:
             return index_mode
         return "100755" if current_mode & stat.S_IXUSR else "100644"
-
-    @staticmethod
-    def _sha256_file(path: Path) -> bytes:
-        digest = sha256()
-        try:
-            with path.open("rb") as source:
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        except OSError as exc:
-            raise SourceSnapshotError(
-                f"Tracked source file could not be read: {path}"
-            ) from exc
-        return digest.digest()
 
     @staticmethod
     def _frame(value: bytes) -> bytes:

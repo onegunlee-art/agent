@@ -86,12 +86,23 @@ the owner value remains authoritative.
   general-document grants. Policy supplies the minimum decision level. The
   gate does not determine real-world truth or authenticate the claimed CEO.
 - `source_snapshot.py`: local Git commit/tree capture and a deterministic
-  SHA-256 manifest of tracked source bytes. Review binding is fail-closed: the
+  SHA-256 manifest of tracked Git blob bytes. Manifest v2 obtains every blob
+  through `git cat-file`, while preserving the existing effective-mode rules,
+  so checkout-level CRLF/LF conversion cannot change the digest. Review
+  binding is fail-closed: the
   tracked source must match HEAD, untracked source and unsafe index flags are
   rejected, project-local bytecode plus tracked symlinks/gitlinks are rejected,
   and only explicit runtime/cache ignored roots are tolerated. The Python
   interpreter and installed dependency environment are a separate trusted
   boundary and are not attested by this source digest.
+
+Source-tree manifest v1 hashed ordinary tracked files from worktree bytes and
+therefore remains meaningful only in the checkout environment where it was
+recorded. Existing v1 Evidence is immutable and is neither rewritten nor
+silently upgraded. New snapshots use the versioned
+`ai-company-os-source-tree-v2` header and Git object bytes; consumers must keep
+the recorded digest and manifest version together when comparing historical
+Evidence.
 - `storage.py`: SQLite schema, transactions, idempotency, global stop state,
   immutable Event ledger, and JSONL export.
 - `application.py`: state transitions, Venture scaffolding, logical scoping,
