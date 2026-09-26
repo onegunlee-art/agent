@@ -102,7 +102,7 @@ def test_dashboard_preserves_rejected_attempts_and_explains_approval_event(
         server.server_close()
 
 
-def test_dashboard_local_server_approves_and_creates_linked_revision(
+def test_dashboard_local_server_records_event_only_actions(
     tmp_path: Path,
 ) -> None:
     with CompanyOS(tmp_path) as company:
@@ -113,6 +113,9 @@ def test_dashboard_local_server_approves_and_creates_linked_revision(
             idempotency_key="dashboard-actions-run",
         )
         db_path = company.db_path
+        before_work_orders = company.store.scalar("SELECT COUNT(*) FROM work_orders")
+        before_decisions = company.store.scalar("SELECT COUNT(*) FROM decisions")
+        before_approvals = company.store.scalar("SELECT COUNT(*) FROM approvals")
 
     server = create_dashboard_server(tmp_path, db_path, port=0)
     host, port = server.server_address
@@ -128,7 +131,7 @@ def test_dashboard_local_server_approves_and_creates_linked_revision(
             f"http://127.0.0.1:{port}/approve",
             {"csrf": server.csrf_token, "work_order_id": work_order.id},
         )
-        assert status == 200 and json.loads(body)["status"] == "APPROVED"
+        assert status == 200 and json.loads(body)["status"] == "RECORDED"
 
         status, body = _post(
             f"http://127.0.0.1:{port}/request-change",
@@ -139,16 +142,15 @@ def test_dashboard_local_server_approves_and_creates_linked_revision(
             },
         )
         result = json.loads(body)
-        assert status == 200 and result["status"] == "CREATED"
+        assert status == 200 and result["status"] == "RECORDED"
 
         with CompanyOS(tmp_path, db_path=db_path) as company:
-            created = company.store.get_row("work_orders", result["work_order_id"])
-            specification = json.loads(created["specification_json"])
-            assert created["status"] == "DRAFT"
-            assert specification["parent_work_order_id"] == work_order.id
+            assert company.store.scalar("SELECT COUNT(*) FROM work_orders") == before_work_orders
+            assert company.store.scalar("SELECT COUNT(*) FROM decisions") == before_decisions
+            assert company.store.scalar("SELECT COUNT(*) FROM approvals") == before_approvals
             event_types = {event["event_type"] for event in company.events()}
             assert "CEO_WORK_ORDER_APPROVED" in event_types
-            assert "WORK_ORDER_REVISION_REQUESTED" in event_types
+            assert "CEO_WORK_ORDER_CHANGE_REQUESTED" in event_types
     finally:
         server.shutdown()
         server.server_close()
