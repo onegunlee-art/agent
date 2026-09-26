@@ -345,3 +345,78 @@ def test_cli_model_run_uses_production_lease_path(
         assert run.payload["diagnostic_only"] is False
         assert result["executor_outcome"] == "DONE"
         assert result["reproducibility_evidence_id"]
+
+
+def test_cli_model_run_rejects_result_returned_after_lease_reclaim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main"],
+        cwd=repository,
+        check=True,
+        timeout=20,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=repository,
+        check=True,
+        timeout=20,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "test"],
+        cwd=repository,
+        check=True,
+        timeout=20,
+    )
+    (repository / "synthetic.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "."], cwd=repository, check=True, timeout=20
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "fixture"],
+        cwd=repository,
+        check=True,
+        timeout=20,
+    )
+    instructions = tmp_path / "instructions.txt"
+    instructions.write_text("Update the synthetic fixture.\n", encoding="utf-8")
+
+    with CompanyOS(tmp_path / "company") as company:
+        _, _, _, work_order = build_venture(company, "v03-model-lease-cli-stale")
+        monkeypatch.setattr(
+            "company_os.cli.CliCodingExecutor",
+            lambda: ReclaimBeforeReturnExecutor(company),
+        )
+        args = build_parser().parse_args(
+            [
+                "work",
+                "model-run",
+                work_order.id,
+                "--repository",
+                str(repository),
+                "--worktree",
+                str(tmp_path / "worktree"),
+                "--branch",
+                "wo/v03-cli-stale",
+                "--instructions-file",
+                str(instructions),
+                "--test-arg",
+                "python",
+                "--test-arg",
+                "acceptance_test.py",
+                "--idempotency-key",
+                "v03-model-lease-cli-stale",
+            ]
+        )
+
+        with pytest.raises(StaleExecutionError, match="Late model execution result"):
+            _dispatch(company, args)
+
+        runs = company.runs_for_work_order(work_order.id)
+        assert len(runs) == 1
+        assert runs[0].outcome == "EXPIRED"
+        assert runs[0].execution_id is not None
+        assert not company.evidence_for_run(runs[0].id)
