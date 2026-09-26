@@ -1,4 +1,48 @@
-# V0.1 Implemented Architecture
+# AI Company OS Implemented Architecture
+
+## V0.2 execution additions
+
+- WorkOrder execution uses a short SQLite claim, `execution_id`, fence token,
+  expiry, and a short finalization transaction. Model work never holds a write
+  transaction open.
+- Expired `WORKSPACE_ONLY` claims return to retryable state; `EXTERNAL` claims
+  require manual recovery. Late results cannot overwrite a newer lease.
+- The Codex CLI executor runs once in a validated `wo/<id>` Git worktree with
+  `workspace-write`, Windows elevated sandboxing, a bounded process tree, a
+  safe environment allowlist, and a separate acceptance command.
+- Each model execution automatically emits separate, append-only
+  `RUN_REPRODUCIBILITY` Evidence containing the exact built instructions,
+  acceptance command, starting branch/HEAD, sparse-checkout patterns, resulting
+  diff, and changed-file SHA-256 manifest. Retrospective records are explicitly
+  labeled `RETROACTIVE_OBSERVATION` and are not presented as execution-time
+  capture. A retrospective record emits a separate append-only
+  `EVIDENCE_BACKFILLED` Event with its reconstruction basis and original
+  Evidence IDs; original Evidence rows and files remain untouched.
+- Functional outcome, USD cost status, and measurable usage status are separate.
+  A ChatGPT-login run can be `DONE` with `cost_status=UNAVAILABLE` only when its
+  one-process-call, token, and time limits pass. The time limit kills the
+  process tree during execution. Token accounting is input plus output and is
+  enforced as post-execution rejection because the CLI does not expose a
+  mid-generation cancellation meter.
+- Rubric reports support weighted deterministic checks, critical hard failures,
+  fail-closed judge criteria, and hash-bound Evidence. DRAFT reports are marked
+  `official=false` until the CEO explicitly approves the exact evaluation-file
+  SHA-256 and threshold in a canonical SQLite Decision/Approval plus append-only
+  Event. The approved source file stays byte-for-byte DRAFT; official status is
+  never inferred from a mutable JSON field. An official report must cite that
+  approval ID, the unchanged specification hash, and a clean Git source
+  commit/tree digest. Any later byte change requires a new approval.
+- Canonical SQLite state defaults outside the repository. SQLite-only backup
+  uses the online backup API, a SHA-256 sidecar, integrity check, table counts,
+  and restore to a new path only. Full recovery additionally creates a ZIP
+  manifest containing the database and every ledger-referenced Evidence,
+  Artifact, verifier, context manifest, council response, and review handoff.
+  Restore accepts only a verified bundle and empty destination paths.
+- Loopback-only preview and dashboard servers provide the browser surfaces;
+  the dashboard uses read-only SQLite snapshots and hash-bound approval or
+  revision actions.
+- The preview answer engine is deterministic FAQ retrieval, not an LLM answer
+  generator. Codex is the coding executor that changes the preview program.
 
 ## Vertical slice
 
@@ -135,25 +179,26 @@ carrying the old remediation claims onto a different commit.
 
 SQLite transactions make canonical state and Events atomic, but SQLite and
 the filesystem cannot share one transaction. Staging and failure cleanup
-close the ordinary rollback gap, while a hard process interruption can still
-leave a staging directory for later diagnosis. V0.1 ExecutorPorts are limited
-to reversible local work. External or irreversible actions remain out of
-scope.
+close the ordinary rollback gap. V0.2 leases reclaim interrupted
+`WORKSPACE_ONLY` execution and fence off late results; `EXTERNAL` work stops
+for manual recovery. External or irreversible actions remain out of scope.
 
 The built-in verifier is `SYNTHETIC_ONLY`. Its PASS result means only that the
 artifact at the declared local path exactly matches fixed expected bytes. It
 does not semantically evaluate the VentureContract metric, experiment, or
-business pass/fail condition. Contract-based verification for real Ventures
-is not implemented in V0.1.
+business pass/fail condition. Model-produced FAQ answers use the separate
+rubric verifier. Contract-based validation for real Ventures remains out of
+scope.
 
 Context Manifests provide `LOGICAL_NAMESPACE_ONLY` organization, not a
-security boundary. The runtime checks that the artifact returned by an
-ExecutorPort is the declared path inside that Venture workspace, but it does
-not sandbox the executor, restrict reads, or detect every write outside the
-workspace. Only a trusted local executor with synthetic, non-confidential
+security boundary. The coding executor adds a validated Git worktree and
+Codex `workspace-write` sandbox, but confidential multi-tenant isolation is
+still not claimed. Only a trusted local executor with synthetic, non-confidential
 data is supported; real Ventures and untrusted executors are out of scope.
 
-The executor still runs inside the SQLite write transaction in this alpha.
-Long-running or externally blocking executors are unsupported because they
-can hold the local write lock. Decoupled execution claiming is deferred to a
-later version.
+The V0.2 execution foundation claims a WorkOrder with a short `EXECUTING`
+transition, commits that transaction, invokes the ExecutorPort without a
+SQLite write lock, and then finalizes the Run in a second short transaction.
+Handled executor failures restore the prior resumable status and append a
+failure Event. Startup and `company reclaim-expired` recover expired claims,
+while fence tokens reject any result arriving from the abandoned execution.

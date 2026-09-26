@@ -68,6 +68,7 @@ _ALLOWED_RUNTIME_FILE_SUFFIXES = frozenset(
         ".tsv",
         ".txt",
         ".webp",
+        ".xml",
     }
 )
 _GIT_ROUTING_ENVIRONMENT = {

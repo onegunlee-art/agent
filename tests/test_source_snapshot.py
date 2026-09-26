@@ -20,6 +20,9 @@ from company_os.source_snapshot import (
 )
 
 
+SUBPROCESS_TIMEOUT_SECONDS = 20
+
+
 def _git(repo: Path, *args: str) -> str:
     completed = subprocess.run(
         ["git", *args],
@@ -30,6 +33,7 @@ def _git(repo: Path, *args: str) -> str:
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
     )
     return completed.stdout.strip()
 
@@ -144,6 +148,9 @@ def test_allowlisted_ignored_runtime_roots_do_not_dirty_the_snapshot(
     state_db = repo / "var" / "state" / "company.db"
     state_db.parent.mkdir(parents=True)
     state_db.write_bytes(b"local runtime state")
+    junit = repo / "var" / "handoffs" / "product-tests.xml"
+    junit.parent.mkdir(parents=True)
+    junit.write_text('<testsuites tests="1" failures="0"/>\n', encoding="utf-8")
 
     with_runtime = source.capture()
 

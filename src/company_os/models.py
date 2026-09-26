@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -45,6 +45,14 @@ class WorkOrder:
     expected_content: str
     verifier_path: Path
     verifier_hash: str
+    execution_id: str | None = None
+    fence_token: int = 0
+    lease_expires_at: str | None = None
+    time_limit_seconds: int = 1_200
+    cost_limit_usd: float = 2.0
+    model_call_limit: int = 1
+    token_limit: int = 250_000
+    side_effect_class: str = "WORKSPACE_ONLY"
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,12 @@ class Run:
     status: str
     attempt: int
     verifier_hash: str
+    execution_id: str | None = None
+    fence_token: int | None = None
+    outcome: str | None = None
+    cost_usd: float | None = None
+    duration_seconds: float | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -83,6 +97,12 @@ class Review:
 @dataclass(frozen=True)
 class ExecutionOutput:
     artifact_path: Path
+    ok: bool = True
+    label: str = "DONE"
+    cost_usd: float | None = 0.0
+    cost_unknown: bool = False
+    duration_seconds: float | None = None
+    error: str | None = None
 
 
 class ExecutorPort(Protocol):

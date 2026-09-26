@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-company-os"
-version = "0.1.0"
+version = "0.2.0a1"
 description = "Local, auditable AI company operating kernel"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,5 +21,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra -m 'not integration'"
 pythonpath = ["src"]
+markers = [
+  "integration: opt-in test that invokes an installed external executable",
+]

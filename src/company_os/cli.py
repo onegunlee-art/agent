@@ -2,14 +2,32 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
 from .application import CompanyOS, ExistingArtifactExecutor
+from .dashboard import serve_dashboard
 from .errors import CompanyOSError
+from .ledger_backup import (
+    backup,
+    backup_recovery_bundle,
+    restore,
+    restore_recovery_bundle,
+    verify,
+    verify_recovery_bundle,
+)
+from .model_executor import (
+    CliCodingExecutor,
+    ExecutorRequest,
+    build_instructions,
+    create_worktree,
+    validate_worktree,
+)
 from .roles import list_role_specs, serialize_role_spec
+from .synthetic_faq import serve as serve_synthetic_faq
 from .utils import payload_hash, read_json, sha256_file
 
 
@@ -28,7 +46,7 @@ def _print(value: Any) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="company",
-        description="Local, resumable AI Company OS V0.1",
+        description="Local, resumable AI Company OS V0.2",
     )
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--db", type=Path)
@@ -119,6 +137,18 @@ def build_parser() -> argparse.ArgumentParser:
     work_resume = work_commands.add_parser("resume")
     work_resume.add_argument("work_order_id")
     work_resume.add_argument("--repair-manifest", type=Path)
+    model_run = work_commands.add_parser(
+        "model-run",
+        help="Run one bounded coding-agent CLI in a Git worktree",
+    )
+    model_run.add_argument("work_order_id")
+    model_run.add_argument("--repository", required=True, type=Path)
+    model_run.add_argument("--worktree", required=True, type=Path)
+    model_run.add_argument("--branch", required=True)
+    model_run.add_argument("--instructions-file", required=True, type=Path)
+    model_run.add_argument("--test-arg", required=True, action="append")
+    model_run.add_argument("--reuse-worktree", action="store_true")
+    model_run.add_argument("--idempotency-key", required=True)
 
     review = commands.add_parser("review", help="Ingest a supplied ReviewResult")
     review_commands = review.add_subparsers(dest="review_command", required=True)
@@ -126,8 +156,57 @@ def build_parser() -> argparse.ArgumentParser:
     review_ingest.add_argument("review_id")
     review_ingest.add_argument("--file", required=True, type=Path)
 
+    evaluation = commands.add_parser(
+        "evaluation",
+        help="Approve and run a hash-bound rubric evaluation",
+    )
+    evaluation_commands = evaluation.add_subparsers(
+        dest="evaluation_command",
+        required=True,
+    )
+    evaluation_approve = evaluation_commands.add_parser("approve")
+    evaluation_approve.add_argument("work_order_id")
+    evaluation_approve.add_argument("--cases", required=True, type=Path)
+    evaluation_approve.add_argument("--expected-sha256", required=True)
+    evaluation_approve.add_argument("--approval-file", required=True, type=Path)
+    evaluation_approve.add_argument("--idempotency-key", required=True)
+    evaluation_run = evaluation_commands.add_parser("run")
+    evaluation_run.add_argument("work_order_id")
+    evaluation_run.add_argument("--run", required=True)
+    evaluation_run.add_argument("--cases", required=True, type=Path)
+    evaluation_run.add_argument("--data", required=True, type=Path)
+    evaluation_run.add_argument("--approval", required=True)
+    evaluation_run.add_argument("--idempotency-key", required=True)
+
     commands.add_parser("stop", help="Persistently disable new execution")
     commands.add_parser("resume", help="Re-enable execution")
+    commands.add_parser("reclaim-expired", help="Reclaim expired execution leases")
+    preview = commands.add_parser("preview", help="Serve the synthetic chatbot locally")
+    preview.add_argument("--data", type=Path)
+    preview.add_argument("--port", type=int, default=8765)
+    dashboard = commands.add_parser("dashboard", help="Serve the local work dashboard")
+    dashboard.add_argument("--port", type=int, default=8780)
+    dashboard.add_argument(
+        "--preview-url", default="http://127.0.0.1:8765/"
+    )
+
+    ledger = commands.add_parser("ledger", help="Back up, verify, or restore the ledger")
+    ledger_commands = ledger.add_subparsers(dest="ledger_command", required=True)
+    ledger_backup = ledger_commands.add_parser("backup")
+    ledger_backup.add_argument("--dir", type=Path, required=True)
+    ledger_verify = ledger_commands.add_parser("verify")
+    ledger_verify.add_argument("--backup", type=Path, required=True)
+    ledger_restore = ledger_commands.add_parser("restore")
+    ledger_restore.add_argument("--backup", type=Path, required=True)
+    ledger_restore.add_argument("--to", type=Path, required=True)
+    recovery_backup = ledger_commands.add_parser("recovery-backup")
+    recovery_backup.add_argument("--dir", type=Path, required=True)
+    recovery_verify = ledger_commands.add_parser("recovery-verify")
+    recovery_verify.add_argument("--bundle", type=Path, required=True)
+    recovery_restore = ledger_commands.add_parser("recovery-restore")
+    recovery_restore.add_argument("--bundle", type=Path, required=True)
+    recovery_restore.add_argument("--to-db", type=Path, required=True)
+    recovery_restore.add_argument("--to-root", type=Path, required=True)
     commands.add_parser("status", help="Show durable company state")
     commands.add_parser("inbox", help="Show pending Decision and Approval items")
 
@@ -262,6 +341,80 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         )
     if args.command == "work" and args.work_command == "status":
         return company.work_order(args.work_order_id)
+    if args.command == "work" and args.work_command == "model-run":
+        prior = company.store.query_one(
+            "SELECT status FROM idempotency WHERE key = ?",
+            (args.idempotency_key,),
+        )
+        if prior is not None:
+            raise ValueError(
+                "model-run idempotency key already exists; refusing a repeated model call"
+            )
+        instructions_path = args.instructions_file.resolve()
+        if (
+            instructions_path.is_symlink()
+            or not instructions_path.is_file()
+            or instructions_path.stat().st_size > 64 * 1024
+        ):
+            raise ValueError("instructions file must be a regular file of at most 64 KiB")
+        work_order = company.work_order(args.work_order_id)
+        repository = args.repository.resolve()
+        worktree = args.worktree.resolve()
+        if worktree.exists():
+            if not args.reuse_worktree:
+                raise ValueError(
+                    "worktree already exists; pass --reuse-worktree only for an intentional repair"
+                )
+            workspace = validate_worktree(repository, args.branch, worktree)
+        else:
+            workspace = create_worktree(repository, args.branch, worktree)
+        test_command = tuple(args.test_arg)
+        instructions = build_instructions(
+            instructions_path.read_text(encoding="utf-8"),
+            subprocess.list2cmdline(test_command),
+        )
+        outcome = CliCodingExecutor().run(
+            ExecutorRequest(
+                work_order_id=work_order.id,
+                workspace=workspace,
+                instructions=instructions,
+                time_limit_seconds=work_order.time_limit_seconds,
+                cost_limit_usd=work_order.cost_limit_usd,
+                model_call_limit=work_order.model_call_limit,
+                token_limit=work_order.token_limit,
+                test_command=test_command,
+            )
+        )
+        run = company.record_model_execution(
+            work_order.id,
+            outcome,
+            idempotency_key=args.idempotency_key,
+        )
+        reproducibility = company.record_run_reproducibility(
+            run.id,
+            instructions=instructions,
+            test_command=list(test_command),
+            workspace_branch=outcome.workspace_branch,
+            workspace_head=outcome.workspace_head,
+            sparse_checkout_patterns=outcome.sparse_checkout_patterns,
+            workspace_diff=outcome.workspace_diff,
+            changed_file_sha256=outcome.changed_file_sha256,
+            provenance="CAPTURED_AT_EXECUTION",
+            notes="captured immediately after the coding-agent process and acceptance command",
+            idempotency_key=f"{args.idempotency_key}:reproducibility",
+        )
+        return {
+            "run": run,
+            "reproducibility_evidence_id": reproducibility.id,
+            "executor_outcome": outcome.label,
+            "executor_ok": outcome.ok,
+            "cost_status": run.payload.get("cost_status"),
+            "usage_status": run.payload.get("usage_status"),
+            "budget_basis": run.payload.get("budget_basis"),
+            "changed_files": outcome.changed_files,
+            "usage": outcome.usage,
+            "worktree": workspace,
+        }
     if args.command == "work" and args.work_command == "verify":
         work_order = company.work_order(args.work_order_id)
         workspace = company.venture(work_order.venture_id).workspace_path
@@ -300,12 +453,90 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         )
     if args.command == "review" and args.review_command == "ingest":
         return company.ingest_review_result(args.review_id, args.file)
+    if args.command == "evaluation" and args.evaluation_command == "approve":
+        approval_path = args.approval_file.resolve()
+        if (
+            approval_path.is_symlink()
+            or not approval_path.is_file()
+            or approval_path.stat().st_size > 64 * 1024
+        ):
+            raise ValueError("approval file must be a regular file of at most 64 KiB")
+        return company.record_evaluation_approval(
+            args.work_order_id,
+            cases_path=args.cases.resolve(),
+            expected_sha256=args.expected_sha256,
+            approval_text=approval_path.read_text(encoding="utf-8"),
+            idempotency_key=args.idempotency_key,
+        )
+    if args.command == "evaluation" and args.evaluation_command == "run":
+        evidence = company.run_official_evaluation(
+            args.work_order_id,
+            args.run,
+            cases_path=args.cases.resolve(),
+            data_path=args.data.resolve(),
+            approval_id=args.approval,
+            idempotency_key=args.idempotency_key,
+        )
+        report = read_json(evidence.path)
+        return {
+            "status": "OFFICIAL_EVALUATION_RECORDED",
+            "evidence": evidence,
+            "verdict": report["verdict"],
+            "score": report["score"],
+            "threshold": report["threshold"],
+            "case_count": report["case_count"],
+            "official": report["official"],
+            "evaluation_approval_id": report["evaluation_approval_id"],
+            "evaluation_spec_sha256": report["evaluation_spec_sha256"],
+            "source_commit": report["source_commit"],
+            "source_tree_sha256": report["source_tree_sha256"],
+        }
     if args.command == "stop":
         company.stop()
         return {"stopped": True}
     if args.command == "resume":
         company.resume()
         return {"stopped": False}
+    if args.command == "reclaim-expired":
+        reclaimed = company.reclaim_expired()
+        return {"status": "RECLAIMED", "count": len(reclaimed), "items": reclaimed}
+    if args.command == "preview":
+        data_path = args.data or (
+            company.root / "examples" / "synthetic-cafe-a" / "faq_data.json"
+        )
+        serve_synthetic_faq(data_path, port=args.port)
+        return {"status": "STOPPED"}
+    if args.command == "dashboard":
+        serve_dashboard(
+            company.root,
+            company.db_path,
+            port=args.port,
+            preview_url=args.preview_url,
+        )
+        return {"status": "STOPPED"}
+    if args.command == "ledger" and args.ledger_command == "backup":
+        return backup(company.db_path, args.dir)
+    if args.command == "ledger" and args.ledger_command == "verify":
+        return verify(args.backup)
+    if args.command == "ledger" and args.ledger_command == "restore":
+        if args.to.resolve() == company.db_path.resolve():
+            raise ValueError("restore target must be separate from the live ledger")
+        return {"status": "RESTORED", "table_counts": restore(args.backup, args.to)}
+    if args.command == "ledger" and args.ledger_command == "recovery-backup":
+        return backup_recovery_bundle(company.db_path, company.root, args.dir)
+    if args.command == "ledger" and args.ledger_command == "recovery-verify":
+        return verify_recovery_bundle(args.bundle)
+    if args.command == "ledger" and args.ledger_command == "recovery-restore":
+        if args.to_db.resolve() == company.db_path.resolve():
+            raise ValueError("restore database must be separate from the live ledger")
+        if args.to_root.resolve() == company.root.resolve():
+            raise ValueError("restore root must be separate from the live company root")
+        restored = restore_recovery_bundle(
+            args.bundle,
+            new_db_path=args.to_db,
+            new_root=args.to_root,
+        )
+        return {"status": "RESTORED", "recovery": restored}
     if args.command == "status":
         waiting = company.store.query_all(
             "SELECT id, work_order_id, binding_status, request_json_path, "

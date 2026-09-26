@@ -1,16 +1,20 @@
-# AI Company OS V0.1
+# AI Company OS V0.2
 
-Status: **V0.1-alpha**. This repository proves the synthetic local workflow;
-it is not ready for a real Venture.
+Status: **V0.2 implementation candidate**. Real Codex CLI calls have edited
+both synthetic FAQ data and preview program code in isolated worktrees and
+passed their acceptance tests. V0.2 is not final until the CEO approves the
+evaluation cases and an independent Claude review returns PASS.
 
 AI Company OS is a local, on-demand operating kernel that turns a one-line
 idea into a venture-scoped workspace, a mechanically checked WorkOrder,
 durable Evidence, and an auditable Decision trail.
 
-V0.1 is intentionally a Python CLI, not a chatbot or background service. It
-does not call the OpenAI or Anthropic APIs and does not invoke Codex
-recursively. CTO, CPO, CMO, and Claude Opus interactions use structured JSON
-and Markdown file handoffs.
+The operating kernel remains an on-demand Python CLI. V0.2 adds an explicitly
+invoked Codex CLI executor, rubric evaluation, a deterministic synthetic FAQ
+bot, a loopback-only status page, execution leases, and online ledger backup.
+CTO, CPO, CMO, and Claude interactions still use structured file handoffs.
+The preview bot itself is deterministic FAQ retrieval; Codex is the coding
+executor, not the model generating each preview answer.
 
 ## Requirements
 
@@ -60,8 +64,96 @@ company review ingest <review_id> --file <review_result.json>
 company events export --output <events.jsonl>
 ```
 
-Use `--root <path>` on any command to select a Company OS root. Canonical
-state defaults to `var/state/company.db` below that root.
+Use `--root <path>` on any command to select a Company OS root. For a Git
+repository, canonical state defaults to
+`%LOCALAPPDATA%\ai-company-os\ledger.sqlite3`, outside the repository and
+OneDrive. A legacy `var/state/company.db` is migrated online and preserved.
+
+## V0.2 execution and browser entry points
+
+Create a UTF-8 instruction file in the editor, then run one coding agent in a
+new Git worktree. Each `--test-arg` is one subprocess argument.
+
+```powershell
+company --root C:\dev\ai-company-os work model-run <work_order_id> `
+  --repository C:\path\to\synthetic-repo `
+  --worktree C:\dev\ai-company-os\var\worktrees\<work_order_id> `
+  --branch wo/<work_order_id> `
+  --instructions-file C:\path\to\work-order.txt `
+  --test-arg C:\dev\ai-company-os\.venv\Scripts\python.exe `
+  --test-arg acceptance_test.py `
+  --idempotency-key <unique-key>
+```
+
+The WorkOrder supplies the time, model-call, token, and USD limits. One model
+call means one coding-agent CLI process, not a count of provider-internal model
+turns. Token accounting is `input_tokens + output_tokens`; cached input and
+reasoning output are reported as subtotals and are not added twice. The time
+limit hard-stops the process tree during execution. The token limit is checked
+after the CLI returns and rejects an over-limit result; it cannot stop a
+generation mid-call. ChatGPT login runs may not expose per-run USD: this is
+recorded as `cost_status=UNAVAILABLE`. A known dollar overrun is recorded
+separately as `COST_LIMIT_EXCEEDED`.
+
+Local browser surfaces bind only to `127.0.0.1`:
+
+```powershell
+company --root C:\dev\ai-company-os preview --port 8765
+company --root C:\dev\ai-company-os dashboard --port 8780
+```
+
+Open `http://127.0.0.1:8765/` for the chatbot and
+`http://127.0.0.1:8780/` for the work dashboard.
+Known FAQ answers show an explicit `출처 보기` control; the source is collapsed
+until the user expands it. Refusals do not display a source control.
+
+Hash-bound evaluation approval is stored only in SQLite. Keep the approved
+evaluation file byte-for-byte unchanged and place the CEO's exact sentence in
+a local, untracked text file before running:
+
+```powershell
+company --root C:\dev\ai-company-os evaluation approve <work-order-id> `
+  --cases C:\dev\ai-company-os\examples\synthetic-cafe-a\eval_cases.json `
+  --expected-sha256 <approved-sha256> `
+  --approval-file <local-ceo-approval.txt> `
+  --idempotency-key <unique-approval-key>
+
+company --root C:\dev\ai-company-os evaluation run <work-order-id> `
+  --run <accepted-run-id> `
+  --cases C:\dev\ai-company-os\examples\synthetic-cafe-a\eval_cases.json `
+  --data C:\dev\ai-company-os\examples\synthetic-cafe-a\faq_data.json `
+  --approval <approval-id> `
+  --idempotency-key <unique-official-evaluation-key>
+```
+
+The approval command fails if the file hash, case count, threshold, or exact
+approval sentence differs. The official report also binds a clean Git commit
+and tracked-tree SHA-256 and never overwrites an earlier DRAFT report.
+
+Back up and verify the external ledger without copying a live SQLite file:
+
+```powershell
+company --root C:\dev\ai-company-os ledger backup --dir C:\safe-backups
+company --root C:\dev\ai-company-os ledger verify --backup <backup.sqlite3>
+company --root C:\dev\ai-company-os ledger restore --backup <backup.sqlite3> --to <new-ledger.sqlite3>
+```
+
+Those commands protect SQLite only. For full recovery of the ledger plus every
+referenced Evidence, Artifact, verifier, context manifest, and review handoff,
+use a hash-bound recovery bundle and restore it into empty locations:
+
+```powershell
+company --root C:\dev\ai-company-os ledger recovery-backup --dir C:\safe-backups
+company --root C:\dev\ai-company-os ledger recovery-verify --bundle <company-recovery.zip>
+company --root C:\dev\ai-company-os ledger recovery-restore `
+  --bundle <company-recovery.zip> `
+  --to-db <new-ledger.sqlite3> `
+  --to-root <empty-company-root>
+```
+
+Bundle creation fails closed if any ledger-referenced runtime file is missing
+or outside the company root. Verification checks the ZIP sidecar, database
+hash and integrity, table counts, every file hash, and unexpected entries.
 
 Corrected executive responses can be ingested again; the prior version is
 retained as `SUPERSEDED`. If a genuinely shared Council field conflicts, use
@@ -109,23 +201,24 @@ silently replacing the owner value.
   unrecoverable `WAITING_FOR_OPUS` state.
 
 See [architecture](docs/architecture.md) for the implemented flow and
-invariants, and [CLAUDE.md](CLAUDE.md) for manual review handoff rules.
+invariants, [개인 에이전트 코딩 업무 환경](docs/OPERATING_GUIDE_KO.md) for the
+exact conversation and operating entry points, [V0.2 방향과 구현 순서](docs/ROADMAP_V0.2_KO.md)
+for the approved build sequence, and [CLAUDE.md](CLAUDE.md) for manual review
+handoff rules.
 
-## V0.1 boundaries
+## V0.2 boundaries
 
-V0.1 has exactly three C-level RoleSpecs: CTO, CPO, and CMO. It does not
-include a web dashboard, scheduler, daemon, external database or queue,
-vector database, web crawler, external messaging, production deployment, or
-real customer data. All automated tests and the bootstrap smoke test use
-synthetic data.
+The OS still has exactly three C-level RoleSpecs: CTO, CPO, and CMO. It does
+not include a scheduler, daemon, external queue, vector database, web crawler,
+external messaging, payments, production deployment, or real customer data.
+All automated tests and the first model cycle use synthetic data.
 
-The built-in exact-text verifier is `SYNTHETIC_ONLY`. A PASS proves only that
+The built-in exact-text verifier remains `SYNTHETIC_ONLY`. A PASS proves only that
 the declared local path contains the expected bytes. It does not evaluate a
-VentureContract's metric, experiment, or real-world pass/fail outcome, so V0.1
+VentureContract's metric, experiment, or real-world pass/fail outcome, so V0.2
 must not be used to validate a real Venture.
 
-The Context Manifest provides `LOGICAL_NAMESPACE_ONLY` organization. It is
-not a sandbox: a local executor may still read the repository or modify files
-outside its Venture workspace. V0.1 therefore permits only a trusted local
-executor operating on synthetic, non-confidential data; untrusted executors
-and confidential multi-Venture workloads are out of scope.
+The Context Manifest provides `LOGICAL_NAMESPACE_ONLY` organization. The
+coding executor therefore also uses a Git worktree plus Codex
+`workspace-write` sandboxing. Worktrees are isolation aids, not security
+boundaries. Confidential multi-tenant workloads remain out of scope.

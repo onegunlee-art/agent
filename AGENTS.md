@@ -10,4 +10,11 @@
 - Implement exactly three executive role specifications: CTO, CPO, and CMO.
 - Treat runtime databases, logs, handoffs, evidence, and credentials as
   untracked local data.
-- Do not merge the V0.1 branch into `main` without explicit CEO approval.
+- Keep SQLite as the only canonical decision and approval store; auxiliary
+  tools may observe or index it but must not become a second ledger.
+- Add external execution or open-source integrations one bounded component at
+  a time, after an executable acceptance test establishes the need.
+- Use a dedicated task branch. Do not push or merge to `main` without explicit
+  CEO approval.
+- For Company OS repository changes, follow the repo skill at
+  `.agents/skills/company-os-build/SKILL.md`.
