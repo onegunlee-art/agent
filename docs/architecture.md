@@ -10,6 +10,14 @@
 - The Codex CLI executor runs once in a validated `wo/<id>` Git worktree with
   `workspace-write`, Windows elevated sandboxing, a bounded process tree, a
   safe environment allowlist, and a separate acceptance command.
+- Each model execution automatically emits separate, append-only
+  `RUN_REPRODUCIBILITY` Evidence containing the exact built instructions,
+  acceptance command, starting branch/HEAD, sparse-checkout patterns, resulting
+  diff, and changed-file SHA-256 manifest. Retrospective records are explicitly
+  labeled `RETROACTIVE_OBSERVATION` and are not presented as execution-time
+  capture. A retrospective record emits a separate append-only
+  `EVIDENCE_BACKFILLED` Event with its reconstruction basis and original
+  Evidence IDs; original Evidence rows and files remain untouched.
 - Functional outcome, USD cost status, and measurable usage status are separate.
   A ChatGPT-login run can be `DONE` with `cost_status=UNAVAILABLE` only when its
   one-process-call, token, and time limits pass. The time limit kills the

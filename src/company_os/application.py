@@ -3503,6 +3503,9 @@ class CompanyOS:
             "token_accounting": outcome.token_accounting,
             "token_limit_enforcement": outcome.token_limit_enforcement,
             "time_limit_enforcement": outcome.time_limit_enforcement,
+            "workspace_branch": outcome.workspace_branch,
+            "workspace_head": outcome.workspace_head,
+            "sparse_checkout_patterns": outcome.sparse_checkout_patterns,
             "duration_seconds": outcome.duration_seconds,
             "changed_files": outcome.changed_files,
             "usage": outcome.usage,
@@ -3561,6 +3564,9 @@ class CompanyOS:
                             "token_accounting": outcome.token_accounting,
                             "token_limit_enforcement": outcome.token_limit_enforcement,
                             "time_limit_enforcement": outcome.time_limit_enforcement,
+                            "workspace_branch": outcome.workspace_branch,
+                            "workspace_head": outcome.workspace_head,
+                            "sparse_checkout_patterns": outcome.sparse_checkout_patterns,
                             "executor_outcome": outcome.label,
                             "usage": outcome.usage,
                             "changed_files": outcome.changed_files,
@@ -3601,6 +3607,9 @@ class CompanyOS:
                             "token_accounting": outcome.token_accounting,
                             "token_limit_enforcement": outcome.token_limit_enforcement,
                             "time_limit_enforcement": outcome.time_limit_enforcement,
+                            "workspace_branch": outcome.workspace_branch,
+                            "workspace_head": outcome.workspace_head,
+                            "sparse_checkout_patterns": outcome.sparse_checkout_patterns,
                         }
                     ),
                     "created_at": now,
@@ -3628,6 +3637,9 @@ class CompanyOS:
                     "token_accounting": outcome.token_accounting,
                     "token_limit_enforcement": outcome.token_limit_enforcement,
                     "time_limit_enforcement": outcome.time_limit_enforcement,
+                    "workspace_branch": outcome.workspace_branch,
+                    "workspace_head": outcome.workspace_head,
+                    "sparse_checkout_patterns": outcome.sparse_checkout_patterns,
                     "diagnostic_only": True,
                 },
                 connection=connection,
@@ -3644,6 +3656,184 @@ class CompanyOS:
         except IdempotencyConflict as exc:
             raise ConflictError(str(exc)) from exc
         return self.run(str(result["run_id"]))
+
+    def record_run_reproducibility(
+        self,
+        run_id: str,
+        *,
+        instructions: str,
+        test_command: list[str],
+        workspace_branch: str,
+        workspace_head: str,
+        sparse_checkout_patterns: list[str],
+        workspace_diff: str,
+        changed_file_sha256: dict[str, str],
+        provenance: str,
+        notes: str = "",
+        idempotency_key: str,
+    ) -> Evidence:
+        """Append hash-bound execution inputs without rewriting an immutable Run."""
+
+        run = self.run(run_id)
+        work_order = self.work_order(run.work_order_id)
+        venture = self.venture(work_order.venture_id)
+        if not instructions.strip() or len(instructions.encode("utf-8")) > 64 * 1024:
+            raise ValidationError("reproducibility instructions must be 1..65536 bytes")
+        if not test_command or any(
+            not isinstance(item, str) or not item.strip() for item in test_command
+        ):
+            raise ValidationError("reproducibility test command must be non-empty")
+        if not re.fullmatch(r"wo/[A-Za-z0-9][A-Za-z0-9._-]{0,79}", workspace_branch):
+            raise ValidationError("reproducibility branch must use wo/<id>")
+        if not re.fullmatch(r"[0-9a-f]{40}", workspace_head):
+            raise ValidationError("reproducibility workspace head must be a Git commit")
+        if provenance not in {"CAPTURED_AT_EXECUTION", "RETROACTIVE_OBSERVATION"}:
+            raise ValidationError("unsupported reproducibility provenance")
+        if not isinstance(notes, str) or len(notes.encode("utf-8")) > 4096:
+            raise ValidationError("reproducibility notes must be at most 4096 bytes")
+        if any(
+            not isinstance(item, str)
+            or not item.strip()
+            or len(item) > 512
+            or "\n" in item
+            or "\r" in item
+            for item in sparse_checkout_patterns
+        ):
+            raise ValidationError("invalid sparse checkout pattern")
+        if not isinstance(workspace_diff, str) or len(
+            workspace_diff.encode("utf-8")
+        ) > 4 * 1024 * 1024:
+            raise ValidationError("workspace diff must be at most 4 MiB")
+        if any(
+            not isinstance(path, str)
+            or not path.strip()
+            or not isinstance(fingerprint, str)
+            or not re.fullmatch(r"[0-9a-f]{64}|DELETED|NON_FILE", fingerprint)
+            for path, fingerprint in changed_file_sha256.items()
+        ):
+            raise ValidationError("invalid changed-file fingerprint manifest")
+
+        payload = {
+            "schema_version": 2,
+            "run_id": run.id,
+            "work_order_id": work_order.id,
+            "instructions": instructions,
+            "instruction_sha256": sha256(instructions.encode("utf-8")).hexdigest(),
+            "test_command": test_command,
+            "workspace_branch": workspace_branch,
+            "workspace_head": workspace_head,
+            "sparse_checkout_patterns": sparse_checkout_patterns,
+            "workspace_diff": workspace_diff,
+            "workspace_diff_sha256": sha256(
+                workspace_diff.encode("utf-8")
+            ).hexdigest(),
+            "changed_file_sha256": changed_file_sha256,
+            "provenance": provenance,
+            "notes": notes,
+        }
+        payload_digest = payload_hash(payload)
+        evidence_path = contained_path(
+            venture.workspace_path,
+            "runs",
+            run.id,
+            f"reproducibility_{payload_digest[:12]}.json",
+        )
+        atomic_write_json(evidence_path, payload)
+        evidence_sha = sha256_file(evidence_path)
+        command_payload = {
+            "run_id": run.id,
+            "payload_sha256": payload_digest,
+            "evidence_sha256": evidence_sha,
+        }
+
+        def operation(connection: sqlite3.Connection) -> dict[str, str]:
+            now = utc_now()
+            evidence_id = new_id("evidence")
+            self.store.insert_row(
+                "evidence",
+                {
+                    "id": evidence_id,
+                    "idea_id": None,
+                    "venture_id": venture.id,
+                    "work_order_id": work_order.id,
+                    "run_id": run.id,
+                    "external_ref": None,
+                    "kind": "RUN_REPRODUCIBILITY",
+                    "path": self._relative(evidence_path),
+                    "sha256": evidence_sha,
+                    "trusted": 1,
+                    "payload_json": self._json(
+                        {
+                            "trusted": True,
+                            "provenance": provenance,
+                            "instruction_sha256": payload["instruction_sha256"],
+                            "workspace_branch": workspace_branch,
+                            "workspace_head": workspace_head,
+                            "sparse_checkout_patterns": sparse_checkout_patterns,
+                            "workspace_diff_sha256": payload[
+                                "workspace_diff_sha256"
+                            ],
+                            "changed_file_sha256": changed_file_sha256,
+                        }
+                    ),
+                    "created_at": now,
+                },
+                connection=connection,
+            )
+            original_evidence_ids = [
+                row["id"]
+                for row in connection.execute(
+                    """
+                    SELECT id FROM evidence
+                    WHERE run_id = ? AND kind != 'RUN_REPRODUCIBILITY'
+                    ORDER BY created_at, id
+                    """,
+                    (run.id,),
+                ).fetchall()
+            ]
+            event_type = (
+                "EVIDENCE_BACKFILLED"
+                if provenance == "RETROACTIVE_OBSERVATION"
+                else "RUN_REPRODUCIBILITY_RECORDED"
+            )
+            event_payload = {
+                "work_order_id": work_order.id,
+                "evidence_id": evidence_id,
+                "evidence_sha256": evidence_sha,
+                "provenance": provenance,
+                "workspace_diff_sha256": payload["workspace_diff_sha256"],
+            }
+            if event_type == "EVIDENCE_BACKFILLED":
+                event_payload.update(
+                    {
+                        "basis": notes,
+                        "original_evidence_ids": original_evidence_ids,
+                        "original_evidence_untouched": True,
+                    }
+                )
+            self.store.append_event(
+                event_type,
+                aggregate_type="Run",
+                aggregate_id=run.id,
+                venture_id=venture.id,
+                payload=event_payload,
+                connection=connection,
+            )
+            return {"evidence_id": evidence_id}
+
+        try:
+            result = self.store.run_idempotent(
+                idempotency_key,
+                "record_run_reproducibility",
+                command_payload,
+                operation,
+            )
+        except IdempotencyConflict as exc:
+            raise ConflictError(str(exc)) from exc
+        evidence_id = str(result["evidence_id"])
+        return next(
+            item for item in self.evidence_for_run(run.id) if item.id == evidence_id
+        )
 
     def _file_integrity_issue(
         self,

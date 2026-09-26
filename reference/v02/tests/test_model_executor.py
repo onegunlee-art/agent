@@ -11,6 +11,8 @@ sys.path.insert(0, str(ROOT))
 import execution_lease as L  # noqa: E402
 import model_executor as M  # noqa: E402
 
+SUBPROCESS_TIMEOUT_SECONDS = 20
+
 FAKE_CLI = textwrap.dedent("""
     import json, sys, time, pathlib
     mode = sys.argv[1]
@@ -32,14 +34,39 @@ TEST_FILE = "from hello import hello\n\ndef test_hello():\n    assert hello() ==
 def _repo(tmp: Path) -> Path:
     repo = tmp / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main"],
+        cwd=repo,
+        check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "t@t"],
+        cwd=repo,
+        check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "t"],
+        cwd=repo,
+        check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
     (repo / "fake_cli.py").write_text(FAKE_CLI)
     (repo / "test_hello.py").write_text(TEST_FILE)
     (repo / "hello.py").write_text("def hello():\n    return None\n")
-    subprocess.run(["git", "add", "."], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "add", "."],
+        cwd=repo,
+        check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "init"],
+        cwd=repo,
+        check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
     return repo
 
 

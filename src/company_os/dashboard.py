@@ -51,6 +51,24 @@ def read_dashboard(db_path: str | Path) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
+            run_rows = connection.execute(
+                """
+                SELECT id, status, outcome, cost_usd, duration_seconds,
+                       payload_json, created_at
+                FROM runs
+                WHERE work_order_id = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (row["id"],),
+            ).fetchall()
+            item["runs"] = []
+            for run_row in run_rows:
+                run = dict(run_row)
+                payload = json.loads(run.pop("payload_json"))
+                run["usage_total_tokens"] = payload.get("usage_total_tokens")
+                run["cost_status"] = payload.get("cost_status")
+                run["usage_status"] = payload.get("usage_status")
+                item["runs"].append(run)
             rubric = connection.execute(
                 """
                 SELECT payload_json FROM evidence
@@ -226,6 +244,25 @@ def _render_page(snapshot: dict[str, Any], csrf_token: str, preview_url: str) ->
     cards: list[str] = []
     for item in snapshot["work_orders"]:
         rubric = item.get("rubric") or {}
+        run_history = []
+        for run in item.get("runs", []):
+            token_count = run.get("usage_total_tokens")
+            tokens = f"{token_count:,}" if isinstance(token_count, int) else "측정 불가"
+            run_history.append(
+                "<li>"
+                f"<code>{html.escape(str(run['id']))}</code> · "
+                f"{html.escape(str(run.get('outcome') or run.get('status')))} · "
+                f"토큰 {html.escape(tokens)} · "
+                f"{html.escape(str(run.get('duration_seconds')))}초"
+                "</li>"
+            )
+        history_html = (
+            "<details><summary>실행 이력 전체 보기</summary><ol>"
+            + "".join(run_history)
+            + "</ol></details>"
+            if run_history
+            else "<p>실행 이력: 없음</p>"
+        )
         cards.append(
             "<article>"
             f"<h2>{html.escape(item['title'])}</h2>"
@@ -237,7 +274,10 @@ def _render_page(snapshot: dict[str, Any], csrf_token: str, preview_url: str) ->
             f"<p>평가: {html.escape(str(rubric.get('verdict', '없음')))} "
             f"({html.escape(str(rubric.get('score', '-')))}) · "
             f"Claude: {html.escape(str(item.get('review_status') or '미요청'))}</p>"
+            f"{history_html}"
             f'<p><a href="{html.escape(preview_url, quote=True)}" target="_blank">챗봇 미리보기 열기</a></p>'
+            '<p class="approval-note">승인 버튼은 원장 상태를 직접 덮어쓰지 않습니다. '
+            '현재 결과에 결속된 결정·승인 행과 <code>CEO_WORK_ORDER_APPROVED</code> 승인 Event를 추가합니다.</p>'
             f'<form method="post" action="/approve"><input type="hidden" name="csrf" value="{csrf_token}">'
             f'<input type="hidden" name="work_order_id" value="{html.escape(item["id"], quote=True)}">'
             '<button type="submit">승인</button></form>'

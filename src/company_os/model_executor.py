@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -24,6 +25,13 @@ class ExecutorRequest:
     test_command: Sequence[str]
     model_call_limit: int = 1
     token_limit: int = 250_000
+
+
+@dataclass(frozen=True)
+class WorkspaceIdentity:
+    branch: str
+    head_commit: str
+    sparse_checkout_patterns: tuple[str, ...]
 
 
 @dataclass
@@ -45,6 +53,11 @@ class ExecutorOutcome:
     token_accounting: str = "INPUT_PLUS_OUTPUT"
     token_limit_enforcement: str = "POST_EXECUTION_REJECTION"
     time_limit_enforcement: str = "HARD_PROCESS_TREE_STOP"
+    workspace_branch: str = ""
+    workspace_head: str = ""
+    sparse_checkout_patterns: list[str] = field(default_factory=list)
+    workspace_diff: str = ""
+    changed_file_sha256: dict[str, str] = field(default_factory=dict)
 
 
 CostParser = Callable[[str], tuple[float | None, dict[str, int]]]
@@ -81,6 +94,7 @@ SAFE_ENVIRONMENT = (
 )
 
 _BRANCH = re.compile(r"^wo/[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+_GIT_TIMEOUT_SECONDS = 30
 
 
 def codex_jsonl_cost(
@@ -134,8 +148,43 @@ def _git(cwd: Path, *arguments: str) -> str:
         capture_output=True,
         text=True,
         check=True,
+        timeout=_GIT_TIMEOUT_SECONDS,
     )
     return completed.stdout
+
+
+def capture_workspace_identity(workspace: Path) -> WorkspaceIdentity:
+    """Capture the exact Git view presented to a coding-agent process."""
+
+    workspace = workspace.resolve()
+    branch = _git(workspace, "branch", "--show-current").strip()
+    head_commit = _git(workspace, "rev-parse", "HEAD").strip()
+    sparse_enabled = subprocess.run(
+        ["git", "config", "--bool", "core.sparseCheckout"],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_GIT_TIMEOUT_SECONDS,
+    ).stdout.strip().casefold() == "true"
+    patterns: tuple[str, ...] = ()
+    if sparse_enabled:
+        completed = subprocess.run(
+            ["git", "sparse-checkout", "list"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "sparse checkout is enabled but its patterns cannot be read"
+            )
+        patterns = tuple(
+            line.strip() for line in completed.stdout.splitlines() if line.strip()
+        )
+    return WorkspaceIdentity(branch, head_commit, patterns)
 
 
 def create_worktree(
@@ -182,17 +231,71 @@ def validate_worktree(repository: Path, branch: str, destination: Path) -> Path:
     return destination
 
 
-def changed_files(workspace: Path) -> list[str]:
+def changed_files(workspace: Path, base_commit: str | None = None) -> list[str]:
     output = _git(workspace, "status", "--porcelain=v1", "--untracked-files=all")
-    paths: list[str] = []
+    paths: set[str] = set()
     for line in output.splitlines():
         if not line.strip():
             continue
         candidate = line[3:]
         if " -> " in candidate:
             candidate = candidate.split(" -> ", 1)[1]
-        paths.append(candidate.strip().strip('"'))
+        paths.add(candidate.strip().strip('"'))
+    if base_commit is not None:
+        committed_or_staged = _git(
+            workspace,
+            "diff",
+            "--name-only",
+            "--no-ext-diff",
+            base_commit,
+            "--",
+        )
+        paths.update(
+            line.strip() for line in committed_or_staged.splitlines() if line.strip()
+        )
     return sorted(paths)
+
+
+def capture_workspace_diff(workspace: Path, base_commit: str = "HEAD") -> str:
+    # Diff from the captured starting commit so staged changes cannot disappear
+    # from the audit record. Untracked files are represented by their full-file
+    # SHA-256 entries in ``changed_file_sha256``.
+    return _git(
+        workspace,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        base_commit,
+        "--",
+    )
+
+
+def changed_file_fingerprints(
+    workspace: Path,
+    paths: Sequence[str],
+) -> dict[str, str]:
+    workspace = workspace.resolve()
+    fingerprints: dict[str, str] = {}
+    for relative in paths:
+        candidate = workspace / relative
+        resolved = candidate.resolve(strict=False)
+        if workspace != resolved and workspace not in resolved.parents:
+            raise ValueError(f"changed file escapes worktree: {relative}")
+        if candidate.is_symlink():
+            fingerprints[relative] = sha256(
+                os.readlink(candidate).encode("utf-8")
+            ).hexdigest()
+        elif candidate.is_file():
+            digest = sha256()
+            with candidate.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(chunk)
+            fingerprints[relative] = digest.hexdigest()
+        elif not candidate.exists():
+            fingerprints[relative] = "DELETED"
+        else:
+            fingerprints[relative] = "NON_FILE"
+    return fingerprints
 
 
 def build_instructions(
@@ -291,6 +394,7 @@ class CliCodingExecutor:
                     capture_output=True,
                     text=True,
                     check=False,
+                    timeout=10,
                 )
             else:
                 try:
@@ -316,6 +420,12 @@ class CliCodingExecutor:
             raise ValueError("model call limit must be positive")
         if request.token_limit <= 0:
             raise ValueError("token limit must be positive")
+        identity = capture_workspace_identity(request.workspace)
+        identity_fields = {
+            "workspace_branch": identity.branch,
+            "workspace_head": identity.head_commit,
+            "sparse_checkout_patterns": list(identity.sparse_checkout_patterns),
+        }
         command = self._resolve(
             [part.format(instructions=request.instructions) for part in self.command]
         )
@@ -328,16 +438,24 @@ class CliCodingExecutor:
                 timeout=request.time_limit_seconds,
             )
         except subprocess.TimeoutExpired as exc:
+            files = changed_files(request.workspace, identity.head_commit)
             return ExecutorOutcome(
                 ok=False,
                 label="TIMEOUT",
                 cost_usd=None,
                 cost_unknown=True,
                 duration_seconds=time.monotonic() - started,
-                changed_files=changed_files(request.workspace),
+                changed_files=files,
                 stdout_tail=(exc.stdout or "")[-4000:],
                 stderr_tail=(exc.stderr or "")[-4000:],
                 error=f"time limit {request.time_limit_seconds}s exceeded",
+                workspace_diff=capture_workspace_diff(
+                    request.workspace, identity.head_commit
+                ),
+                changed_file_sha256=changed_file_fingerprints(
+                    request.workspace, files
+                ),
+                **identity_fields,
             )
         except FileNotFoundError as exc:
             return ExecutorOutcome(
@@ -347,6 +465,7 @@ class CliCodingExecutor:
                 cost_unknown=True,
                 duration_seconds=time.monotonic() - started,
                 error=str(exc),
+                **identity_fields,
             )
 
         cost, usage = self.cost_parser(completed.stdout)
@@ -362,7 +481,10 @@ class CliCodingExecutor:
                 else "WITHIN_LIMIT"
             )
         )
-        files = changed_files(request.workspace)
+        files = changed_files(request.workspace, identity.head_commit)
+        workspace_diff = capture_workspace_diff(request.workspace, identity.head_commit)
+        file_fingerprints = changed_file_fingerprints(request.workspace, files)
+        current_head = _git(request.workspace, "rev-parse", "HEAD").strip()
         outcome = ExecutorOutcome(
             ok=completed.returncode == 0,
             label="DONE" if completed.returncode == 0 else "ERROR",
@@ -377,7 +499,17 @@ class CliCodingExecutor:
             usage_status=usage_status,
             usage_total_tokens=usage_total_tokens,
             model_calls=1,
+            workspace_diff=workspace_diff,
+            changed_file_sha256=file_fingerprints,
+            **identity_fields,
         )
+        if current_head != identity.head_commit:
+            outcome.ok = False
+            outcome.label = "GIT_HISTORY_MUTATED"
+            outcome.error = (
+                "coding agent changed Git history; commits are owned by Company OS"
+            )
+            return outcome
         if outcome.ok and not files:
             outcome.ok = False
             combined_output = f"{completed.stdout}\n{completed.stderr}".casefold()

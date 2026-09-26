@@ -93,11 +93,33 @@ Codex CLI 실제 실행은 `company work model-run --help`에서 인자를 확�
 Codex CLI 프로세스 1회이며 내부 모델 turn 수가 아니다. 토큰은 입력+출력을
 합산하고 캐시·추론 subtotal은 중복 합산하지 않는다. 시간 상한은 실행 중
 프로세스 트리를 종료하지만 토큰 상한은 CLI 종료 후 초과 결과를 거부한다.
+즉 토큰 상한은 결과 채택 관문이지 이미 발생한 사용량의 사전 지출 차단이
+아니다. 최대 turn·context 기반 사전 제한은 V0.7 backlog다.
+
+`company work model-run`은 실행 직후 지시문과 그 해시, 수용 테스트 명령,
+worktree 브랜치와 시작 HEAD, sparse checkout 패턴, 생성 diff, 변경 파일
+SHA-256을 별도 `RUN_REPRODUCIBILITY` Evidence와 Event에 자동 기록한다.
+과거 실행을 나중에 보강한 경우에는 `RETROACTIVE_OBSERVATION`으로 표시하며,
+실행 시점에 캡처한 증거처럼 표현하지 않는다. 이 경우 원본 Evidence를 수정하지
+않고 근거를 담은 추가 전용 `EVIDENCE_BACKFILLED` Event를 남긴다.
+
+기본 `pytest`는 외부 실행 파일을 부르지 않는 단위·수용 테스트만 실행한다.
+설치된 Codex CLI를 실제로 시작하는 검사는 `integration` marker로 분리되어
+기본 실행에서 제외된다. 운영자가 명시적으로 확인할 때만 아래처럼 실행한다.
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -m integration tests\integration
+```
 
 현재 `preview`는 LLM이 매 질문의 문장을 생성하는 챗봇이 아니라 합성 자료를
 결정적으로 검색하는 FAQ 미리보기다. 실제 모델 Codex는 이 프로그램과 데이터를
 수정하는 코딩 실행자로 사용된다. 알려진 답변의 출처는 `출처 보기` 버튼을
 눌렀을 때만 펼쳐지고 자료 밖 질문에는 버튼이 나오지 않아야 한다.
+
+현황판의 승인 버튼은 기존 행을 직접 덮어쓰지 않는다. 현재 Run·Artifact·검수
+결속을 담은 Decision/Approval 행과 `CEO_WORK_ORDER_APPROVED` Event를 추가한다.
+현황판은 성공 재실행에 가려진 거부 시도까지 실행 이력 전체와 토큰 수로 보여
+준다.
 
 SQLite만 복구하려면 `company ledger backup/verify/restore`를 사용한다. 원장과
 연결된 Evidence·Artifact·handoff까지 재해 복구하려면 아래 묶음을 사용한다.

@@ -368,8 +368,22 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
             outcome,
             idempotency_key=args.idempotency_key,
         )
+        reproducibility = company.record_run_reproducibility(
+            run.id,
+            instructions=instructions,
+            test_command=list(test_command),
+            workspace_branch=outcome.workspace_branch,
+            workspace_head=outcome.workspace_head,
+            sparse_checkout_patterns=outcome.sparse_checkout_patterns,
+            workspace_diff=outcome.workspace_diff,
+            changed_file_sha256=outcome.changed_file_sha256,
+            provenance="CAPTURED_AT_EXECUTION",
+            notes="captured immediately after the coding-agent process and acceptance command",
+            idempotency_key=f"{args.idempotency_key}:reproducibility",
+        )
         return {
             "run": run,
+            "reproducibility_evidence_id": reproducibility.id,
             "executor_outcome": outcome.label,
             "executor_ok": outcome.ok,
             "cost_status": run.payload.get("cost_status"),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -19,12 +20,16 @@ from company_os.model_executor import (
     ExecutorOutcome,
     ExecutorRequest,
     build_instructions,
+    capture_workspace_identity,
     codex_jsonl_cost,
     create_worktree,
     validate_worktree,
 )
 
 from .helpers import build_venture
+
+
+SUBPROCESS_TIMEOUT_SECONDS = 20
 
 
 FAKE_CLI = textwrap.dedent(
@@ -43,6 +48,11 @@ FAKE_CLI = textwrap.dedent(
     elif mode == "denied":
         print(json.dumps({"type":"turn.completed","usage":{"input_tokens":2,"output_tokens":1}}))
         print("patch rejected: writing is blocked by read-only sandbox", file=sys.stderr)
+    elif mode == "commit":
+        pathlib.Path("hello.py").write_text("def hello():\\n    return 'hi'\\n")
+        subprocess.run(["git", "add", "hello.py"], check=True, timeout=10)
+        subprocess.run(["git", "commit", "-q", "-m", "unauthorized"], check=True, timeout=10)
+        print(json.dumps({"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}))
     elif mode == "spawn-late":
         subprocess.Popen([sys.executable, "-c", "import pathlib,time; time.sleep(2.5); pathlib.Path('late.txt').write_text('late')"])
         time.sleep(5)
@@ -53,17 +63,44 @@ FAKE_CLI = textwrap.dedent(
 def _repo(tmp: Path) -> Path:
     repo = tmp / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main"],
+        cwd=repo,
+        check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=repo,
+        check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "test"],
+        cwd=repo,
+        check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
     (repo / "fake_cli.py").write_text(FAKE_CLI, encoding="utf-8")
     (repo / "hello.py").write_text("def hello():\n    return None\n", encoding="utf-8")
     (repo / "test_hello.py").write_text(
         "from hello import hello\n\ndef test_hello():\n    assert hello() == 'hi'\n",
         encoding="utf-8",
     )
-    subprocess.run(["git", "add", "."], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    (repo / "src").mkdir()
+    (repo / "src" / "placeholder.txt").write_text("fixture\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "."],
+        cwd=repo,
+        check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "init"],
+        cwd=repo,
+        check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
     return repo
 
 
@@ -100,8 +137,26 @@ def test_worktree_edit_passes_and_main_is_untouched() -> None:
         ).run(_request(workspace))
         assert result.ok and result.label == "DONE"
         assert result.changed_files == ["hello.py"]
+        assert "diff --git a/hello.py b/hello.py" in result.workspace_diff
+        assert result.changed_file_sha256["hello.py"]
         assert result.cost_usd == 0.00075 and not result.cost_unknown
         assert "return None" in (repo / "hello.py").read_text(encoding="utf-8")
+
+
+def test_executor_rejects_history_mutation_but_preserves_its_diff() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        repo = _repo(root)
+        workspace = create_worktree(
+            repo,
+            "wo/WO-history",
+            root / "worktrees" / "WO-history",
+        )
+        result = _executor("commit").run(_request(workspace))
+        assert not result.ok and result.label == "GIT_HISTORY_MUTATED"
+        assert result.changed_files == ["hello.py"]
+        assert "diff --git a/hello.py b/hello.py" in result.workspace_diff
+        assert result.changed_file_sha256["hello.py"]
 
 
 def test_existing_worktree_must_belong_to_repository_and_branch() -> None:
@@ -116,6 +171,34 @@ def test_existing_worktree_must_belong_to_repository_and_branch() -> None:
         assert validate_worktree(repo, "wo/WO-existing", workspace) == workspace.resolve()
         with pytest.raises(ValueError, match="branch"):
             validate_worktree(repo, "wo/WO-other", workspace)
+
+
+def test_sparse_checkout_patterns_are_captured_as_run_reproducibility() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        repo = _repo(root)
+        workspace = create_worktree(
+            repo,
+            "wo/WO-sparse",
+            root / "worktrees" / "WO-sparse",
+        )
+        subprocess.run(
+            ["git", "sparse-checkout", "init", "--cone"],
+            cwd=workspace,
+            check=True,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        subprocess.run(
+            ["git", "sparse-checkout", "set", "src"],
+            cwd=workspace,
+            check=True,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+
+        identity = capture_workspace_identity(workspace)
+        assert identity.branch == "wo/WO-sparse"
+        assert len(identity.head_commit) == 40
+        assert identity.sparse_checkout_patterns == ("src",)
 
 
 def test_cli_exposes_bounded_model_run_entrypoint() -> None:
@@ -303,6 +386,54 @@ def test_model_executor_outcome_is_recorded_as_run_event_and_evidence(
             event["event_type"] for event in company.events()
         }
 
+        reproducibility = company.record_run_reproducibility(
+            run.id,
+            instructions="Change hello() and do not edit the test.",
+            test_command=[sys.executable, "-m", "pytest", "-q"],
+            workspace_branch="wo/WO-ledger",
+            workspace_head="a" * 40,
+            sparse_checkout_patterns=["src", "tests"],
+            workspace_diff="diff --git a/hello.py b/hello.py\n",
+            changed_file_sha256={"hello.py": "b" * 64},
+            provenance="CAPTURED_AT_EXECUTION",
+            notes="captured immediately after the fixture executor",
+            idempotency_key="model-executor-ledger-reproducibility",
+        )
+        payload = json.loads(reproducibility.path.read_text(encoding="utf-8"))
+        assert reproducibility.kind == "RUN_REPRODUCIBILITY"
+        assert payload["instructions"].startswith("Change hello")
+        assert payload["instruction_sha256"]
+        assert payload["sparse_checkout_patterns"] == ["src", "tests"]
+        assert payload["workspace_diff_sha256"]
+        assert payload["changed_file_sha256"] == {"hello.py": "b" * 64}
+        assert payload["notes"].startswith("captured immediately")
+        assert "RUN_REPRODUCIBILITY_RECORDED" in {
+            event["event_type"] for event in company.events()
+        }
+
+        backfill = company.record_run_reproducibility(
+            run.id,
+            instructions="Reconstructed from the archived WorkOrder handoff.",
+            test_command=[sys.executable, "-m", "pytest", "-q"],
+            workspace_branch="wo/WO-ledger",
+            workspace_head="a" * 40,
+            sparse_checkout_patterns=["src", "tests"],
+            workspace_diff="",
+            changed_file_sha256={},
+            provenance="RETROACTIVE_OBSERVATION",
+            notes="basis: archived handoff plus post-run Git inspection",
+            idempotency_key="model-executor-ledger-backfill",
+        )
+        backfill_events = [
+            event
+            for event in company.events()
+            if event["event_type"] == "EVIDENCE_BACKFILLED"
+        ]
+        assert backfill.kind == "RUN_REPRODUCIBILITY"
+        assert backfill_events[-1]["payload"]["evidence_id"] == backfill.id
+        assert backfill_events[-1]["payload"]["original_evidence_untouched"] is True
+        assert backfill_events[-1]["payload"]["basis"].startswith("basis:")
+
 
 def test_unknown_and_over_limit_model_cost_have_distinct_outcomes(
     tmp_path: Path,
@@ -326,9 +457,30 @@ def test_unknown_and_over_limit_model_cost_have_distinct_outcomes(
         )
         assert unknown_run.outcome == "DONE"
         assert unknown_run.status == "DONE"
+        assert unknown_run.cost_usd is None
         assert unknown_run.payload["cost_status"] == "UNAVAILABLE"
+        assert unknown_run.payload["cost_status"] != "WITHIN_LIMIT"
         assert unknown_run.payload["usage_status"] == "WITHIN_LIMIT"
         assert unknown_run.payload["budget_basis"] == "TIME_CALL_TOKEN"
+
+        measured_zero = ExecutorOutcome(
+            ok=True,
+            label="DONE",
+            cost_usd=0.0,
+            cost_unknown=False,
+            duration_seconds=0.1,
+            usage={"input_tokens": 10, "output_tokens": 2},
+            usage_status="WITHIN_LIMIT",
+            usage_total_tokens=12,
+        )
+        zero_run = company.record_model_execution(
+            work_order.id,
+            measured_zero,
+            idempotency_key="model-cost-policy-measured-zero",
+        )
+        assert zero_run.cost_usd == 0.0
+        assert zero_run.payload["cost_status"] == "WITHIN_LIMIT"
+        assert zero_run.payload["budget_basis"] == "USD"
 
         over = ExecutorOutcome(
             ok=True,

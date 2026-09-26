@@ -21,5 +21,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra -m 'not integration'"
 pythonpath = ["src"]
+markers = [
+  "integration: opt-in test that invokes an installed external executable",
+]
