@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 CAFE_A = ROOT / "examples" / "synthetic-cafe-a"
 DATA = load_json(CAFE_A / "faq_data.json")
 SPEC = load_json(CAFE_A / "eval_cases.json")
+CYCLE_3_CASES = CAFE_A / "cycle-3" / "eval_cases.json"
+CYCLE_3_SPEC = load_json(CYCLE_3_CASES)
 
 
 def test_baseline_synthetic_bot_passes_draft_cases() -> None:
@@ -41,6 +43,33 @@ def test_ceo_reviewed_cases_are_strict_and_cover_unknown_price() -> None:
     assert cases["q13"]["question"] == "흑임자 라떼 얼마예요?"
     assert cases["q13"]["must_not_include"] == ["원"]
     assert cases["q13"]["expected_source_ids"] == ["faq-black-sesame-latte"]
+
+
+def test_cycle_3_q14_draft_is_explicitly_waiting_for_ceo_approval() -> None:
+    cases = {case["id"]: case for case in CYCLE_3_SPEC["cases"]}
+
+    assert CYCLE_3_SPEC["_status"] == "DRAFT"
+    assert CYCLE_3_SPEC["_approval_status"] == "AWAITING_CEO_APPROVAL"
+    assert CYCLE_3_SPEC["threshold"] == 1.0
+    assert len(cases) == 14
+    assert cases["q14"] == {
+        "id": "q14",
+        "question": "화장실 어디예요?",
+        "must_include_all": ["카운터", "열쇠", "2층"],
+        "must_cite_source": True,
+        "expected_source_ids": ["faq-restroom"],
+        "expect_refusal": False,
+    }
+
+
+def test_cycle_3_restroom_answer_uses_only_the_new_public_faq() -> None:
+    result = answer("화장실 어디예요?", DATA)
+
+    assert result["refused"] is False
+    assert result["sources"] == ["faq-restroom"]
+    assert result["source_details"]
+    assert all(term in result["answer_text"] for term in ("카운터", "열쇠", "2층"))
+    assert "SECRET-7781" not in json.dumps(result, ensure_ascii=False)
 
 
 def test_unknown_black_sesame_price_is_not_invented() -> None:
