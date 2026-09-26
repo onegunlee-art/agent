@@ -52,7 +52,7 @@ from .models import (
     Venture,
     WorkOrder,
 )
-from .model_executor import ExecutorOutcome
+from .model_executor import ExecutorOutcome, ExecutorRequest
 from .roles import get_role_spec, list_role_specs, serialize_role_spec
 from .rubric import RubricReport, report_as_dict
 from .paths import default_ledger_path, validate_live_db_path
@@ -102,6 +102,61 @@ def _cost_status(
     if cost_usd > cost_limit_usd:
         return "EXCEEDED"
     return "WITHIN_LIMIT"
+
+
+def _model_execution_policy(
+    work_order: WorkOrder,
+    outcome: ExecutorOutcome,
+) -> tuple[str, str, str, str, str | None]:
+    """Return the canonical label and budget interpretation for a model Run."""
+
+    cost_status = _cost_status(
+        outcome.cost_usd,
+        outcome.cost_unknown,
+        work_order.cost_limit_usd,
+    )
+    usage_status = outcome.usage_status
+    if usage_status == "UNAVAILABLE" and outcome.usage:
+        usage_status = (
+            "EXCEEDED"
+            if outcome.usage_total_tokens > work_order.token_limit
+            else "WITHIN_LIMIT"
+        )
+    budget_basis = "TIME_CALL_TOKEN" if cost_status == "UNAVAILABLE" else "USD"
+    if not outcome.ok:
+        recorded_label = outcome.label
+    elif usage_status == "UNAVAILABLE":
+        recorded_label = "USAGE_UNAVAILABLE"
+    elif usage_status == "EXCEEDED":
+        recorded_label = "USAGE_LIMIT_EXCEEDED"
+    elif cost_status == "EXCEEDED":
+        recorded_label = "COST_LIMIT_EXCEEDED"
+    else:
+        recorded_label = outcome.label
+    policy_error = (
+        outcome.error
+        if not outcome.ok
+        else (
+            "execution usage could not be measured"
+            if usage_status == "UNAVAILABLE"
+            else (
+                "execution token usage exceeded WorkOrder limit"
+                if usage_status == "EXCEEDED"
+                else (
+                    "execution cost exceeded WorkOrder limit"
+                    if cost_status == "EXCEEDED"
+                    else outcome.error
+                )
+            )
+        )
+    )
+    return (
+        cost_status,
+        usage_status,
+        budget_basis,
+        recorded_label,
+        policy_error,
+    )
 
 
 def _read_bounded_evidence_file(source: Path, *, label: str) -> bytes:
@@ -3514,6 +3569,8 @@ class CompanyOS:
         run_row = self._row("runs", run_id)
         if run_row["work_order_id"] != work_order_id:
             raise ValidationError("Official evaluation Run does not belong to WorkOrder")
+        if run_row["outcome"] not in {"DONE", "PASS"}:
+            raise ValidationError("Official evaluation requires a successful Run")
         source = Path(cases_path).resolve()
         relative_path = self._relative(source)
         current_sha256 = sha256_file(source)
@@ -3744,6 +3801,455 @@ class CompanyOS:
             if item.id == evidence_id
         )
 
+    def execute_model_work_order(
+        self,
+        work_order_id: str,
+        *,
+        executor: Any,
+        request: ExecutorRequest,
+        idempotency_key: str,
+    ) -> tuple[Run, ExecutorOutcome]:
+        """Claim a WorkOrder lease, run one model process, and fence its result."""
+
+        work_order = self.work_order(work_order_id)
+        if request.work_order_id != work_order_id:
+            raise ValidationError("model request does not belong to WorkOrder")
+        if work_order.side_effect_class != "WORKSPACE_ONLY":
+            raise ValidationError("model-run only supports WORKSPACE_ONLY WorkOrders")
+        canonical_limits = (
+            work_order.time_limit_seconds,
+            work_order.cost_limit_usd,
+            work_order.model_call_limit,
+            work_order.token_limit,
+        )
+        requested_limits = (
+            request.time_limit_seconds,
+            request.cost_limit_usd,
+            request.model_call_limit,
+            request.token_limit,
+        )
+        if requested_limits != canonical_limits:
+            raise ValidationError("model request limits must match canonical WorkOrder limits")
+
+        executor_name = str(getattr(executor, "name", "codex_cli"))
+        command_payload = {
+            "work_order_id": work_order_id,
+            "executor": executor_name,
+            "instructions_sha256": sha256(
+                request.instructions.encode("utf-8")
+            ).hexdigest(),
+            "test_command": list(request.test_command),
+            "workspace": str(request.workspace.resolve()),
+            "time_limit_seconds": request.time_limit_seconds,
+            "cost_limit_usd": request.cost_limit_usd,
+            "model_call_limit": request.model_call_limit,
+            "token_limit": request.token_limit,
+        }
+        execution_id = new_id("execution")
+        claimed_at = utc_now()
+        lease_expires_at = ""
+        fence_token = 0
+        claimed_from_status = ""
+        claim_rejected = False
+        try:
+            with self.store.transaction() as connection:
+                stopped_row = connection.execute(
+                    "SELECT value_json FROM global_state WHERE key = 'stopped'"
+                ).fetchone()
+                if stopped_row is not None and bool(
+                    json.loads(stopped_row["value_json"])
+                ):
+                    self.store.append_event(
+                        "WORK_ORDER_CLAIM_REJECTED",
+                        aggregate_type="WorkOrder",
+                        aggregate_id=work_order_id,
+                        venture_id=work_order.venture_id,
+                        payload={
+                            "reason": "COMPANY_STOPPED",
+                            "execution_kind": "MODEL",
+                        },
+                        connection=connection,
+                    )
+                    claim_rejected = True
+                if not claim_rejected:
+                    claim = self.store.claim_idempotency(
+                        idempotency_key,
+                        "execute_model_work_order",
+                        command_payload,
+                        connection=connection,
+                    )
+                    if not claim.is_new:
+                        raise ConflictError(
+                            "model-run idempotency key already exists; refusing a "
+                            "repeated model call"
+                        )
+                    current_row = connection.execute(
+                        "SELECT * FROM work_orders WHERE id = ?", (work_order_id,)
+                    ).fetchone()
+                    if current_row is None:
+                        raise NotFoundError(f"WorkOrder not found: {work_order_id}")
+                    current_work = self._work_order_from_row(current_row)
+                    if current_work.status not in {"READY", "VERIFICATION_FAILED"}:
+                        raise ValidationError(
+                            "WorkOrder cannot model-run from status "
+                            f"{current_work.status}"
+                        )
+                    claimed_from_status = current_work.status
+                    fence_token = current_work.fence_token + 1
+                    lease_expires_at = (
+                        datetime.now(timezone.utc)
+                        + timedelta(seconds=current_work.time_limit_seconds)
+                    ).isoformat()
+                    claimed = connection.execute(
+                        """
+                        UPDATE work_orders
+                        SET status = 'EXECUTING', execution_id = ?, fence_token = ?,
+                            lease_expires_at = ?, updated_at = ?
+                        WHERE id = ? AND status = ? AND fence_token = ?
+                        """,
+                        (
+                            execution_id,
+                            fence_token,
+                            lease_expires_at,
+                            claimed_at,
+                            work_order_id,
+                            current_work.status,
+                            current_work.fence_token,
+                        ),
+                    )
+                    if claimed.rowcount != 1:
+                        raise ConflictError(
+                            "WorkOrder model execution could not be claimed: "
+                            f"{work_order_id}"
+                        )
+                    self.store.append_event(
+                        "WORK_ORDER_EXECUTION_STARTED",
+                        aggregate_type="WorkOrder",
+                        aggregate_id=work_order_id,
+                        venture_id=current_work.venture_id,
+                        payload={
+                            "execution_id": execution_id,
+                            "fence_token": fence_token,
+                            "lease_expires_at": lease_expires_at,
+                            "executor": executor_name,
+                            "execution_kind": "MODEL",
+                            "prior_status": current_work.status,
+                        },
+                        connection=connection,
+                    )
+        except IdempotencyConflict as exc:
+            raise ConflictError(str(exc)) from exc
+        if claim_rejected:
+            raise CompanyStoppedError(
+                "Company execution is stopped; run company resume"
+            )
+
+        started_monotonic = time.monotonic()
+        try:
+            outcome = executor.run(request)
+            if not isinstance(outcome, ExecutorOutcome):
+                raise TypeError("model executor must return ExecutorOutcome")
+        except BaseException as error:
+            failed_outcome = ExecutorOutcome(
+                ok=False,
+                label="ERROR",
+                cost_usd=None,
+                cost_unknown=True,
+                duration_seconds=time.monotonic() - started_monotonic,
+                error=f"{type(error).__name__}: {error}",
+                usage_status="UNAVAILABLE",
+                model_calls=1,
+            )
+            try:
+                self._finalize_model_execution(
+                    work_order,
+                    failed_outcome,
+                    executor_name=executor_name,
+                    idempotency_key=idempotency_key,
+                    execution_id=execution_id,
+                    fence_token=fence_token,
+                    lease_expires_at=lease_expires_at,
+                    claimed_at=claimed_at,
+                    claimed_from_status=claimed_from_status,
+                )
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "Model execution cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+
+        run = self._finalize_model_execution(
+            work_order,
+            outcome,
+            executor_name=executor_name,
+            idempotency_key=idempotency_key,
+            execution_id=execution_id,
+            fence_token=fence_token,
+            lease_expires_at=lease_expires_at,
+            claimed_at=claimed_at,
+            claimed_from_status=claimed_from_status,
+        )
+        return run, outcome
+
+    def _finalize_model_execution(
+        self,
+        work_order: WorkOrder,
+        outcome: ExecutorOutcome,
+        *,
+        executor_name: str,
+        idempotency_key: str,
+        execution_id: str,
+        fence_token: int,
+        lease_expires_at: str,
+        claimed_at: str,
+        claimed_from_status: str,
+    ) -> Run:
+        """Record a model result only while its exact lease still owns the WorkOrder."""
+
+        venture = self.venture(work_order.venture_id)
+        run_id = new_id("run")
+        (
+            cost_status,
+            usage_status,
+            budget_basis,
+            recorded_label,
+            policy_error,
+        ) = _model_execution_policy(work_order, outcome)
+        finished_at = utc_now()
+        if datetime.now(timezone.utc) > datetime.fromisoformat(lease_expires_at):
+            recorded_label = "EXPIRED"
+            policy_error = "model execution result arrived after lease expiry"
+
+        def redact(value: str) -> str:
+            return re.sub(
+                r"(?:sk|ghp|github_pat)-?[A-Za-z0-9_-]{16,}",
+                "[REDACTED]",
+                value,
+            )
+
+        report_payload = {
+            "run_id": run_id,
+            "work_order_id": work_order.id,
+            "execution_id": execution_id,
+            "fence_token": fence_token,
+            "lease_expires_at": lease_expires_at,
+            "outcome": recorded_label,
+            "executor_outcome": outcome.label,
+            "ok": (
+                recorded_label != "EXPIRED"
+                and outcome.ok
+                and usage_status == "WITHIN_LIMIT"
+                and cost_status != "EXCEEDED"
+            ),
+            "cost_usd": outcome.cost_usd,
+            "cost_unknown": outcome.cost_unknown,
+            "cost_status": cost_status,
+            "cost_limit_usd": work_order.cost_limit_usd,
+            "budget_basis": budget_basis,
+            "model_call_limit": work_order.model_call_limit,
+            "model_calls": outcome.model_calls,
+            "model_call_unit": outcome.model_call_unit,
+            "token_limit": work_order.token_limit,
+            "usage_status": usage_status,
+            "usage_total_tokens": outcome.usage_total_tokens,
+            "token_accounting": outcome.token_accounting,
+            "token_limit_enforcement": outcome.token_limit_enforcement,
+            "time_limit_enforcement": outcome.time_limit_enforcement,
+            "workspace_branch": outcome.workspace_branch,
+            "workspace_head": outcome.workspace_head,
+            "sparse_checkout_patterns": outcome.sparse_checkout_patterns,
+            "duration_seconds": outcome.duration_seconds,
+            "changed_files": outcome.changed_files,
+            "usage": outcome.usage,
+            "error": policy_error,
+            "stdout_tail": redact(outcome.stdout_tail),
+            "stderr_tail": redact(outcome.stderr_tail),
+            "diagnostic_only": False,
+            "production_execution": True,
+        }
+        report_path = contained_path(
+            venture.workspace_path,
+            "runs",
+            run_id,
+            "model_execution.json",
+        )
+        atomic_write_json(report_path, report_payload)
+        report_sha = sha256_file(report_path)
+        stale = False
+        try:
+            with self.store.transaction() as connection:
+                current = connection.execute(
+                    "SELECT * FROM work_orders WHERE id = ?", (work_order.id,)
+                ).fetchone()
+                if current is None:
+                    raise NotFoundError(f"WorkOrder not found: {work_order.id}")
+                if (
+                    current["status"] != "EXECUTING"
+                    or current["execution_id"] != execution_id
+                    or int(current["fence_token"]) != fence_token
+                ):
+                    stale = True
+                    self.store.append_event(
+                        "STALE_RESULT_REJECTED",
+                        aggregate_type="WorkOrder",
+                        aggregate_id=work_order.id,
+                        venture_id=work_order.venture_id,
+                        payload={
+                            "execution_kind": "MODEL",
+                            "execution_id": execution_id,
+                            "fence_token": fence_token,
+                            "current_execution_id": current["execution_id"],
+                            "current_fence_token": int(current["fence_token"]),
+                        },
+                        connection=connection,
+                    )
+                else:
+                    attempt = int(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM runs WHERE work_order_id = ?",
+                            (work_order.id,),
+                        ).fetchone()[0]
+                    ) + 1
+                    released = connection.execute(
+                        """
+                        UPDATE work_orders
+                        SET status = ?, execution_id = NULL, lease_expires_at = NULL,
+                            fence_token = fence_token + 1, updated_at = ?
+                        WHERE id = ? AND status = 'EXECUTING'
+                          AND execution_id = ? AND fence_token = ?
+                        """,
+                        (
+                            claimed_from_status,
+                            finished_at,
+                            work_order.id,
+                            execution_id,
+                            fence_token,
+                        ),
+                    )
+                    if released.rowcount != 1:
+                        raise StaleExecutionError(
+                            f"Model execution lease changed while finalizing {work_order.id}"
+                        )
+                    self.store.insert_row(
+                        "runs",
+                        {
+                            "id": run_id,
+                            "work_order_id": work_order.id,
+                            "status": recorded_label,
+                            "executor": executor_name,
+                            "verifier_sha256": work_order.verifier_hash,
+                            "execution_id": execution_id,
+                            "fence_token": fence_token,
+                            "outcome": recorded_label,
+                            "cost_usd": outcome.cost_usd,
+                            "duration_seconds": outcome.duration_seconds,
+                            "payload_json": self._json(
+                                {
+                                    "attempt": attempt,
+                                    "cost_unknown": outcome.cost_unknown,
+                                    "cost_status": cost_status,
+                                    "cost_limit_usd": work_order.cost_limit_usd,
+                                    "budget_basis": budget_basis,
+                                    "model_call_limit": work_order.model_call_limit,
+                                    "model_calls": outcome.model_calls,
+                                    "model_call_unit": outcome.model_call_unit,
+                                    "token_limit": work_order.token_limit,
+                                    "usage_status": usage_status,
+                                    "usage_total_tokens": outcome.usage_total_tokens,
+                                    "token_accounting": outcome.token_accounting,
+                                    "token_limit_enforcement": outcome.token_limit_enforcement,
+                                    "time_limit_enforcement": outcome.time_limit_enforcement,
+                                    "workspace_branch": outcome.workspace_branch,
+                                    "workspace_head": outcome.workspace_head,
+                                    "sparse_checkout_patterns": outcome.sparse_checkout_patterns,
+                                    "executor_outcome": outcome.label,
+                                    "usage": outcome.usage,
+                                    "changed_files": outcome.changed_files,
+                                    "lease_expires_at": lease_expires_at,
+                                    "diagnostic_only": False,
+                                    "production_execution": True,
+                                }
+                            ),
+                            "started_at": claimed_at,
+                            "finished_at": finished_at,
+                            "created_at": finished_at,
+                        },
+                        connection=connection,
+                    )
+                    evidence_id = new_id("evidence")
+                    evidence_kind = (
+                        "MODEL_EXECUTION_FAILURE"
+                        if recorded_label == "EXPIRED"
+                        else "MODEL_EXECUTION"
+                    )
+                    self.store.insert_row(
+                        "evidence",
+                        {
+                            "id": evidence_id,
+                            "idea_id": None,
+                            "venture_id": venture.id,
+                            "work_order_id": work_order.id,
+                            "run_id": run_id,
+                            "external_ref": None,
+                            "kind": evidence_kind,
+                            "path": self._relative(report_path),
+                            "sha256": report_sha,
+                            "trusted": 1,
+                            "payload_json": self._json(
+                                {
+                                    "trusted": True,
+                                    "diagnostic_only": False,
+                                    "production_execution": True,
+                                    "execution_id": execution_id,
+                                    "fence_token": fence_token,
+                                    "outcome": recorded_label,
+                                    "cost_status": cost_status,
+                                    "usage_status": usage_status,
+                                    "workspace_branch": outcome.workspace_branch,
+                                    "workspace_head": outcome.workspace_head,
+                                    "sparse_checkout_patterns": outcome.sparse_checkout_patterns,
+                                }
+                            ),
+                            "created_at": finished_at,
+                        },
+                        connection=connection,
+                    )
+                    self.store.append_event(
+                        "MODEL_EXECUTION_FINALIZED",
+                        aggregate_type="Run",
+                        aggregate_id=run_id,
+                        venture_id=venture.id,
+                        payload={
+                            "work_order_id": work_order.id,
+                            "evidence_id": evidence_id,
+                            "evidence_kind": evidence_kind,
+                            "execution_id": execution_id,
+                            "fence_token": fence_token,
+                            "outcome": recorded_label,
+                            "diagnostic_only": False,
+                            "restored_status": claimed_from_status,
+                        },
+                        connection=connection,
+                    )
+                    self.store.complete_idempotency(
+                        idempotency_key,
+                        {"run_id": run_id},
+                        command="execute_model_work_order",
+                        connection=connection,
+                    )
+        except BaseException:
+            if report_path.is_file():
+                report_path.unlink()
+            raise
+        if stale:
+            if report_path.is_file():
+                report_path.unlink()
+            raise StaleExecutionError(
+                f"Late model execution result rejected for {work_order.id}/{execution_id}"
+            )
+        return self.run(run_id)
+
     def record_model_execution(
         self,
         work_order_id: str,
@@ -3756,48 +4262,13 @@ class CompanyOS:
         work_order = self.work_order(work_order_id)
         venture = self.venture(work_order.venture_id)
         run_id = new_id("run")
-        cost_status = _cost_status(
-            outcome.cost_usd,
-            outcome.cost_unknown,
-            work_order.cost_limit_usd,
-        )
-        usage_status = outcome.usage_status
-        if usage_status == "UNAVAILABLE" and outcome.usage:
-            usage_status = (
-                "EXCEEDED"
-                if outcome.usage_total_tokens > work_order.token_limit
-                else "WITHIN_LIMIT"
-            )
-        budget_basis = (
-            "TIME_CALL_TOKEN" if cost_status == "UNAVAILABLE" else "USD"
-        )
-        if not outcome.ok:
-            recorded_label = outcome.label
-        elif usage_status == "UNAVAILABLE":
-            recorded_label = "USAGE_UNAVAILABLE"
-        elif usage_status == "EXCEEDED":
-            recorded_label = "USAGE_LIMIT_EXCEEDED"
-        elif cost_status == "EXCEEDED":
-            recorded_label = "COST_LIMIT_EXCEEDED"
-        else:
-            recorded_label = outcome.label
-        policy_error = (
-            outcome.error
-            if not outcome.ok
-            else (
-                "execution usage could not be measured"
-                if usage_status == "UNAVAILABLE"
-                else (
-                    "execution token usage exceeded WorkOrder limit"
-                    if usage_status == "EXCEEDED"
-                    else (
-                        "execution cost exceeded WorkOrder limit"
-                        if cost_status == "EXCEEDED"
-                        else outcome.error
-                    )
-                )
-            )
-        )
+        (
+            cost_status,
+            usage_status,
+            budget_basis,
+            recorded_label,
+            policy_error,
+        ) = _model_execution_policy(work_order, outcome)
 
         def redact(value: str) -> str:
             return re.sub(

@@ -99,6 +99,13 @@ Codex CLI 프로세스 1회이며 내부 모델 turn 수가 아니다. 토큰은
 `company work model-run`은 실행 직후 지시문과 그 해시, 수용 테스트 명령,
 worktree 브랜치와 시작 HEAD, sparse checkout 패턴, 생성 diff, 변경 파일
 SHA-256을 별도 `RUN_REPRODUCIBILITY` Evidence와 Event에 자동 기록한다.
+V0.3부터 이 명령은 모델 프로세스를 시작하기 전에 WorkOrder를 짧은 SQLite
+트랜잭션으로 claim한다. 모델 실행 중에는 쓰기 트랜잭션을 열어두지 않으며,
+완료 Run에는 `execution_id`, `fence_token`, `production_execution=true`,
+`diagnostic_only=false`가 기록된다. 만료된 claim은 `company reclaim-expired`로
+회수할 수 있고, 회수 뒤 늦게 돌아온 결과는 `STALE_RESULT_REJECTED`만 남기고
+Evidence로 채택되지 않는다. V0.2에서 만들어진 6개 모델 Run은 당시 사실대로
+`diagnostic_only=true`인 과거 기록으로 보존하며 수정하지 않는다.
 과거 실행을 나중에 보강한 경우에는 `RETROACTIVE_OBSERVATION`으로 표시하며,
 실행 시점에 캡처한 증거처럼 표현하지 않는다. 이 경우 원본 Evidence를 수정하지
 않고 근거를 담은 추가 전용 `EVIDENCE_BACKFILLED` Event를 남긴다.
