@@ -9,6 +9,7 @@ import py_compile
 import shutil
 import subprocess
 import sys
+import zipfile
 
 import pytest
 
@@ -67,7 +68,7 @@ def _expected_initial_manifest_sha256() -> str:
         (b"alpha.txt", b"100644", sha256(b"alpha\n").digest()),
         (b"nested/beta.bin", b"100644", sha256(b"\x00beta\xff").digest()),
     ]
-    manifest = bytearray(b"ai-company-os-source-tree-v1\0")
+    manifest = bytearray(b"ai-company-os-source-tree-v2\0")
     manifest.extend(len(entries).to_bytes(8, "big"))
     for path, mode, content_digest in entries:
         manifest.extend(_frame(path))
@@ -92,6 +93,79 @@ def test_clean_snapshot_reports_commit_tree_and_deterministic_sha256(
     assert first.source_tree_oid == _git(repo, "rev-parse", "HEAD^{tree}")
     assert first.source_tree_sha256 == _expected_initial_manifest_sha256()
     assert first.dirty is False
+
+
+def test_same_tree_oid_has_same_sha256_across_lf_and_crlf_checkouts(
+    tmp_path: Path,
+) -> None:
+    source_repo = _repository(tmp_path / "origin")
+    lf_repo = tmp_path / "lf-checkout"
+    crlf_repo = tmp_path / "crlf-checkout"
+    _git(
+        tmp_path,
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        str(source_repo),
+        str(lf_repo),
+    )
+    _git(
+        tmp_path,
+        "clone",
+        "--quiet",
+        "--no-checkout",
+        str(source_repo),
+        str(crlf_repo),
+    )
+    _git(lf_repo, "config", "core.autocrlf", "false")
+    _git(crlf_repo, "config", "core.autocrlf", "true")
+    _git(lf_repo, "checkout", "--quiet", "--force", "HEAD")
+    _git(crlf_repo, "checkout", "--quiet", "--force", "HEAD")
+
+    assert (lf_repo / "alpha.txt").read_bytes() == b"alpha\n"
+    assert (crlf_repo / "alpha.txt").read_bytes() == b"alpha\r\n"
+    assert _git(lf_repo, "status", "--porcelain") == ""
+    assert _git(crlf_repo, "status", "--porcelain") == ""
+
+    lf_snapshot = GitSourceSnapshot(code_root=lf_repo).capture()
+    crlf_snapshot = GitSourceSnapshot(code_root=crlf_repo).capture()
+
+    assert lf_snapshot.source_tree_oid == crlf_snapshot.source_tree_oid
+    assert lf_snapshot.source_tree_sha256 == crlf_snapshot.source_tree_sha256
+
+
+def test_tracked_only_source_zip_reconstructs_same_tree_sha256(
+    tmp_path: Path,
+) -> None:
+    source_repo = _repository(tmp_path / "origin")
+    source_snapshot = GitSourceSnapshot(code_root=source_repo).capture()
+    archive_path = tmp_path / "source.zip"
+    _git(
+        source_repo,
+        "archive",
+        "--format=zip",
+        f"--output={archive_path}",
+        "HEAD",
+    )
+    reconstructed = tmp_path / "reconstructed"
+    reconstructed.mkdir()
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(reconstructed)
+    _git(reconstructed, "init", "--quiet")
+    _git(reconstructed, "config", "user.name", "Snapshot Test")
+    _git(reconstructed, "config", "user.email", "snapshot@example.invalid")
+    _git(reconstructed, "config", "core.autocrlf", "false")
+    _git(reconstructed, "config", "core.filemode", "false")
+    _git(reconstructed, "add", "--all")
+    _git(reconstructed, "commit", "--quiet", "-m", "reconstruct source archive")
+
+    reconstructed_snapshot = GitSourceSnapshot(code_root=reconstructed).capture()
+
+    assert reconstructed_snapshot.source_tree_oid == source_snapshot.source_tree_oid
+    assert (
+        reconstructed_snapshot.source_tree_sha256
+        == source_snapshot.source_tree_sha256
+    )
 
 
 def test_dirty_or_staged_tracked_content_is_rejected_until_committed(
