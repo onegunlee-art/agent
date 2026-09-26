@@ -77,7 +77,8 @@ cd C:\dev\ai-company-os
 
 ```powershell
 cd C:\dev\ai-company-os
-.\.venv\Scripts\company.exe --root C:\dev\ai-company-os dashboard --port 8780
+.\.venv\Scripts\company.exe --root C:\dev\ai-company-os dashboard --port 8780 `
+  --backup-dir "$env:LOCALAPPDATA\ai-company-os\backups"
 ```
 
 그 뒤 브라우저에서 다음 주소를 연다.
@@ -143,10 +144,23 @@ Evidence로 채택되지 않는다. V0.2에서 만들어진 6개 모델 Run은 �
 공식 Evidence는 승인 ID, 평가 파일 해시, clean Git commit/tree 해시를 함께
 기록한다. 승인 뒤 파일이 한 바이트라도 바뀌면 공식 평가는 실패한다.
 
-현황판의 승인 버튼은 기존 행을 직접 덮어쓰지 않는다. 현재 Run·Artifact·검수
-결속을 담은 Decision/Approval 행과 `CEO_WORK_ORDER_APPROVED` Event를 추가한다.
-현황판은 성공 재실행에 가려진 거부 시도까지 실행 이력 전체와 토큰 수로 보여
-준다.
+현황판 조회는 `query_only` SQLite 연결만 사용한다. 승인·수정 요청 버튼은
+현황판 프로세스가 원장을 직접 쓰지 않고 별도 `company dashboard-action` CLI를
+실행한다. CLI는 현재 Run·Artifact·검수 결속을 담은
+`CEO_WORK_ORDER_APPROVED` 또는 `CEO_WORK_ORDER_CHANGE_REQUESTED` Event 하나만
+추가하며 WorkOrder·Decision·Approval 행을 덮어쓰거나 새로 만들지 않는다.
+평가 사례의 공식 승인은 위의 해시 결속 평가 승인 명령으로 별도 수행한다.
+
+현황판은 승인 대기와 CEO 판단 필요 항목을 맨 위에 놓고, 성공 재실행에 가려진
+거부·만료 시도까지 실행 이력 전체를 보존한다. 채택 Run 원가와 요청 전체
+원가를 토큰·시간·USD로 분리하며, `--backup-dir`에서 SHA-256 sidecar가 있는
+가장 최근 원장 또는 recovery ZIP의 시각을 보여준다. 권장 백업 위치는 다음과
+같다.
+
+```powershell
+.\.venv\Scripts\company.exe --root C:\dev\ai-company-os ledger recovery-backup `
+  --dir "$env:LOCALAPPDATA\ai-company-os\backups"
+```
 
 SQLite만 복구하려면 `company ledger backup/verify/restore`를 사용한다. 원장과
 연결된 Evidence·Artifact·handoff까지 재해 복구하려면 아래 묶음을 사용한다.
@@ -159,13 +173,12 @@ SQLite만 복구하려면 `company ledger backup/verify/restore`를 사용한다
 
 ## 현재 구축 수준
 
-V0.2 구현 브랜치는 아이디어, CTO/CPO/CMO handoff, 계약, WorkOrder,
-Evidence, 독립 리뷰, 중단·재개에 더해 실행 lease, 실제 Codex CLI 실행,
-rubric 평가, 로컬 챗봇·현황판, 외부 원장과 전체 참조 파일 복구를 구현했다.
+V0.2 생산 사이클과 V0.3 R2 모델 lease 통합은 Claude 독립 검수 PASS와 CEO
+로컬 병합 승인을 통과했다. 현재 V0.3 작업 브랜치는 그 기반 위에 승인 대기,
+전체 실행 이력, 요청 원가, 백업 시각을 보여주는 로컬 운영 현황판 최소판을
+구현한다. 이 현황판 변경은 자체 테스트 결과이며 아직 별도 독립 검수 결과로
+표현하지 않는다.
 
-합성 챗봇 코드 수정과 DRAFT 평가 통과는 확인됐지만, CEO의 평가 세트 APPROVED와
-Claude 독립 PASS가 남아 있으므로 V0.2 final은 아니다.
 OpenClaw, Deep Agents, Langfuse, Graphiti, Browser Use, OpenSandbox, Docling,
-DSPy를 한꺼번에 설치하지 않는다. 다음 관문은 CEO의 합성 챗봇 평가 세트
-승인과 Claude 독립 검수다. 두 관문을 통과한 작업 방식만 새 스킬 후보로
-승격한다.
+DSPy를 한꺼번에 설치하지 않는다. 반복해서 검증된 절차만 다음 버전의 생산
+라인 또는 스킬 후보로 승격한다.

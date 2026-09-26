@@ -38,9 +38,15 @@
   manifest containing the database and every ledger-referenced Evidence,
   Artifact, verifier, context manifest, council response, and review handoff.
   Restore accepts only a verified bundle and empty destination paths.
-- Loopback-only preview and dashboard servers provide the browser surfaces;
-  the dashboard uses read-only SQLite snapshots and hash-bound approval or
-  revision actions.
+- Loopback-only preview and dashboard servers provide the browser surfaces.
+  Dashboard reads use a query-only SQLite connection; button writes are
+  append-only CEO action Events issued by a separate `company
+  dashboard-action` CLI process. The browser server never opens a writable
+  ledger connection. Formal evaluation approvals remain a separate,
+  hash-bound workflow.
+- The operator view sorts approval and CEO-decision items first, retains every
+  rejected or expired Run, separates the accepted Run's token/time/USD from
+  the full request cost, and reports the newest sidecar-bound backup file.
 - The preview answer engine is deterministic FAQ retrieval, not an LLM answer
   generator. Codex is the coding executor that changes the preview program.
 
