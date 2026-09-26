@@ -342,14 +342,6 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
     if args.command == "work" and args.work_command == "status":
         return company.work_order(args.work_order_id)
     if args.command == "work" and args.work_command == "model-run":
-        prior = company.store.query_one(
-            "SELECT status FROM idempotency WHERE key = ?",
-            (args.idempotency_key,),
-        )
-        if prior is not None:
-            raise ValueError(
-                "model-run idempotency key already exists; refusing a repeated model call"
-            )
         instructions_path = args.instructions_file.resolve()
         if (
             instructions_path.is_symlink()
@@ -373,8 +365,10 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
             instructions_path.read_text(encoding="utf-8"),
             subprocess.list2cmdline(test_command),
         )
-        outcome = CliCodingExecutor().run(
-            ExecutorRequest(
+        run, outcome = company.execute_model_work_order(
+            work_order.id,
+            executor=CliCodingExecutor(),
+            request=ExecutorRequest(
                 work_order_id=work_order.id,
                 workspace=workspace,
                 instructions=instructions,
@@ -383,11 +377,7 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
                 model_call_limit=work_order.model_call_limit,
                 token_limit=work_order.token_limit,
                 test_command=test_command,
-            )
-        )
-        run = company.record_model_execution(
-            work_order.id,
-            outcome,
+            ),
             idempotency_key=args.idempotency_key,
         )
         reproducibility = company.record_run_reproducibility(

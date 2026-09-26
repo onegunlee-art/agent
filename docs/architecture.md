@@ -207,9 +207,20 @@ Codex `workspace-write` sandbox, but confidential multi-tenant isolation is
 still not claimed. Only a trusted local executor with synthetic, non-confidential
 data is supported; real Ventures and untrusted executors are out of scope.
 
-The V0.2 execution foundation claims a WorkOrder with a short `EXECUTING`
-transition, commits that transaction, invokes the ExecutorPort without a
-SQLite write lock, and then finalizes the Run in a second short transaction.
-Handled executor failures restore the prior resumable status and append a
-failure Event. Startup and `company reclaim-expired` recover expired claims,
-while fence tokens reject any result arriving from the abandoned execution.
+The V0.2 artifact-execution foundation claims a WorkOrder with a short
+`EXECUTING` transition, commits that transaction, invokes the ExecutorPort
+without a SQLite write lock, and then finalizes the Run in a second short
+transaction. Handled executor failures restore the prior resumable status and
+append a failure Event. Startup and `company reclaim-expired` recover expired
+claims, while fence tokens reject any result arriving from the abandoned
+execution.
+
+V0.3 applies the same claim/execute/finalize boundary to `work model-run`.
+The coding-agent process now starts only after an atomic WorkOrder claim. Its
+canonical Run and `MODEL_EXECUTION` Evidence carry that claim's
+`execution_id` and fence token, and are marked `production_execution=true`
+and `diagnostic_only=false`. Expiry recovery can release the WorkOrder for a
+new claim; an older process that returns later can append only a
+`STALE_RESULT_REJECTED` Event and cannot create model Evidence or overwrite the
+newer result. The six V0.2 model Runs remain immutable historical
+`diagnostic_only=true` records; they are not rewritten by this change.
