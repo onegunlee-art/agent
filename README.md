@@ -231,6 +231,8 @@ handoff rules. Customer handling is defined in
 [고객별 비공개 저장소 규칙](docs/PRIVATE_CUSTOMER_REPOSITORY_RULES_KO.md) and the
 [파일럿 체크리스트](docs/V05_PILOT_CHECKLIST_KO.md). The remaining V0.5
 boundaries are explicit in [known limitations](docs/known-limitations.md).
+[V0.6 승인 대기 알림](docs/V06_APPROVAL_NOTIFICATIONS_KO.md)은 고객 자료가 없는
+단방향 알림과 로컬 fallback만 제공하며 원격 승인 입력은 제공하지 않습니다.
 
 Customer material must never be committed to this public repository. It lives
 only in a private registry outside the repository, with one independent Git

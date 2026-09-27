@@ -45,6 +45,7 @@ from .model_executor import (
     create_worktree,
     validate_worktree,
 )
+from .notifications import dispatch_pending_notifications
 from .roles import list_role_specs, serialize_role_spec
 from .review_package import build_review_materials
 from .skill_promotion import (
@@ -344,6 +345,19 @@ def build_parser() -> argparse.ArgumentParser:
     audit_push.add_argument("--tag", action="append", required=True)
     audit_push.add_argument("--approval-file", type=Path, required=True)
     audit_push.add_argument("--idempotency-key", required=True)
+
+    notification = commands.add_parser(
+        "notification", help="Dispatch outbound-only CEO attention notices"
+    )
+    notification_commands = notification.add_subparsers(
+        dest="notification_command", required=True
+    )
+    notification_dispatch = notification_commands.add_parser("dispatch")
+    notification_dispatch.add_argument("--outbox", type=Path, required=True)
+    notification_dispatch.add_argument("--config", type=Path)
+    notification_dispatch.add_argument(
+        "--dashboard-url", default="http://127.0.0.1:8780/"
+    )
 
     events = commands.add_parser("events", help="Export the append-only ledger")
     event_commands = events.add_subparsers(dest="events_command", required=True)
@@ -864,6 +878,16 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
             tags=args.tag,
             approval_file=args.approval_file,
             idempotency_key=args.idempotency_key,
+        )
+    if (
+        args.command == "notification"
+        and args.notification_command == "dispatch"
+    ):
+        return dispatch_pending_notifications(
+            company,
+            outbox=args.outbox,
+            config_path=args.config,
+            dashboard_url=args.dashboard_url,
         )
     if args.command == "events" and args.events_command == "export":
         path = company.export_event_ledger(args.output)
