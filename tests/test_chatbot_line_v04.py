@@ -178,6 +178,18 @@ def test_skill_candidate_requires_full_evaluation_and_ceo_event(
             evaluation_event_id=evaluation["event_id"],
             idempotency_key="approve-skill-candidate",
         )
+        skill_source = candidate / "SKILL.md"
+        approved_bytes = skill_source.read_bytes()
+        skill_source.write_text("# Candidate changed after approval\n", encoding="utf-8")
+        with pytest.raises(ValidationError, match="approval Event"):
+            promote_skill_candidate(
+                company,
+                candidate,
+                approval_event_id=approval["event_id"],
+                destination_root=destination,
+                idempotency_key="promote-mutated-skill-candidate",
+            )
+        skill_source.write_bytes(approved_bytes)
         promoted = promote_skill_candidate(
             company,
             candidate,
