@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "line_id": "chatbot-v1",
+  "minimum_validation_passes": 3,
+  "source_lessons": "lessons/V02_PRODUCTION_CYCLES_KO.md",
+  "procedures": [
+    {
+      "id": "bounded-work-order",
+      "validation_passes": 4,
+      "evidence": "V0.2 production cycles 1, 2, and 3 plus synthetic customer B",
+      "evidence_run_ids": [
+        "run_e1037947ca3e4b80b2cc48f2c5341dbc",
+        "run_6906a56cae4c43cba701621d17378e0f",
+        "run_31219bfc8b734d0ab1105cf794191a64",
+        "run_755dbdcb15f74682987782ac76ec1902"
+      ],
+      "description": "One customer request is bound to one scoped WorkOrder."
+    },
+    {
+      "id": "single-model-call-with-limits",
+      "validation_passes": 4,
+      "evidence": "Accepted Runs in V0.2 cycles 1, 2, and 3 plus synthetic customer B",
+      "evidence_run_ids": [
+        "run_e1037947ca3e4b80b2cc48f2c5341dbc",
+        "run_6906a56cae4c43cba701621d17378e0f",
+        "run_31219bfc8b734d0ab1105cf794191a64",
+        "run_755dbdcb15f74682987782ac76ec1902"
+      ],
+      "description": "Each attempt uses one coding-agent process with time and token gates."
+    },
+    {
+      "id": "full-regression-before-adoption",
+      "validation_passes": 4,
+      "evidence": "Official rubric PASS in V0.2 cycles 1, 2, and 3 plus customer B DRAFT PASS pending CEO approval",
+      "evidence_run_ids": [
+        "run_e1037947ca3e4b80b2cc48f2c5341dbc",
+        "run_6906a56cae4c43cba701621d17378e0f",
+        "run_31219bfc8b734d0ab1105cf794191a64",
+        "run_755dbdcb15f74682987782ac76ec1902"
+      ],
+      "description": "Adoption requires the focused acceptance test and every existing evaluation."
+    }
+  ]
+}
