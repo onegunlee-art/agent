@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 from hashlib import sha256
 import json
+import re
 import subprocess
 import secrets
 import sqlite3
@@ -117,6 +118,40 @@ def _cost_summary(runs: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _request_group_id(run: dict[str, Any]) -> str:
+    explicit = run.get("production_request_id")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    branch = run.get("workspace_branch")
+    if isinstance(branch, str) and branch.strip():
+        return re.sub(
+            r"-(?:retry|final|attempt)(?:-\d+)?$",
+            "",
+            branch.strip(),
+            flags=re.IGNORECASE,
+        )
+    return "legacy-unclassified"
+
+
+def _request_groups(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for run in runs:
+        if not isinstance(run.get("usage_total_tokens"), int) and not run.get(
+            "workspace_branch"
+        ):
+            continue
+        group_id = _request_group_id(run)
+        grouped.setdefault(group_id, []).append(run)
+    return [
+        {
+            "id": group_id,
+            "runs": group_runs,
+            "summary": _cost_summary(group_runs),
+        }
+        for group_id, group_runs in grouped.items()
+    ]
+
+
 def _attention_kind(
     item: dict[str, Any],
     *,
@@ -209,8 +244,21 @@ def read_dashboard(
                 run["usage_total_tokens"] = _run_tokens(payload)
                 run["cost_status"] = payload.get("cost_status")
                 run["usage_status"] = payload.get("usage_status")
+                run["workspace_branch"] = payload.get("workspace_branch")
+                run["production_request_id"] = payload.get(
+                    "production_request_id"
+                )
+                run["diagnostic_only"] = payload.get("diagnostic_only")
+                run["production_execution"] = payload.get(
+                    "production_execution"
+                )
                 item["runs"].append(run)
-            item["cost_summary"] = _cost_summary(item["runs"])
+            item["request_groups"] = _request_groups(item["runs"])
+            item["cost_summary"] = (
+                item["request_groups"][0]["summary"]
+                if item["request_groups"]
+                else _cost_summary(item["runs"])
+            )
             rubric = connection.execute(
                 """
                 SELECT payload_json FROM evidence
@@ -438,6 +486,27 @@ def _render_page(snapshot: dict[str, Any], csrf_token: str, preview_url: str) ->
             if run_rows
             else '<p class="muted">실행 이력이 없습니다.</p>'
         )
+        request_rows: list[str] = []
+        for group in item.get("request_groups", []):
+            request_summary = group["summary"]
+            request_rows.append(
+                "<tr>"
+                f"<td><code>{html.escape(str(group['id']))}</code></td>"
+                f"<td>{html.escape(_format_tokens(request_summary['accepted_tokens']))}</td>"
+                f"<td>{html.escape(_format_tokens(request_summary['request_total_tokens']))}</td>"
+                f"<td>{request_summary['attempt_count']}회</td>"
+                "</tr>"
+            )
+        requests_html = (
+            '<details open><summary>요청별 원가 '
+            f'<span class="count">{len(request_rows)}건</span></summary>'
+            '<div class="table-wrap"><table><thead><tr><th>요청</th>'
+            '<th>채택 토큰</th><th>전체 토큰</th><th>시도</th></tr></thead><tbody>'
+            + "".join(request_rows)
+            + "</tbody></table></div></details>"
+            if request_rows
+            else ""
+        )
         work_order_id = html.escape(str(item["id"]), quote=True)
         cards.append(
             '<article class="work-card">'
@@ -449,16 +518,17 @@ def _render_page(snapshot: dict[str, Any], csrf_token: str, preview_url: str) ->
             f'<strong>{html.escape(str(item["status"]))}</strong>'
             "</div></div>"
             '<div class="cost-grid">'
-            '<section><span class="eyebrow">채택 Run 원가</span>'
+            '<section><span class="eyebrow">최근 요청 채택 Run 원가</span>'
             f'<strong>{html.escape(_format_tokens(summary["accepted_tokens"]))} 토큰</strong>'
             f'<small>{html.escape(_format_seconds(summary["accepted_duration_seconds"]))} · '
             f'{html.escape(_format_usd(summary["accepted_cost_usd"], unknown=summary["accepted_cost_usd"] is None))}</small></section>'
-            '<section><span class="eyebrow">요청 전체 원가</span>'
+            '<section><span class="eyebrow">최근 요청 전체 원가</span>'
             f'<strong>{html.escape(_format_tokens(summary["request_total_tokens"]))} 토큰</strong>'
             f'<small>{summary["attempt_count"]}회 시도 · '
             f'{html.escape(_format_seconds(summary["request_total_duration_seconds"]))} · '
             f'{html.escape(_format_usd(summary["request_total_cost_usd"], unknown=summary["request_has_unknown_usd"]))}</small></section>'
             "</div>"
+            f"{requests_html}"
             '<div class="signals">'
             f'<span>평가 <strong>{html.escape(str(rubric.get("verdict", "없음")))}</strong> '
             f'{html.escape(str(rubric.get("score", "-")))}</span>'

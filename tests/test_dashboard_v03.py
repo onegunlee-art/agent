@@ -20,6 +20,7 @@ def _model_outcome(
     duration: float,
     cost_usd: float,
     usage_status: str,
+    workspace_branch: str = "",
 ) -> ExecutorOutcome:
     return ExecutorOutcome(
         ok=True,
@@ -30,6 +31,7 @@ def _model_outcome(
         usage={"input_tokens": tokens - 10, "output_tokens": 10},
         usage_status=usage_status,
         usage_total_tokens=tokens,
+        workspace_branch=workspace_branch,
     )
 
 
@@ -110,6 +112,72 @@ def test_dashboard_prioritizes_ceo_attention_and_separates_request_cost(
     ]
     assert snapshot["last_backup"]["name"] == "ledger-20260927-010203.sqlite3"
     assert snapshot["last_backup"]["created_at"]
+
+
+def test_dashboard_separates_retries_for_each_production_request(
+    tmp_path: Path,
+) -> None:
+    with CompanyOS(tmp_path / "company") as company:
+        _, _, _, work_order = build_venture(company, "dashboard-request-groups")
+        company.record_model_execution(
+            work_order.id,
+            _model_outcome(
+                tokens=223_886,
+                duration=108.0,
+                cost_usd=0.0,
+                usage_status="WITHIN_LIMIT",
+                workspace_branch="wo/v02-cycle-2-suggestions",
+            ),
+            idempotency_key="dashboard-cycle-2-failed",
+        )
+        company.record_model_execution(
+            work_order.id,
+            _model_outcome(
+                tokens=256_569,
+                duration=135.0,
+                cost_usd=0.0,
+                usage_status="EXCEEDED",
+                workspace_branch="wo/v02-cycle-2-suggestions-retry",
+            ),
+            idempotency_key="dashboard-cycle-2-exceeded",
+        )
+        company.record_model_execution(
+            work_order.id,
+            _model_outcome(
+                tokens=100_188,
+                duration=69.0,
+                cost_usd=0.0,
+                usage_status="WITHIN_LIMIT",
+                workspace_branch="wo/v02-cycle-2-suggestions-final",
+            ),
+            idempotency_key="dashboard-cycle-2-done",
+        )
+        company.record_model_execution(
+            work_order.id,
+            _model_outcome(
+                tokens=96_392,
+                duration=72.0,
+                cost_usd=0.0,
+                usage_status="WITHIN_LIMIT",
+                workspace_branch="wo/v02-cycle-3-restroom",
+            ),
+            idempotency_key="dashboard-cycle-3-done",
+        )
+        db_path = company.db_path
+
+    snapshot = read_dashboard(db_path)
+    item = snapshot["work_orders"][0]
+
+    assert item["cost_summary"]["accepted_tokens"] == 96_392
+    assert item["cost_summary"]["request_total_tokens"] == 96_392
+    cycle_2 = next(
+        group
+        for group in item["request_groups"]
+        if group["id"] == "wo/v02-cycle-2-suggestions"
+    )
+    assert cycle_2["summary"]["accepted_tokens"] == 100_188
+    assert cycle_2["summary"]["request_total_tokens"] == 580_643
+    assert cycle_2["summary"]["attempt_count"] == 3
 
 
 def test_dashboard_page_shows_operating_summary_and_backup_time(
