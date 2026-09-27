@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 from hashlib import sha256
 import json
+import os
 import re
 import subprocess
 import secrets
@@ -625,10 +626,17 @@ def _cli_action_runner(
         ]
         if action == "request-change":
             command.extend(["--request", request_text])
+        environment = os.environ.copy()
+        source_root = str((root / "src").resolve())
+        existing_pythonpath = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = os.pathsep.join(
+            part for part in (source_root, existing_pythonpath) if part
+        )
         try:
             completed = subprocess.run(
                 command,
                 cwd=root,
+                env=environment,
                 check=False,
                 shell=False,
                 stdin=subprocess.DEVNULL,

@@ -119,6 +119,13 @@ Evidence로 채택되지 않는다. V0.2에서 만들어진 6개 모델 Run은 �
 .\.venv\Scripts\python.exe -m pytest -m integration tests\integration
 ```
 
+Git 체크아웃·tree·줄바꿈 재현 테스트에는 `slow` marker가 붙는다. 릴리스 관문과
+기본 전체 테스트는 이를 포함한다. 개발 중 빠른 루프에서만 명시적으로 제외한다.
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -m "not slow and not integration"
+```
+
 현재 `preview`는 LLM이 매 질문의 문장을 생성하는 챗봇이 아니라 합성 자료를
 결정적으로 검색하는 FAQ 미리보기다. 실제 모델 Codex는 이 프로그램과 데이터를
 수정하는 코딩 실행자로 사용된다. 알려진 답변의 출처는 `출처 보기` 버튼을

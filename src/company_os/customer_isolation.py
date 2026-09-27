@@ -34,6 +34,7 @@ from .utils import (
 
 _CLIENT_ID = re.compile(r"[a-z0-9][a-z0-9-]{1,63}")
 _CONFIG_NAME = "client.json"
+_DEFAULT_SYNC_FOLDER_MARKERS = ("onedrive", "dropbox", "google drive", "icloud")
 
 
 @dataclass(frozen=True)
@@ -89,7 +90,18 @@ def _validate_private_root(company_root: Path, private_root: Path) -> Path:
     private = private_root.resolve()
     if private == public or public in private.parents or private in public.parents:
         raise ValidationError("private customer repository must be outside public source")
-    if "onedrive" in str(private).casefold():
+    configured = [
+        marker.strip().casefold()
+        for marker in re.split(
+            r"[;,]", os.environ.get("AI_COMPANY_OS_EXTRA_SYNC_FOLDERS", "")
+        )
+        if marker.strip()
+    ]
+    path_text = str(private).casefold()
+    if any(
+        marker in path_text
+        for marker in (*_DEFAULT_SYNC_FOLDER_MARKERS, *configured)
+    ):
         raise ValidationError("private customer repository must not be in a sync folder")
     for candidate in (private, *private.parents):
         if (candidate / ".git").exists():
@@ -142,6 +154,147 @@ def _copy_public_templates(company_root: Path, client_root: Path) -> None:
                 "__pycache__", "*.pyc", ".pytest_cache", ".git", "var"
             ),
         )
+
+
+def _public_template_manifest(company_root: Path) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for relative in ("lines/chatbot", "src/company_os", "tests"):
+        source_root = contained_path(company_root.resolve(), relative)
+        if not source_root.is_dir():
+            raise ValidationError(f"public production template is missing: {relative}")
+        for source in sorted(source_root.rglob("*"), key=lambda item: item.as_posix()):
+            if source.is_symlink():
+                raise ValidationError("public production templates must not contain symlinks")
+            if not source.is_file() or source.name.endswith((".pyc", ".pyo")):
+                continue
+            if any(part in {"__pycache__", ".pytest_cache", ".git", "var"} for part in source.parts):
+                continue
+            entries.append(
+                {
+                    "path": source.relative_to(company_root).as_posix(),
+                    "sha256": sha256_file(source),
+                    "size": source.stat().st_size,
+                }
+            )
+    return entries
+
+
+def _public_template_sha256(company_root: Path) -> str:
+    return _tree_sha256(_public_template_manifest(company_root.resolve()))
+
+
+def template_sync_approval_text(
+    company_root: str | Path,
+    private_root: str | Path,
+    client_id: str,
+) -> str:
+    """Return the exact CEO sentence binding a template sync candidate."""
+
+    client = _valid_client_id(client_id)
+    policy = load_client_policy(private_root, client)
+    before_tree = _git(policy.client_root, "rev-parse", "HEAD^{tree}")
+    template_sha = _public_template_sha256(Path(company_root))
+    return (
+        f"고객 {client}의 템플릿 동기화(현재 tree: {before_tree}, "
+        f"공개 템플릿 SHA-256: {template_sha})를 APPROVED로 승인합니다."
+    )
+
+
+def sync_client_templates(
+    company: CompanyOS,
+    private_root: str | Path,
+    client_id: str,
+    *,
+    approval_file: str | Path,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Apply one hash-bound public template snapshot to an isolated client repo."""
+
+    policy = load_client_policy(private_root, client_id, company=company)
+    if _git(policy.client_root, "status", "--porcelain"):
+        raise ValidationError("client repository must be clean before template sync")
+    before_tree = _git(policy.client_root, "rev-parse", "HEAD^{tree}")
+    template_sha = _public_template_sha256(company.root)
+    expected_approval = template_sync_approval_text(
+        company.root, private_root, policy.client_id
+    )
+    approval = Path(approval_file).resolve()
+    if approval.is_symlink() or not approval.is_file():
+        raise ValidationError("template sync approval must be a regular file")
+    if approval.read_text(encoding="utf-8").strip() != expected_approval:
+        raise ValidationError("template sync approval text does not match candidate hashes")
+    command_payload = {
+        "client_id": policy.client_id,
+        "before_tree_oid": before_tree,
+        "public_template_sha256": template_sha,
+        "approval_sha256": sha256_file(approval),
+    }
+    try:
+        with company.store.transaction() as connection:
+            claim = company.store.claim_idempotency(
+                idempotency_key,
+                "sync_client_templates",
+                command_payload,
+                connection=connection,
+            )
+            if not claim.is_new:
+                if claim.completed and isinstance(claim.result, dict):
+                    return dict(claim.result)
+                raise ConflictError("client template sync is already in progress")
+            approval_event = company.store.append_event(
+                "CLIENT_TEMPLATE_SYNC_APPROVED",
+                aggregate_type="Client",
+                aggregate_id=policy.client_id,
+                payload={**command_payload, "actor": "CEO"},
+                connection=connection,
+            )
+    except IdempotencyConflict as exc:
+        raise ConflictError(str(exc)) from exc
+
+    for relative in ("lines/chatbot", "src/company_os", "tests"):
+        target = contained_path(policy.client_root, relative)
+        if target.exists():
+            _remove_repository_tree(target)
+        source = contained_path(company.root, relative)
+        shutil.copytree(
+            source,
+            target,
+            ignore=shutil.ignore_patterns(
+                "__pycache__", "*.pyc", ".pytest_cache", ".git", "var"
+            ),
+        )
+    _git(policy.client_root, "add", "--", "lines/chatbot", "src/company_os", "tests")
+    if _git(policy.client_root, "status", "--porcelain"):
+        _git(policy.client_root, "commit", "-q", "-m", "Sync reviewed public templates")
+    after_tree = _git(policy.client_root, "rev-parse", "HEAD^{tree}")
+    with company.store.transaction() as connection:
+        event = company.store.append_event(
+            "CLIENT_TEMPLATES_SYNCED",
+            aggregate_type="Client",
+            aggregate_id=policy.client_id,
+            payload={
+                **command_payload,
+                "after_tree_oid": after_tree,
+                "approval_event_id": str(approval_event["id"]),
+            },
+            connection=connection,
+        )
+        result = {
+            "status": "SYNCED",
+            "client_id": policy.client_id,
+            "before_tree_oid": before_tree,
+            "after_tree_oid": after_tree,
+            "public_template_sha256": template_sha,
+            "approval_event_id": str(approval_event["id"]),
+            "event_id": str(event["id"]),
+        }
+        company.store.complete_idempotency(
+            idempotency_key,
+            result,
+            command="sync_client_templates",
+            connection=connection,
+        )
+    return result
 
 
 def _initialize_client_repository(
@@ -798,3 +951,119 @@ def delete_client_data(
                     (idempotency_key, "delete_client_data"),
                 )
         raise
+
+
+def recover_client_deletion(
+    company: CompanyOS,
+    private_root: str | Path,
+    client_id: str,
+    *,
+    deletion_idempotency_key: str,
+) -> dict[str, Any]:
+    """Recover a deletion interrupted between filesystem removal and Event commit."""
+
+    private = Path(private_root).resolve()
+    client = _valid_client_id(client_id)
+    with company.store.transaction(immediate=False) as connection:
+        row = connection.execute(
+            "SELECT * FROM idempotency WHERE key = ?",
+            (deletion_idempotency_key,),
+        ).fetchone()
+    if row is None or row["command"] != "delete_client_data":
+        raise ValidationError("claimed client deletion was not found")
+    if row["status"] == "COMPLETED" and row["result_json"]:
+        result = json.loads(row["result_json"])
+        if result.get("client_id") != client:
+            raise ConflictError("deletion idempotency key belongs to another client")
+        return dict(result)
+    request = json.loads(row["request_json"] or "{}")
+    if request.get("client_id") != client:
+        raise ConflictError("deletion idempotency key belongs to another client")
+
+    client_root = contained_path(private, "clients", client)
+    backup_root = contained_path(private, "backups", client)
+    if client_root.exists() or backup_root.exists():
+        with company.store.transaction() as connection:
+            company.store.append_event(
+                "CUSTOMER_DELETION_RECOVERY_RESET",
+                aggregate_type="Client",
+                aggregate_id=client,
+                payload={
+                    "deletion_idempotency_key": deletion_idempotency_key,
+                    "active_data_remains": client_root.exists(),
+                    "backup_data_remains": backup_root.exists(),
+                    "status": "RETRY_ALLOWED",
+                },
+                connection=connection,
+            )
+            connection.execute(
+                "DELETE FROM idempotency WHERE key = ? AND command = ? "
+                "AND status = 'CLAIMED'",
+                (deletion_idempotency_key, "delete_client_data"),
+            )
+        return {"status": "RETRY_ALLOWED", "client_id": client}
+
+    counts = request.get("deletion_scope_counts", {})
+    deleted_scopes = {
+        "active": {
+            "file_count": int(counts.get("active", 0)),
+            "removed": True,
+        },
+        "backup": {
+            "file_count": int(counts.get("backup", 0)),
+            "removed": True,
+        },
+        "git_history": {
+            "file_count": int(counts.get("git_history", 0)),
+            "removed": True,
+            "repository_directory_removed": True,
+        },
+    }
+    certificate_name = (
+        f"{client}-recovered-{str(row['payload_hash'])[:12]}.json"
+    )
+    certificate_path = contained_path(private, "deletion-evidence", certificate_name)
+    certificate = {
+        "schema_version": 1,
+        "status": "DELETED",
+        **request,
+        "deleted_scopes": deleted_scopes,
+        "deleted_at": utc_now(),
+        "raw_customer_data_retained": False,
+        "recovered_from_interruption": True,
+        "deletion_idempotency_key": deletion_idempotency_key,
+    }
+    if not certificate_path.exists():
+        atomic_write_json(certificate_path, certificate)
+    certificate_sha = sha256_file(certificate_path)
+    with company.store.transaction() as connection:
+        event = company.store.append_event(
+            "CUSTOMER_DATA_DELETED",
+            aggregate_type="Client",
+            aggregate_id=client,
+            payload={
+                **request,
+                "deleted_scopes": deleted_scopes,
+                "certificate_path": f"deletion-evidence/{certificate_name}",
+                "certificate_sha256": certificate_sha,
+                "actor": "CEO",
+                "recovered_from_interruption": True,
+            },
+            connection=connection,
+        )
+        result = {
+            "status": "DELETED",
+            "client_id": client,
+            "event_id": str(event["id"]),
+            "certificate_path": str(certificate_path),
+            "certificate_sha256": certificate_sha,
+            "deleted_file_count": int(request.get("deleted_file_count", 0)),
+            "recovered": True,
+        }
+        company.store.complete_idempotency(
+            deletion_idempotency_key,
+            result,
+            command="delete_client_data",
+            connection=connection,
+        )
+    return result

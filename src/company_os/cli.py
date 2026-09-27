@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .application import CompanyOS, ExistingArtifactExecutor
+from .audit_events import (
+    record_claude_verdict_archived,
+    record_source_pushed,
+)
 from .dashboard import record_dashboard_action, serve_dashboard
 from .customer_isolation import (
     backup_client_data,
@@ -17,8 +21,10 @@ from .customer_isolation import (
     delete_client_data,
     initialize_client,
     load_client_policy,
+    recover_client_deletion,
     restore_client_backup,
     save_isolated_evaluation_draft,
+    sync_client_templates,
     validate_client_execution,
     verify_client_backup,
 )
@@ -285,6 +291,17 @@ def build_parser() -> argparse.ArgumentParser:
     client_delete.add_argument("--private-root", type=Path, required=True)
     client_delete.add_argument("--confirm-client-id", required=True)
     client_delete.add_argument("--idempotency-key", required=True)
+    client_recover_delete = client_commands.add_parser("recover-delete")
+    client_recover_delete.add_argument("client_id")
+    client_recover_delete.add_argument("--private-root", type=Path, required=True)
+    client_recover_delete.add_argument(
+        "--deletion-idempotency-key", required=True
+    )
+    client_sync = client_commands.add_parser("sync-templates")
+    client_sync.add_argument("client_id")
+    client_sync.add_argument("--private-root", type=Path, required=True)
+    client_sync.add_argument("--approval-file", type=Path, required=True)
+    client_sync.add_argument("--idempotency-key", required=True)
 
     ledger = commands.add_parser("ledger", help="Back up, verify, or restore the ledger")
     ledger_commands = ledger.add_subparsers(dest="ledger_command", required=True)
@@ -305,6 +322,28 @@ def build_parser() -> argparse.ArgumentParser:
     recovery_restore.add_argument("--to-root", type=Path, required=True)
     commands.add_parser("status", help="Show durable company state")
     commands.add_parser("inbox", help="Show pending Decision and Approval items")
+
+    audit = commands.add_parser("audit", help="Record bounded reviewed audit events")
+    audit_commands = audit.add_subparsers(dest="audit_command", required=True)
+    audit_verdict = audit_commands.add_parser("archive-verdict")
+    audit_verdict.add_argument("--file", type=Path, required=True)
+    audit_verdict.add_argument("--expected-sha256", required=True)
+    audit_verdict.add_argument(
+        "--provenance",
+        choices=(
+            "ORIGINAL",
+            "USER_SUPPLIED_TRANSCRIPT",
+            "USER_SUPPLIED_TRANSCRIPT_SUMMARY",
+        ),
+        required=True,
+    )
+    audit_verdict.add_argument("--idempotency-key", required=True)
+    audit_push = audit_commands.add_parser("source-pushed")
+    audit_push.add_argument("--remote-url", required=True)
+    audit_push.add_argument("--commit", required=True)
+    audit_push.add_argument("--tag", action="append", required=True)
+    audit_push.add_argument("--approval-file", type=Path, required=True)
+    audit_push.add_argument("--idempotency-key", required=True)
 
     events = commands.add_parser("events", help="Export the append-only ledger")
     event_commands = events.add_subparsers(dest="events_command", required=True)
@@ -744,6 +783,21 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
                     args.bundle, args.to_private_root
                 ),
             }
+        if args.client_command == "recover-delete":
+            return recover_client_deletion(
+                company,
+                args.private_root,
+                args.client_id,
+                deletion_idempotency_key=args.deletion_idempotency_key,
+            )
+        if args.client_command == "sync-templates":
+            return sync_client_templates(
+                company,
+                args.private_root,
+                args.client_id,
+                approval_file=args.approval_file,
+                idempotency_key=args.idempotency_key,
+            )
         return delete_client_data(
             company,
             args.private_root,
@@ -794,6 +848,23 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         }
     if args.command == "inbox":
         return company.inbox()
+    if args.command == "audit" and args.audit_command == "archive-verdict":
+        return record_claude_verdict_archived(
+            company,
+            args.file,
+            expected_sha256=args.expected_sha256,
+            provenance=args.provenance,
+            idempotency_key=args.idempotency_key,
+        )
+    if args.command == "audit" and args.audit_command == "source-pushed":
+        return record_source_pushed(
+            company,
+            remote_url=args.remote_url,
+            commit=args.commit,
+            tags=args.tag,
+            approval_file=args.approval_file,
+            idempotency_key=args.idempotency_key,
+        )
     if args.command == "events" and args.events_command == "export":
         path = company.export_event_ledger(args.output)
         return {"status": "EXPORTED", "path": path}
