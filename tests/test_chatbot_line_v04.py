@@ -207,6 +207,7 @@ def test_synthetic_customer_b_delivery_candidate() -> None:
     intake = json.loads((customer_root / "customer_input.json").read_text("utf-8"))
     data = json.loads((customer_root / "faq_data.json").read_text("utf-8"))
     cases = json.loads((customer_root / "eval_cases.json").read_text("utf-8"))
+    delivery = json.loads((customer_root / "delivery_report.json").read_text("utf-8"))
 
     validate_customer_material(intake, data)
     assert cases == draft_adversarial_evaluation(intake)
@@ -217,3 +218,9 @@ def test_synthetic_customer_b_delivery_candidate() -> None:
     assert report.verdict == "PASS"
     assert report.score == 1.0
     assert answer("케이크 말고 빵 있어요?", data)["matched_id"] == "faq-bread"
+    assert delivery["status"] == "DELIVERY_CANDIDATE"
+    assert delivery["model_run"]["production_execution"] is True
+    assert delivery["executor_change"]["provenance"] == "CAPTURED_AT_EXECUTION"
+    assert delivery["builder_followup_product_changes"] == []
+    assert delivery["evaluation"]["status"] == "DRAFT"
+    assert delivery["evaluation"]["official"] is False

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "customer_id": "synthetic-bakery-b",
+  "status": "DELIVERY_CANDIDATE",
+  "production_line": "chatbot-v1",
+  "work_order_id": "work_order_7a9cab0274c84f5c8159713b02405db2",
+  "model_run": {
+    "run_id": "run_755dbdcb15f74682987782ac76ec1902",
+    "execution_id": "execution_335dd58219824318a4b6f50fa8c98bf0",
+    "fence_token": 1,
+    "outcome": "DONE",
+    "production_execution": true,
+    "diagnostic_only": false,
+    "usage_total_tokens": 137493,
+    "duration_seconds": 86.224798,
+    "model_calls": 1,
+    "token_limit": 250000
+  },
+  "executor_change": {
+    "changed_files": ["examples/synthetic-cafe-b/faq_data.json"],
+    "faq_data_sha256": "62a02aaebabbc255e2dab62828d92bfee17f8f9bb83f29f650f81e4c9ca69260",
+    "workspace_diff_sha256": "86e14cc48ce503a3c6fddc6eafba47e8f58211cbd4d2fa530934a505bb8533da",
+    "reproducibility_evidence_id": "evidence_c7b07db1b032489e87691f2a468263a5",
+    "provenance": "CAPTURED_AT_EXECUTION"
+  },
+  "builder_followup_product_changes": [],
+  "inputs": {
+    "customer_input_sha256": "e797e7b56fef697a5002d9631e043690ac285c44edec9c289af9793da5ba6731",
+    "evaluation_spec_sha256": "afe1bcc8681684689d9a7e3d0703d5afc6d5c04a88f2a8d60f2e81d7b9c49122"
+  },
+  "evaluation": {
+    "status": "DRAFT",
+    "official": false,
+    "verdict": "PASS",
+    "score": 1.0,
+    "threshold": 1.0,
+    "case_count": 9,
+    "rubric_evidence_sha256": "51395035e38e28f415d4492a1db8188b203ed5b19fecbeb5d5bcdf7947e935e1",
+    "evidence_id": "evidence_849d8f76c2b84836835bf7b8a313f8a9",
+    "report_file_sha256": "294fbcb91e6bd7f375cf63781a7ef28174a8fa1f884ded058d534d5df0831d02"
+  },
+  "delivery_note": "합성 자료 전용 납품 후보입니다. DRAFT 평가는 공식 CEO 승인으로 해석하지 않습니다."
+}
