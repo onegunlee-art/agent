@@ -117,6 +117,15 @@ def evaluate_case(
         result.checks.append(
             Check("must_not_include", not _contains(text, needle), needle)
         )
+    for item in case.get("must_not_match_regex", []):
+        pattern = str(item)
+        result.checks.append(
+            Check(
+                "must_not_match_regex",
+                re.search(pattern, text) is None,
+                pattern,
+            )
+        )
 
     result.passed = (
         bool(result.checks)

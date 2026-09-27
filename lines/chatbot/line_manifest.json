@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "line_id": "chatbot-v1",
+  "minimum_validation_passes": 3,
+  "source_lessons": "lessons/V02_PRODUCTION_CYCLES_KO.md",
+  "procedures": [
+    {
+      "id": "bounded-work-order",
+      "validation_passes": 3,
+      "evidence": "V0.2 production cycles 1, 2, and 3",
+      "description": "One customer request is bound to one scoped WorkOrder."
+    },
+    {
+      "id": "single-model-call-with-limits",
+      "validation_passes": 3,
+      "evidence": "Accepted Runs in V0.2 cycles 1, 2, and 3",
+      "description": "Each attempt uses one coding-agent process with time and token gates."
+    },
+    {
+      "id": "full-regression-before-adoption",
+      "validation_passes": 3,
+      "evidence": "Official rubric PASS in V0.2 cycles 1, 2, and 3",
+      "description": "Adoption requires the focused acceptance test and every existing evaluation."
+    }
+  ]
+}

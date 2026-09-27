@@ -131,6 +131,21 @@ company --root C:\dev\ai-company-os evaluation run <work-order-id> `
   --idempotency-key <unique-official-evaluation-key>
 ```
 
+V0.4 chatbot-line assets live in `lines/chatbot/`. Automatically generated
+adversarial questions remain DRAFT until hash-bound CEO approval. Reusable
+candidate skills follow this enforced sequence:
+
+```powershell
+company --root C:\dev\ai-company-os skill evaluate <candidate-dir>
+company --root C:\dev\ai-company-os skill approve <candidate-dir> `
+  --evaluation-event <passing-event-id>
+company --root C:\dev\ai-company-os skill promote <candidate-dir> `
+  --approval-event <ceo-approval-event-id>
+```
+
+Promotion rejects a changed candidate, an incomplete evaluation suite, or a
+missing CEO approval Event.
+
 The approval command fails if the file hash, case count, threshold, or exact
 approval sentence differs. The official report also binds a clean Git commit
 and tracked-tree SHA-256 and never overwrites an earlier DRAFT report.

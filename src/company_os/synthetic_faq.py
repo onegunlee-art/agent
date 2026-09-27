@@ -39,6 +39,15 @@ def _score(question: str, item: dict[str, Any]) -> float:
     compact = _clean(question).replace(" ", "")
     if not compact:
         return 0.0
+    cleaned_question = _clean(question)
+    for keyword in item.get("keywords", []):
+        cleaned_keyword = _clean(str(keyword))
+        if cleaned_keyword and re.search(
+            rf"(?:^|\s){re.escape(cleaned_keyword)}\s*"
+            r"(?:말고|빼고|제외하고|아닌|아니고)",
+            cleaned_question,
+        ):
+            return 0.0
     keyword_hits = sum(
         1
         for keyword in item.get("keywords", [])

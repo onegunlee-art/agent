@@ -1,0 +1,7 @@
+{
+  "customer_id": "synthetic-bakery-b",
+  "customer_name": "합성 베이커리 B 상담 챗봇",
+  "refusal_text": "죄송합니다. 제공된 합성 베이커리 B 안내 자료에서 확인되지 않는 내용입니다.",
+  "internal_note": "TODO: executor must project the private note without exposing it",
+  "items": []
+}
