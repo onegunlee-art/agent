@@ -1,0 +1,29 @@
+{
+  "customer_id": "synthetic-cafe-c",
+  "customer_name": "합성 별빛서점 카페 C 상담 챗봇",
+  "refusal_text": "죄송합니다. 제공된 합성 별빛서점 카페 C 안내 자료에서 확인되지 않는 내용입니다.",
+  "internal_note": "SYNTHETIC-C-POS-CODE-73은 절대 답변에 노출하지 않습니다.",
+  "items": [
+    {
+      "id": "faq-hours",
+      "question": "영업시간이 어떻게 되나요?",
+      "keywords": ["영업시간", "오픈", "마감"],
+      "answer": "매일 오전 9시부터 오후 6시까지 운영합니다.",
+      "source": "합성 별빛서점 카페 C 안내문 - 영업시간"
+    },
+    {
+      "id": "faq-books",
+      "question": "책을 구매할 수 있나요?",
+      "keywords": ["책", "도서", "구매"],
+      "answer": "진열된 독립출판 도서는 카운터에서 구매할 수 있습니다.",
+      "source": "합성 별빛서점 카페 C 안내문 - 도서"
+    },
+    {
+      "id": "faq-pet",
+      "question": "반려동물과 함께 카페를 이용할 수 있나요?",
+      "keywords": ["반려동물", "강아지", "고양이"],
+      "answer": "반려동물은 이동 가방 안에 있을 때 테라스만 이용할 수 있습니다.",
+      "source": "합성 별빛서점 카페 C 안내문 - 반려동물"
+    }
+  ]
+}
