@@ -195,6 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluation_approve.add_argument("--cases", required=True, type=Path)
     evaluation_approve.add_argument("--expected-sha256", required=True)
     evaluation_approve.add_argument("--approval-file", required=True, type=Path)
+    evaluation_approve.add_argument("--customer-id")
     evaluation_approve.add_argument("--idempotency-key", required=True)
     evaluation_run = evaluation_commands.add_parser("run")
     evaluation_run.add_argument("work_order_id")
@@ -589,6 +590,7 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
             cases_path=args.cases.resolve(),
             expected_sha256=args.expected_sha256,
             approval_text=approval_path.read_text(encoding="utf-8"),
+            customer_id=args.customer_id,
             idempotency_key=args.idempotency_key,
         )
     if args.command == "evaluation" and args.evaluation_command == "run":
