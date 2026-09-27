@@ -232,6 +232,11 @@ handoff rules. Customer handling is defined in
 [파일럿 체크리스트](docs/V05_PILOT_CHECKLIST_KO.md). The remaining V0.5
 boundaries are explicit in [known limitations](docs/known-limitations.md).
 
+Customer material must never be committed to this public repository. It lives
+only in a private registry outside the repository, with one independent Git
+repository per customer. Runtime ledgers, backups, deletion certificates, and
+handoffs are local untracked state as well.
+
 ## Current boundaries
 
 The OS still has exactly three C-level RoleSpecs: CTO, CPO, and CMO. It does

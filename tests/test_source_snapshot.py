@@ -13,6 +13,8 @@ import zipfile
 
 import pytest
 
+pytestmark = pytest.mark.slow
+
 from company_os.source_snapshot import (
     GitSourceSnapshot,
     SourceSnapshot,

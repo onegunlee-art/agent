@@ -25,4 +25,5 @@ addopts = "-ra -m 'not integration'"
 pythonpath = ["src"]
 markers = [
   "integration: opt-in test that invokes an installed external executable",
+  "slow: deterministic Git/hash reproduction test kept in release gates",
 ]
