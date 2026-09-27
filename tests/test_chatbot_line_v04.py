@@ -17,6 +17,7 @@ from company_os.skill_promotion import (
     approve_skill_candidate,
     evaluate_skill_candidate,
     promote_skill_candidate,
+    skill_approval_text,
 )
 from company_os.synthetic_faq import answer, evaluate
 
@@ -174,10 +175,24 @@ def test_skill_candidate_requires_full_evaluation_and_ceo_event(
             runner=lambda *_args, **_kwargs: completed,
             idempotency_key="evaluate-skill-candidate",
         )
+        approval_sentence = skill_approval_text(
+            "safe-faq-suggestions",
+            evaluation["candidate_tree_sha256"],
+            evaluation["event_id"],
+        )
+        with pytest.raises(ValidationError, match="approval text"):
+            approve_skill_candidate(
+                company,
+                candidate,
+                evaluation_event_id=evaluation["event_id"],
+                approval_text="approve it",
+                idempotency_key="approve-skill-candidate-wrong-text",
+            )
         approval = approve_skill_candidate(
             company,
             candidate,
             evaluation_event_id=evaluation["event_id"],
+            approval_text=approval_sentence,
             idempotency_key="approve-skill-candidate",
         )
         skill_source = candidate / "SKILL.md"

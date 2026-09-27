@@ -139,7 +139,7 @@ candidate skills follow this enforced sequence:
 ```powershell
 company --root C:\dev\ai-company-os skill evaluate <candidate-dir>
 company --root C:\dev\ai-company-os skill approve <candidate-dir> `
-  --evaluation-event <passing-event-id>
+  --evaluation-event <passing-event-id> --approval-file <ceo-approval.txt>
 company --root C:\dev\ai-company-os skill promote <candidate-dir> `
   --approval-event <ceo-approval-event-id>
 ```

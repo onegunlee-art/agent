@@ -67,6 +67,17 @@ def candidate_tree_sha256(candidate_dir: str | Path) -> str:
     return sha256(canonical_json(entries).encode("utf-8")).hexdigest()
 
 
+def skill_approval_text(
+    candidate_id: str,
+    candidate_hash: str,
+    evaluation_event_id: str,
+) -> str:
+    return (
+        f"Skill candidate {candidate_id} (SHA-256: {candidate_hash}) evaluated by "
+        f"Event {evaluation_event_id} is APPROVED for promotion."
+    )
+
+
 def _event(company: CompanyOS, event_id: str) -> tuple[sqlite3.Row, dict[str, Any]]:
     row = company.store.query_one("SELECT * FROM events WHERE id = ?", (event_id,))
     if row is None:
@@ -197,6 +208,7 @@ def approve_skill_candidate(
     candidate_dir: str | Path,
     *,
     evaluation_event_id: str,
+    approval_text: str,
     idempotency_key: str,
 ) -> dict[str, Any]:
     root, manifest = _manifest(candidate_dir)
@@ -210,11 +222,21 @@ def approve_skill_candidate(
         or evaluation.get("all_existing_evaluations_passed") is not True
     ):
         raise ValidationError("candidate does not have a current passing evaluation")
+    expected_approval = skill_approval_text(
+        str(manifest["candidate_id"]),
+        candidate_hash,
+        evaluation_event_id,
+    )
+    if approval_text.strip() != expected_approval:
+        raise ValidationError("CEO skill approval text does not match the candidate hash")
     command_payload = {
         "candidate_id": manifest["candidate_id"],
         "candidate_tree_sha256": candidate_hash,
         "evaluation_event_id": evaluation_event_id,
         "evaluation_report_sha256": evaluation["evaluation_report_sha256"],
+        "approval_text_sha256": sha256(
+            approval_text.strip().encode("utf-8")
+        ).hexdigest(),
     }
 
     def operation(connection: sqlite3.Connection) -> dict[str, Any]:

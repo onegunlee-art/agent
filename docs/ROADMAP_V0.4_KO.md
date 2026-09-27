@@ -18,7 +18,8 @@ V0.4는 세 번의 V0.2 생산 사이클에서 반복 검증된 절차만
 
 `company skill evaluate`는 후보 manifest가 선언한 기존 평가 경로를 전부 실행하고
 candidate tree 해시와 결과 파일 해시를 Event에 기록한다. PASS 뒤 CEO가
-`company skill approve`로 승인 Event를 추가해야 `company skill promote`가 원자적으로
+후보 해시·평가 Event에 정확히 결속된 승인문을 파일로 남기고 `company skill
+approve`로 승인 Event를 추가해야 `company skill promote`가 원자적으로
 `lines/chatbot/skills/`에 복사할 수 있다. 후보 바이트가 바뀌면 이전 평가와 승인은
 무효다.
 

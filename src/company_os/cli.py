@@ -223,6 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     skill_approve = skill_commands.add_parser("approve")
     skill_approve.add_argument("candidate", type=Path)
     skill_approve.add_argument("--evaluation-event")
+    skill_approve.add_argument("--approval-file", type=Path)
     skill_approve.add_argument("--idempotency-key")
     skill_promote = skill_commands.add_parser("promote")
     skill_promote.add_argument("candidate", type=Path)
@@ -579,10 +580,20 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         if args.skill_command == "approve":
             if not args.evaluation_event:
                 raise ValueError("skill approve requires --evaluation-event")
+            if args.approval_file is None:
+                raise ValueError("skill approve requires --approval-file")
+            approval_path = args.approval_file.resolve()
+            if (
+                approval_path.is_symlink()
+                or not approval_path.is_file()
+                or approval_path.stat().st_size > 64 * 1024
+            ):
+                raise ValueError("skill approval file must be regular and at most 64 KiB")
             return approve_skill_candidate(
                 company,
                 candidate,
                 evaluation_event_id=args.evaluation_event,
+                approval_text=approval_path.read_text(encoding="utf-8"),
                 idempotency_key=args.idempotency_key
                 or f"cli-skill-approve:{candidate_hash}:{args.evaluation_event}",
             )
