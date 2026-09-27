@@ -99,11 +99,16 @@ Local browser surfaces bind only to `127.0.0.1`:
 
 ```powershell
 company --root C:\dev\ai-company-os preview --port 8765
-company --root C:\dev\ai-company-os dashboard --port 8780
+company --root C:\dev\ai-company-os dashboard --port 8780 `
+  --backup-dir "$env:LOCALAPPDATA\ai-company-os\backups"
 ```
 
 Open `http://127.0.0.1:8765/` for the chatbot and
 `http://127.0.0.1:8780/` for the work dashboard.
+The dashboard reads SQLite in query-only mode. Its approval and change-request
+buttons invoke a separate `company dashboard-action` CLI process that appends
+an Event; they do not overwrite WorkOrder state or constitute formal
+hash-bound evaluation approval.
 Known FAQ answers show an explicit `출처 보기` control; the source is collapsed
 until the user expands it. Refusals do not display a source control.
 

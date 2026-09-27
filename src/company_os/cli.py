@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .application import CompanyOS, ExistingArtifactExecutor
-from .dashboard import serve_dashboard
+from .dashboard import record_dashboard_action, serve_dashboard
 from .errors import CompanyOSError
 from .ledger_backup import (
     backup,
@@ -189,6 +189,22 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument(
         "--preview-url", default="http://127.0.0.1:8765/"
     )
+    dashboard.add_argument("--backup-dir", type=Path)
+    dashboard_action = commands.add_parser(
+        "dashboard-action",
+        help="Append one dashboard CEO action Event through the CLI",
+    )
+    dashboard_action_commands = dashboard_action.add_subparsers(
+        dest="dashboard_action_command",
+        required=True,
+    )
+    dashboard_approve = dashboard_action_commands.add_parser("approve")
+    dashboard_approve.add_argument("work_order_id")
+    dashboard_approve.add_argument("--idempotency-key", required=True)
+    dashboard_change = dashboard_action_commands.add_parser("request-change")
+    dashboard_change.add_argument("work_order_id")
+    dashboard_change.add_argument("--request", required=True)
+    dashboard_change.add_argument("--idempotency-key", required=True)
 
     ledger = commands.add_parser("ledger", help="Back up, verify, or restore the ledger")
     ledger_commands = ledger.add_subparsers(dest="ledger_command", required=True)
@@ -502,8 +518,21 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
             company.db_path,
             port=args.port,
             preview_url=args.preview_url,
+            backup_dir=args.backup_dir,
         )
         return {"status": "STOPPED"}
+    if args.command == "dashboard-action":
+        return record_dashboard_action(
+            company,
+            args.work_order_id,
+            action=args.dashboard_action_command,
+            request_text=(
+                args.request
+                if args.dashboard_action_command == "request-change"
+                else ""
+            ),
+            idempotency_key=args.idempotency_key,
+        )
     if args.command == "ledger" and args.ledger_command == "backup":
         return backup(company.db_path, args.dir)
     if args.command == "ledger" and args.ledger_command == "verify":

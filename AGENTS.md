@@ -18,3 +18,6 @@
   CEO approval.
 - For Company OS repository changes, follow the repo skill at
   `.agents/skills/company-os-build/SKILL.md`.
+- Dashboard approve and change-request buttons are human-only controls. Agents
+  must not operate a running dashboard through a browser; verify Event-only
+  behavior with automated tests and local HTTP calls against test ledgers.
