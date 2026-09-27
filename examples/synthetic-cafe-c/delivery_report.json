@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "customer_id": "synthetic-cafe-c",
+  "status": "DELIVERY_CANDIDATE",
+  "source": {
+    "commit": "3ebf1d50f52beb5f9d8780d1be33f04213322283",
+    "tree_oid": "750a0bec7342e10856d97ed7370a37938573148c"
+  },
+  "model": {
+    "run_id": "run_798976be2fcb4ffaac9713701fdb47fb",
+    "execution_id": "execution_2493f77b7b49461f89ddd6680f903cd0"
+  },
+  "evaluation": {
+    "evidence_id": "evidence_755000fe15fd40ed9271ce8fe5afb0ea",
+    "report_sha256": "cbfb1d3e9e7ff933cd7b1d29e71a987b01fca0ad2647f8f9276b426ca2e3afa9"
+  },
+  "approvals": {
+    "evaluation_event_id": "event_6cb478348a8e49e88b9aa9eddeaa846a",
+    "skill_promotion_event_id": "event_1c9fe6f62e174f1dbfafd985416838b7"
+  },
+  "review": {
+    "sha256": "c4ca0e5cedc77037234393330f87be4000b0e3182dd00ecc6f00b15bac3ac702",
+    "provenance": "USER_SUPPLIED_TRANSCRIPT"
+  },
+  "manifest": {
+    "files": [
+      {
+        "path": "customer_input.json",
+        "size": 310,
+        "sha256": "c9afd19ac90ae76486776a4f67cc6d4458e505ca5168b2765b6f475787bb2532"
+      },
+      {
+        "path": "deletion_certificate.json",
+        "size": 771,
+        "sha256": "bf054eaf7e1d9a2bde442d4f6a295d0637e78767bf4e5dea1c5b5ceb7cd140b2"
+      },
+      {
+        "path": "eval_cases.json",
+        "size": 1659,
+        "sha256": "643a1820f38c69b0ebea65839dbf5a02170d8816e6edfb2c2e7f1ace7fc19846"
+      },
+      {
+        "path": "faq_data.json",
+        "size": 1309,
+        "sha256": "4d22534004b8632dc96058e15c6d1cbb72437a0f2276645ad8805b985beae8fa"
+      },
+      {
+        "path": "official_rubric_report.json",
+        "size": 3770,
+        "sha256": "cbfb1d3e9e7ff933cd7b1d29e71a987b01fca0ad2647f8f9276b426ca2e3afa9"
+      }
+    ],
+    "sha256": "af77745f250665447a59da207f1fb235e50c58ebe9f431f39b1944a266c63b1c"
+  },
+  "lifecycle": {
+    "backup": {
+      "sha256": "fbe47c5fc6703482e93d9ab748d57e160dddfea6e6e9fa48f4ea37041b28779a",
+      "file_count": 224,
+      "verified": true,
+      "removed_by_customer_deletion": true
+    },
+    "deletion": {
+      "event_id": "event_7c3f553325ac4278a104e06c0074a4da",
+      "certificate_sha256": "bf054eaf7e1d9a2bde442d4f6a295d0637e78767bf4e5dea1c5b5ceb7cd140b2",
+      "raw_customer_data_retained": false,
+      "active_removed": true,
+      "backup_removed": true,
+      "git_history_removed": true
+    },
+    "elapsed_seconds": 80.76563499998883,
+    "usage": {
+      "model_calls": 1,
+      "input_tokens": 75536,
+      "cached_input_tokens": 65024,
+      "output_tokens": 770,
+      "reasoning_output_tokens": 103,
+      "accounting_total_tokens": 76306,
+      "cost_usd": null,
+      "cost_status": "UNAVAILABLE"
+    },
+    "builder_follow_up": {
+      "product_files_changed": 0,
+      "evaluation_draft_prompts_changed": 2,
+      "reason": "Corrected two ambiguous deterministic-evaluation questions; model product output remained unchanged."
+    }
+  },
+  "created_at": "2026-09-27T16:18:57.458019+00:00",
+  "signature_envelope": {
+    "format": "DSSE_COMPATIBLE_UNSIGNED",
+    "payload_type": "application/vnd.ai-company-os.delivery-report+json",
+    "payload_sha256": "47227fba87a3925d7a16183085916ac4738a64bf004d4bf565318ced31383004",
+    "signatures": []
+  }
+}
