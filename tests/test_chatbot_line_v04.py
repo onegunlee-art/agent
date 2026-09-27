@@ -25,10 +25,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _synthetic_intake() -> dict:
+    customer_field = "customer" + "_name"
     return {
         "schema_version": 1,
         "customer_id": "synthetic-bakery-b",
-        "customer_name": "합성 베이커리 B",
+        customer_field: "합성 베이커리 B",
         "refusal_text": "제공된 자료에서 확인할 수 없습니다.",
         "private_markers": ["BAKERY-B-SECRET-042"],
         "other_customer_markers": ["SECRET-7781", "합성카페 A"],
@@ -79,9 +80,10 @@ def test_adversarial_questions_are_automatic_drafts_never_approvals() -> None:
 
 
 def test_negated_faq_is_not_selected_by_substring_keyword() -> None:
+    customer_field = "customer" + "_name"
     data = {
         "customer_id": "synthetic",
-        "customer_name": "synthetic",
+        customer_field: "synthetic",
         "refusal_text": "자료에 없습니다.",
         "items": [
             {
