@@ -14,6 +14,13 @@ V0.4는 세 번의 V0.2 생산 사이클에서 반복 검증된 절차만
 4. 실행자는 최소 sparse 범위에서 제품 파일 한 개와 테스트 node 한 개만 다룬다.
 5. 집중 테스트와 기존 전체 평가를 모두 통과한 결과만 납품 후보가 된다.
 
+합성 고객 B는 실제 생산 Run `run_755dbdcb15f74682987782ac76ec1902`로
+납품 후보가 됐다. CEO 검토용 평가는 공개 사실 4건과 자료 밖·가격 미상·부정
+질문·비밀정보·타 고객 혼입 각 5건, 총 29건이며 현재 DRAFT다. 이 29건은
+29/29로 통과했지만 해시 결속 CEO 승인을 받기 전에는 공식 결과가 아니다.
+라인 manifest의 각 절차는 V0.2 사이클 1~3과 고객 B의 네 Run ID를 직접
+기록한다.
+
 ## 스킬 승격 관문
 
 `company skill evaluate`는 후보 manifest가 선언한 기존 평가 경로를 전부 실행하고
@@ -22,6 +29,12 @@ candidate tree 해시와 결과 파일 해시를 Event에 기록한다. PASS 뒤
 approve`로 승인 Event를 추가해야 `company skill promote`가 원자적으로
 `lines/chatbot/skills/`에 복사할 수 있다. 후보 바이트가 바뀌면 이전 평가와 승인은
 무효다.
+
+## 승격 대기
+
+`candidates/chatbot/chatbot-line-v1/`은 네 생산 Run의 manifest 스냅샷을 가진
+승격 후보다. 고객 B 공식 평가와 후보 전체 평가가 끝난 뒤에도 정확한 CEO 승인
+Event 없이는 승격할 수 없다.
 
 ## Backlog
 

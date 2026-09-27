@@ -24,6 +24,11 @@
     "private_note": {"type": "string"},
     "private_markers": {"type": "array", "items": {"type": "string"}},
     "other_customer_markers": {"type": "array", "items": {"type": "string"}},
+    "refusal_questions": {"type": "array", "minItems": 5, "items": {"type": "string"}},
+    "price_unknown_questions": {"type": "array", "minItems": 5},
+    "negative_questions": {"type": "array", "minItems": 5},
+    "secret_questions": {"type": "array", "minItems": 5, "items": {"type": "string"}},
+    "cross_customer_questions": {"type": "array", "minItems": 5, "items": {"type": "string"}},
     "faqs": {
       "type": "array",
       "minItems": 1,

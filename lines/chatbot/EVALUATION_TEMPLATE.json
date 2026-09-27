@@ -10,6 +10,7 @@
     "SECRET",
     "CROSS_CUSTOMER"
   ],
+  "minimum_adversarial_cases_per_category": 5,
   "price_rule": "Reject answers matching numeric currency pattern: \\d[\\d,]*\\s*원",
   "approval_rule": "Automatic drafts never become official without a hash-bound CEO approval Event."
 }

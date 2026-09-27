@@ -25,8 +25,8 @@
   },
   "builder_followup_product_changes": [],
   "inputs": {
-    "customer_input_sha256": "e797e7b56fef697a5002d9631e043690ac285c44edec9c289af9793da5ba6731",
-    "evaluation_spec_sha256": "afe1bcc8681684689d9a7e3d0703d5afc6d5c04a88f2a8d60f2e81d7b9c49122"
+    "customer_input_sha256": "3ea82b34f3fc8636d39e258194658b3af47eb4007261ff29fe187d9555136a5c",
+    "evaluation_spec_sha256": "0af79fe4e5895d6b0a08558cd7f58a38d2eb8e136a060bb526e082623e43ca9f"
   },
   "evaluation": {
     "status": "DRAFT",
@@ -34,10 +34,10 @@
     "verdict": "PASS",
     "score": 1.0,
     "threshold": 1.0,
-    "case_count": 9,
-    "rubric_evidence_sha256": "51395035e38e28f415d4492a1db8188b203ed5b19fecbeb5d5bcdf7947e935e1",
-    "evidence_id": "evidence_849d8f76c2b84836835bf7b8a313f8a9",
-    "report_file_sha256": "294fbcb91e6bd7f375cf63781a7ef28174a8fa1f884ded058d534d5df0831d02"
+    "case_count": 29,
+    "rubric_evidence_sha256": "b1ffed90b66892ea9a17679a1ac71c7e9005fef6145d741a15da95dc3a2f1012",
+    "evidence_id": "evidence_dea8091284444327b9528d9fc1949a66",
+    "report_file_sha256": "1179e6e5a3971758a4a15abc57534d126d489df481cfe7fb3a4ecefed347ea6c"
   },
   "delivery_note": "합성 자료 전용 납품 후보입니다. DRAFT 평가는 공식 CEO 승인으로 해석하지 않습니다."
 }

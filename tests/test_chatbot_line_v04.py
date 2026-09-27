@@ -23,6 +23,12 @@ from company_os.synthetic_faq import answer, evaluate
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PROVEN_PRODUCTION_RUN_IDS = {
+    "run_e1037947ca3e4b80b2cc48f2c5341dbc",
+    "run_6906a56cae4c43cba701621d17378e0f",
+    "run_31219bfc8b734d0ab1105cf794191a64",
+    "run_755dbdcb15f74682987782ac76ec1902",
+}
 
 
 def _synthetic_intake() -> dict:
@@ -110,13 +116,17 @@ def test_negated_faq_is_not_selected_by_substring_keyword() -> None:
     assert result["sources"] == ["faq-bread"]
 
 
-def test_chatbot_line_contains_only_three_cycle_proven_procedures() -> None:
+def test_chatbot_line_procedures_are_bound_to_four_production_runs() -> None:
     line_root = ROOT / "lines" / "chatbot"
     manifest = json.loads((line_root / "line_manifest.json").read_text("utf-8"))
 
     assert manifest["minimum_validation_passes"] == 3
     assert manifest["procedures"]
-    assert all(item["validation_passes"] >= 3 for item in manifest["procedures"])
+    assert all(item["validation_passes"] >= 4 for item in manifest["procedures"])
+    assert all(
+        set(item["evidence_run_ids"]) == PROVEN_PRODUCTION_RUN_IDS
+        for item in manifest["procedures"]
+    )
     assert {
         "WORK_ORDER_TEMPLATE.md",
         "CUSTOMER_INPUT_SCHEMA.json",
@@ -231,6 +241,25 @@ def test_skill_cli_exposes_evaluate_approve_and_promote() -> None:
         assert parsed.skill_command == command
 
 
+def test_chatbot_line_v1_candidate_carries_provenance_snapshot() -> None:
+    candidate_root = ROOT / "candidates" / "chatbot" / "chatbot-line-v1"
+    candidate = json.loads((candidate_root / "candidate.json").read_text("utf-8"))
+    line_manifest = json.loads(
+        (ROOT / "lines" / "chatbot" / "line_manifest.json").read_text("utf-8")
+    )
+    manifest_snapshot = json.loads(
+        (candidate_root / "line_manifest_snapshot.json").read_text("utf-8")
+    )
+
+    assert candidate["candidate_id"] == "chatbot-line-v1"
+    assert set(candidate["required_evaluation_paths"]) == {
+        "tests/test_synthetic_faq_v02.py",
+        "tests/test_chatbot_line_v04.py",
+    }
+    assert manifest_snapshot == line_manifest
+    assert (candidate_root / "SKILL.md").is_file()
+
+
 def test_synthetic_customer_b_delivery_candidate() -> None:
     customer_root = ROOT / "examples" / "synthetic-cafe-b"
     intake = json.loads((customer_root / "customer_input.json").read_text("utf-8"))
@@ -240,6 +269,18 @@ def test_synthetic_customer_b_delivery_candidate() -> None:
 
     validate_customer_material(intake, data)
     assert cases == draft_adversarial_evaluation(intake)
+    category_counts: dict[str, int] = {}
+    for case in cases["cases"]:
+        category = str(case["category"])
+        category_counts[category] = category_counts.get(category, 0) + 1
+    for category in (
+        "REFUSAL",
+        "PRICE_UNKNOWN",
+        "NEGATIVE_QUERY",
+        "SECRET",
+        "CROSS_CUSTOMER",
+    ):
+        assert category_counts[category] >= 5
     report = evaluate(
         customer_root / "eval_cases.json",
         customer_root / "faq_data.json",
