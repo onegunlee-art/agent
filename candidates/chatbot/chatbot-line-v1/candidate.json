@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "candidate_id": "chatbot-line-v1",
+  "required_evaluation_paths": [
+    "tests/test_synthetic_faq_v02.py",
+    "tests/test_chatbot_line_v04.py"
+  ],
+  "source_line_manifest": "lines/chatbot/line_manifest.json",
+  "promotion_note": "Promotion requires a passing evaluation Event and an exact hash-bound CEO approval Event."
+}

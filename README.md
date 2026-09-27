@@ -1,17 +1,18 @@
-# AI Company OS V0.2
+# AI Company OS V0.4
 
-Status: **V0.2 implementation candidate**. Real Codex CLI calls have edited
-both synthetic FAQ data and preview program code in isolated worktrees and
-passed their acceptance tests. V0.2 is not final until the CEO approves the
-evaluation cases and an independent Claude review returns PASS.
+Status: **V0.4 implementation candidate**. V0.2 and the V0.3 model-execution
+lease integration passed independent review. V0.4 adds a reusable chatbot
+production line and has completed one synthetic customer B model Run; its
+automatically drafted evaluation remains non-official until CEO approval.
 
 AI Company OS is a local, on-demand operating kernel that turns a one-line
 idea into a venture-scoped workspace, a mechanically checked WorkOrder,
 durable Evidence, and an auditable Decision trail.
 
-The operating kernel remains an on-demand Python CLI. V0.2 adds an explicitly
-invoked Codex CLI executor, rubric evaluation, a deterministic synthetic FAQ
-bot, a loopback-only status page, execution leases, and online ledger backup.
+The operating kernel remains an on-demand Python CLI. It includes an explicitly
+invoked Codex CLI executor, rubric evaluation, deterministic synthetic FAQ
+bots, a loopback-only status page, execution leases, online ledger backup, and
+candidate-to-approved reusable-skill promotion gates.
 CTO, CPO, CMO, and Claude interactions still use structured file handoffs.
 The preview bot itself is deterministic FAQ retrieval; Codex is the coding
 executor, not the model generating each preview answer.
@@ -130,6 +131,21 @@ company --root C:\dev\ai-company-os evaluation run <work-order-id> `
   --approval <approval-id> `
   --idempotency-key <unique-official-evaluation-key>
 ```
+
+V0.4 chatbot-line assets live in `lines/chatbot/`. Automatically generated
+adversarial questions remain DRAFT until hash-bound CEO approval. Reusable
+candidate skills follow this enforced sequence:
+
+```powershell
+company --root C:\dev\ai-company-os skill evaluate <candidate-dir>
+company --root C:\dev\ai-company-os skill approve <candidate-dir> `
+  --evaluation-event <passing-event-id> --approval-file <ceo-approval.txt>
+company --root C:\dev\ai-company-os skill promote <candidate-dir> `
+  --approval-event <ceo-approval-event-id>
+```
+
+Promotion rejects a changed candidate, an incomplete evaluation suite, or a
+missing CEO approval Event.
 
 The approval command fails if the file hash, case count, threshold, or exact
 approval sentence differs. The official report also binds a clean Git commit

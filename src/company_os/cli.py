@@ -27,6 +27,12 @@ from .model_executor import (
     validate_worktree,
 )
 from .roles import list_role_specs, serialize_role_spec
+from .skill_promotion import (
+    approve_skill_candidate,
+    candidate_tree_sha256,
+    evaluate_skill_candidate,
+    promote_skill_candidate,
+)
 from .synthetic_faq import serve as serve_synthetic_faq
 from .utils import payload_hash, read_json, sha256_file
 
@@ -205,6 +211,25 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard_change.add_argument("work_order_id")
     dashboard_change.add_argument("--request", required=True)
     dashboard_change.add_argument("--idempotency-key", required=True)
+
+    skill = commands.add_parser(
+        "skill", help="Evaluate, approve, and promote reusable skill candidates"
+    )
+    skill_commands = skill.add_subparsers(dest="skill_command", required=True)
+    skill_evaluate = skill_commands.add_parser("evaluate")
+    skill_evaluate.add_argument("candidate", type=Path)
+    skill_evaluate.add_argument("--test-arg", action="append", default=[])
+    skill_evaluate.add_argument("--idempotency-key")
+    skill_approve = skill_commands.add_parser("approve")
+    skill_approve.add_argument("candidate", type=Path)
+    skill_approve.add_argument("--evaluation-event")
+    skill_approve.add_argument("--approval-file", type=Path)
+    skill_approve.add_argument("--idempotency-key")
+    skill_promote = skill_commands.add_parser("promote")
+    skill_promote.add_argument("candidate", type=Path)
+    skill_promote.add_argument("--approval-event")
+    skill_promote.add_argument("--destination-root", type=Path)
+    skill_promote.add_argument("--idempotency-key")
 
     ledger = commands.add_parser("ledger", help="Back up, verify, or restore the ledger")
     ledger_commands = ledger.add_subparsers(dest="ledger_command", required=True)
@@ -532,6 +557,55 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
                 else ""
             ),
             idempotency_key=args.idempotency_key,
+        )
+    if args.command == "skill":
+        candidate = args.candidate.resolve()
+        candidate_hash = candidate_tree_sha256(candidate)
+        if args.skill_command == "evaluate":
+            manifest = read_json(candidate / "candidate.json")
+            test_command = tuple(args.test_arg) or (
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                *[str(path) for path in manifest["required_evaluation_paths"]],
+            )
+            return evaluate_skill_candidate(
+                company,
+                candidate,
+                test_command=test_command,
+                idempotency_key=args.idempotency_key
+                or f"cli-skill-evaluate:{candidate_hash}",
+            )
+        if args.skill_command == "approve":
+            if not args.evaluation_event:
+                raise ValueError("skill approve requires --evaluation-event")
+            if args.approval_file is None:
+                raise ValueError("skill approve requires --approval-file")
+            approval_path = args.approval_file.resolve()
+            if (
+                approval_path.is_symlink()
+                or not approval_path.is_file()
+                or approval_path.stat().st_size > 64 * 1024
+            ):
+                raise ValueError("skill approval file must be regular and at most 64 KiB")
+            return approve_skill_candidate(
+                company,
+                candidate,
+                evaluation_event_id=args.evaluation_event,
+                approval_text=approval_path.read_text(encoding="utf-8"),
+                idempotency_key=args.idempotency_key
+                or f"cli-skill-approve:{candidate_hash}:{args.evaluation_event}",
+            )
+        if not args.approval_event:
+            raise ValueError("skill promote requires --approval-event")
+        return promote_skill_candidate(
+            company,
+            candidate,
+            approval_event_id=args.approval_event,
+            destination_root=args.destination_root,
+            idempotency_key=args.idempotency_key
+            or f"cli-skill-promote:{candidate_hash}:{args.approval_event}",
         )
     if args.command == "ledger" and args.ledger_command == "backup":
         return backup(company.db_path, args.dir)
