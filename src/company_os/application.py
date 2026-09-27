@@ -53,6 +53,7 @@ from .models import (
     WorkOrder,
 )
 from .model_executor import ExecutorOutcome, ExecutorRequest
+from .pilot import evaluation_approval_text_v2
 from .roles import get_role_spec, list_role_specs, serialize_role_spec
 from .rubric import RubricReport, report_as_dict
 from .paths import default_ledger_path, validate_live_db_path
@@ -3374,6 +3375,7 @@ class CompanyOS:
         cases_path: str | Path,
         expected_sha256: str,
         approval_text: str,
+        customer_id: str | None = None,
         idempotency_key: str,
     ) -> dict[str, Any]:
         """Record a CEO approval bound to the exact immutable DRAFT bytes."""
@@ -3409,9 +3411,21 @@ class CompanyOS:
                 "evaluation specification requires a numeric threshold"
             ) from exc
         normalized_approval_text = approval_text.strip()
+        approval_template_version = 1 if customer_id is None else 2
         required_approval_text = (
-            f"V0.2 평가 사례 {len(cases)}건({source.name} SHA-256: "
-            f"{actual_sha256})과 threshold {threshold:.2f}을 APPROVED로 승인합니다."
+            (
+                f"V0.2 평가 사례 {len(cases)}건({source.name} SHA-256: "
+                f"{actual_sha256})과 threshold {threshold:.2f}을 APPROVED로 "
+                "승인합니다."
+            )
+            if customer_id is None
+            else evaluation_approval_text_v2(
+                customer_id=customer_id,
+                spec_path=relative_path,
+                case_count=len(cases),
+                spec_sha256=actual_sha256,
+                threshold=threshold,
+            )
         )
         if normalized_approval_text != required_approval_text:
             raise ValidationError(
@@ -3425,6 +3439,8 @@ class CompanyOS:
             "case_count": len(cases),
             "threshold": threshold,
             "approval_text": normalized_approval_text,
+            "approval_template_version": approval_template_version,
+            "customer_id": customer_id,
         }
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
@@ -3442,6 +3458,8 @@ class CompanyOS:
                     normalized_approval_text.encode("utf-8")
                 ).hexdigest(),
                 "source": "user_supplied",
+                "approval_template_version": approval_template_version,
+                "customer_id": customer_id,
             }
             self.store.insert_row(
                 "decisions",
@@ -3471,6 +3489,8 @@ class CompanyOS:
                             "case_count": len(cases),
                             "threshold": threshold,
                             "explicit_ceo_approval": True,
+                            "approval_template_version": approval_template_version,
+                            "customer_id": customer_id,
                         }
                     ),
                     "created_at": now,
@@ -3491,6 +3511,8 @@ class CompanyOS:
                     "case_count": len(cases),
                     "threshold": threshold,
                     "actor": "CEO",
+                    "approval_template_version": approval_template_version,
+                    "customer_id": customer_id,
                 },
                 connection=connection,
             )
@@ -3501,6 +3523,8 @@ class CompanyOS:
                 "evaluation_spec_sha256": actual_sha256,
                 "case_count": len(cases),
                 "threshold": threshold,
+                "approval_template_version": approval_template_version,
+                "customer_id": customer_id,
             }
 
         try:
