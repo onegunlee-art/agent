@@ -6,6 +6,8 @@ import subprocess
 
 import pytest
 
+import company_os.customer_isolation as customer_isolation_module
+
 from company_os.application import CompanyOS
 from company_os.cli import build_parser
 from company_os.customer_isolation import (
@@ -26,7 +28,30 @@ from company_os.model_executor import capture_workspace_identity
 from company_os.utils import sha256_file
 
 
+def _git(repository: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repository,
+        check=check,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _seed_public_templates(public_root: Path) -> None:
+    for relative in (
+        "lines/chatbot/WORK_ORDER_TEMPLATE.md",
+        "src/company_os/synthetic_faq.py",
+        "tests/test_synthetic_faq.py",
+    ):
+        target = public_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"synthetic template: {relative}\n", encoding="utf-8")
+
+
 def _register_clients(company: CompanyOS, private_root: Path) -> None:
+    _seed_public_templates(company.root)
     initialize_client(
         company,
         private_root,
@@ -61,6 +86,10 @@ def test_client_registration_keeps_raw_markers_out_of_public_ledger(
         assert policy.token_limit == 120_000
         assert policy.cost_limit_usd == 1.25
         assert policy.client_root == private_root / "clients" / "client-alpha"
+        assert (policy.client_root / ".git").is_dir()
+        assert Path(
+            _git(policy.client_root, "rev-parse", "--show-toplevel").stdout.strip()
+        ).resolve() == policy.client_root
         event_text = json.dumps(company.events(), ensure_ascii=False)
         config_path = private_root / "clients" / "client-alpha" / "client.json"
         changed = json.loads(config_path.read_text(encoding="utf-8"))
@@ -92,7 +121,7 @@ def test_customer_sparse_patterns_and_limits_fail_closed(tmp_path: Path) -> None
     expected = client_sparse_patterns("client-alpha")
     validated = validate_client_execution(
         policy,
-        repository=private_root,
+        repository=policy.client_root,
         sparse_checkout_patterns=expected,
         token_limit=100_000,
         cost_limit_usd=1.0,
@@ -102,15 +131,15 @@ def test_customer_sparse_patterns_and_limits_fail_closed(tmp_path: Path) -> None
     with pytest.raises(ValidationError, match="sparse"):
         validate_client_execution(
             policy,
-            repository=private_root,
-            sparse_checkout_patterns=(*expected, "clients/client-beta"),
+            repository=policy.client_root,
+            sparse_checkout_patterns=(*expected, "../client-beta"),
             token_limit=100_000,
             cost_limit_usd=1.0,
         )
     with pytest.raises(ValidationError, match="token"):
         validate_client_execution(
             policy,
-            repository=private_root,
+            repository=policy.client_root,
             sparse_checkout_patterns=expected,
             token_limit=120_001,
             cost_limit_usd=1.0,
@@ -118,7 +147,7 @@ def test_customer_sparse_patterns_and_limits_fail_closed(tmp_path: Path) -> None
     with pytest.raises(ValidationError, match="cost"):
         validate_client_execution(
             policy,
-            repository=private_root,
+            repository=policy.client_root,
             sparse_checkout_patterns=expected,
             token_limit=100_000,
             cost_limit_usd=1.26,
@@ -126,42 +155,38 @@ def test_customer_sparse_patterns_and_limits_fail_closed(tmp_path: Path) -> None
 
 
 def test_sparse_checkout_physically_excludes_another_customer(tmp_path: Path) -> None:
-    repository = tmp_path / "private-customer-repository"
-    repository.mkdir()
-    for relative in (
-        "clients/client-alpha/material",
-        "clients/client-beta/material",
-        "lines/chatbot",
-        "src/company_os",
-        "tests",
-    ):
-        folder = repository / relative
-        folder.mkdir(parents=True)
-        (folder / "tracked.txt").write_text(f"synthetic {relative}", encoding="utf-8")
-    for command in (
-        ["git", "init", "-q"],
-        ["git", "config", "user.email", "synthetic@example.invalid"],
-        ["git", "config", "user.name", "Synthetic Test"],
-        ["git", "add", "."],
-        ["git", "commit", "-q", "-m", "synthetic private baseline"],
-    ):
-        subprocess.run(
-            command,
-            cwd=repository,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+    public_root = tmp_path / "public-company-os"
+    private_root = tmp_path / "private-customer-repositories"
+    with CompanyOS(public_root) as company:
+        _register_clients(company, private_root)
+    alpha = load_client_policy(private_root, "client-alpha")
+    beta = load_client_policy(private_root, "client-beta")
+    (alpha.client_root / "material" / "alpha.txt").write_text(
+        "ALPHA-ONLY-CONTENT", encoding="utf-8"
+    )
+    (beta.client_root / "material" / "beta.txt").write_text(
+        "BETA-ONLY-CONTENT", encoding="utf-8"
+    )
+    for policy in (alpha, beta):
+        _git(policy.client_root, "add", "material")
+        _git(policy.client_root, "commit", "-q", "-m", "synthetic customer data")
+    beta_blob = _git(
+        beta.client_root, "rev-parse", "HEAD:material/beta.txt"
+    ).stdout.strip()
 
     configure_customer_sparse_checkout(
-        repository, client_sparse_patterns("client-alpha")
+        alpha.client_root, client_sparse_patterns("client-alpha")
     )
-    identity = capture_workspace_identity(repository)
+    identity = capture_workspace_identity(alpha.client_root)
+    cross_repo_lookup = _git(
+        alpha.client_root, "cat-file", "-e", beta_blob, check=False
+    )
 
     assert identity.sparse_checkout_patterns == client_sparse_patterns("client-alpha")
-    assert (repository / "clients" / "client-alpha").is_dir()
-    assert not (repository / "clients" / "client-beta").exists()
+    assert alpha.client_root != beta.client_root
+    assert (alpha.client_root / ".git").is_dir()
+    assert (beta.client_root / ".git").is_dir()
+    assert cross_repo_lookup.returncode != 0
 
 
 def test_private_customer_root_cannot_be_inside_public_source(tmp_path: Path) -> None:
@@ -259,6 +284,9 @@ def test_customer_backup_restores_folder_and_hashes(tmp_path: Path) -> None:
         _register_clients(company, private_root)
     material = private_root / "clients" / "client-alpha" / "material" / "faq.txt"
     material.write_text("synthetic alpha FAQ", encoding="utf-8")
+    client_repository = material.parents[1]
+    _git(client_repository, "add", "material/faq.txt")
+    _git(client_repository, "commit", "-q", "-m", "add synthetic FAQ")
 
     bundle = backup_client_data(
         private_root,
@@ -275,6 +303,8 @@ def test_customer_backup_restores_folder_and_hashes(tmp_path: Path) -> None:
     assert restored == restored_root / "clients" / "client-alpha"
     assert restored_material.read_text(encoding="utf-8") == "synthetic alpha FAQ"
     assert sha256_file(restored_material) == sha256_file(material)
+    assert (restored / ".git").is_dir()
+    assert "add synthetic FAQ" in _git(restored, "log", "--format=%s").stdout
 
     with bundle.path.open("r+b") as handle:
         handle.seek(40)
@@ -284,6 +314,7 @@ def test_customer_backup_restores_folder_and_hashes(tmp_path: Path) -> None:
 
 def test_customer_delete_removes_active_and_backup_data_but_keeps_evidence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     public_root = tmp_path / "public-company-os"
     private_root = tmp_path / "private-customer-repository"
@@ -293,6 +324,12 @@ def test_customer_delete_removes_active_and_backup_data_but_keeps_evidence(
             private_root / "clients" / "client-alpha" / "material" / "private.txt"
         )
         material.write_text("ALPHA-PRIVATE-41", encoding="utf-8")
+        client_repository = material.parents[1]
+        _git(client_repository, "add", "material/private.txt")
+        _git(client_repository, "commit", "-q", "-m", "add private synthetic data")
+        deleted_blob = _git(
+            client_repository, "rev-parse", "HEAD:material/private.txt"
+        ).stdout.strip()
         backup_client_data(
             private_root,
             "client-alpha",
@@ -300,7 +337,25 @@ def test_customer_delete_removes_active_and_backup_data_but_keeps_evidence(
             timestamp="20260927-120001",
         )
 
+        transaction_states: list[bool] = []
+        original_remove = customer_isolation_module._remove_repository_tree
+
+        def observed_remove(path: Path) -> None:
+            transaction_states.append(company.store.connection.in_transaction)
+            original_remove(path)
+
+        monkeypatch.setattr(
+            customer_isolation_module, "_remove_repository_tree", observed_remove
+        )
+
         result = delete_client_data(
+            company,
+            private_root,
+            "client-alpha",
+            confirmation="client-alpha",
+            idempotency_key="delete-client-alpha",
+        )
+        replay = delete_client_data(
             company,
             private_root,
             "client-alpha",
@@ -311,12 +366,33 @@ def test_customer_delete_removes_active_and_backup_data_but_keeps_evidence(
 
     assert not (private_root / "clients" / "client-alpha").exists()
     assert not (private_root / "backups" / "client-alpha").exists()
+    assert transaction_states and not any(transaction_states)
+    assert replay == result
     certificate = Path(result["certificate_path"])
     assert certificate.is_file()
     assert sha256_file(certificate) == result["certificate_sha256"]
     certificate_payload = json.loads(certificate.read_text(encoding="utf-8"))
     assert certificate_payload["status"] == "DELETED"
     assert certificate_payload["deleted_file_count"] >= 2
+    assert certificate_payload["deleted_scopes"]["active"]["removed"] is True
+    assert certificate_payload["deleted_scopes"]["backup"]["removed"] is True
+    assert certificate_payload["deleted_scopes"]["git_history"]["removed"] is True
+    assert certificate_payload["raw_customer_data_retained"] is False
+    parent_history = _git(
+        private_root,
+        "log",
+        "--all",
+        "--",
+        "clients/client-alpha",
+        check=False,
+    )
+    beta_repository = private_root / "clients" / "client-beta"
+    remaining_blob_lookup = _git(
+        beta_repository, "cat-file", "-e", deleted_blob, check=False
+    )
+    assert parent_history.stdout.strip() == ""
+    assert parent_history.returncode != 0
+    assert remaining_blob_lookup.returncode != 0
     event_payload = json.dumps(events[-1]["payload"], ensure_ascii=False)
     assert events[-1]["event_type"] == "CUSTOMER_DATA_DELETED"
     assert "ALPHA-PRIVATE-41" not in event_payload

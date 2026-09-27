@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -18,7 +19,8 @@ from typing import Any, Sequence
 
 from .application import CompanyOS
 from .chatbot_line import draft_adversarial_evaluation
-from .errors import ValidationError
+from .errors import ConflictError, ValidationError
+from .storage import IdempotencyConflict
 from .utils import (
     atomic_write_json,
     atomic_write_text,
@@ -89,14 +91,19 @@ def _validate_private_root(company_root: Path, private_root: Path) -> Path:
         raise ValidationError("private customer repository must be outside public source")
     if "onedrive" in str(private).casefold():
         raise ValidationError("private customer repository must not be in a sync folder")
+    for candidate in (private, *private.parents):
+        if (candidate / ".git").exists():
+            raise ValidationError(
+                "private customer repository registry must not be inside another Git repository"
+            )
     return private
 
 
 def client_sparse_patterns(client_id: str) -> tuple[str, ...]:
-    client = _valid_client_id(client_id)
+    _valid_client_id(client_id)
     return (
-        f"clients/{client}",
         "lines/chatbot",
+        "material",
         "src/company_os",
         "tests",
     )
@@ -105,6 +112,71 @@ def client_sparse_patterns(client_id: str) -> tuple[str, ...]:
 def _client_config(private_root: Path, client_id: str) -> Path:
     client = _valid_client_id(client_id)
     return contained_path(private_root.resolve(), "clients", client, _CONFIG_NAME)
+
+
+def _git(repository: Path, *args: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValidationError(f"customer repository git command failed: {' '.join(args)}") from exc
+    return completed.stdout.strip()
+
+
+def _copy_public_templates(company_root: Path, client_root: Path) -> None:
+    for relative in ("lines/chatbot", "src/company_os", "tests"):
+        source = contained_path(company_root, relative)
+        if not source.is_dir():
+            raise ValidationError(f"public production template is missing: {relative}")
+        target = contained_path(client_root, relative)
+        shutil.copytree(
+            source,
+            target,
+            ignore=shutil.ignore_patterns(
+                "__pycache__", "*.pyc", ".pytest_cache", ".git", "var"
+            ),
+        )
+
+
+def _initialize_client_repository(
+    company_root: Path,
+    client_root: Path,
+    config: dict[str, Any],
+) -> str:
+    (client_root / "material").mkdir(parents=True)
+    (client_root / "workspace").mkdir()
+    (client_root / "material" / ".gitkeep").write_text("", encoding="utf-8")
+    (client_root / ".gitignore").write_text(
+        "/workspace/\n__pycache__/\n*.py[cod]\n.pytest_cache/\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    _copy_public_templates(company_root, client_root)
+    atomic_write_json(client_root / _CONFIG_NAME, config)
+    _git(client_root, "init", "-q")
+    _git(client_root, "config", "user.name", "AI Company OS")
+    _git(client_root, "config", "user.email", "local@ai-company.invalid")
+    _git(client_root, "config", "core.autocrlf", "false")
+    _git(client_root, "config", "core.filemode", "false")
+    _git(client_root, "add", "-A")
+    _git(client_root, "commit", "-q", "-m", "Initialize isolated client repository")
+    return _git(client_root, "rev-parse", "HEAD^{tree}")
+
+
+def _remove_repository_tree(path: Path) -> None:
+    """Remove a complete client repository, including read-only Git objects."""
+
+    def make_writable_and_retry(function: Any, target: str, _error: Any) -> None:
+        os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+        function(target)
+
+    shutil.rmtree(path, onerror=make_writable_and_retry)
 
 
 def initialize_client(
@@ -129,7 +201,6 @@ def initialize_client(
     if cost_limit_usd < 0:
         raise ValidationError("client cost limit must be non-negative")
     client_root = contained_path(private, "clients", client)
-    config_path = client_root / _CONFIG_NAME
     patterns = client_sparse_patterns(client)
     marker_digest = payload_hash(
         {"private_markers": secrets, "customer_markers": identities}
@@ -142,6 +213,7 @@ def initialize_client(
         "private_markers": secrets,
         "customer_markers": identities,
         "sparse_checkout_patterns": list(patterns),
+        "repository_layout": "ISOLATED_GIT_REPOSITORY",
         "created_at": utc_now(),
     }
     command_payload = {
@@ -150,17 +222,39 @@ def initialize_client(
         "cost_limit_usd": float(cost_limit_usd),
         "marker_set_sha256": marker_digest,
         "sparse_checkout_patterns": list(patterns),
+        "repository_layout": "ISOLATED_GIT_REPOSITORY",
     }
+    try:
+        with company.store.transaction() as connection:
+            claim = company.store.claim_idempotency(
+                idempotency_key,
+                "initialize_client",
+                command_payload,
+                connection=connection,
+            )
+            if not claim.is_new:
+                if claim.completed and isinstance(claim.result, dict):
+                    return dict(claim.result)
+                raise ConflictError("client initialization is already in progress")
+    except IdempotencyConflict as exc:
+        raise ConflictError(str(exc)) from exc
 
-    def operation(connection: Any) -> dict[str, Any]:
-        if config_path.exists():
-            raise ValidationError(f"client already exists: {client}")
-        created = False
-        try:
-            (client_root / "material").mkdir(parents=True)
-            (client_root / "workspace").mkdir()
-            atomic_write_json(config_path, config)
-            created = True
+    def release_claim() -> None:
+        with company.store.transaction() as connection:
+            connection.execute(
+                "DELETE FROM idempotency WHERE key = ? AND command = ? "
+                "AND status = 'CLAIMED'",
+                (idempotency_key, "initialize_client"),
+            )
+
+    if client_root.exists():
+        release_claim()
+        raise ValidationError(f"client already exists: {client}")
+    try:
+        repository_tree_oid = _initialize_client_repository(
+            company.root, client_root, config
+        )
+        with company.store.transaction() as connection:
             event = company.store.append_event(
                 "CUSTOMER_ISOLATION_CREATED",
                 aggregate_type="Client",
@@ -168,30 +262,31 @@ def initialize_client(
                 payload={
                     **command_payload,
                     "client_path": f"clients/{client}",
+                    "repository_tree_oid": repository_tree_oid,
                     "raw_markers_recorded": False,
                 },
                 connection=connection,
             )
-            return {
+            result = {
                 "status": "CREATED",
                 "client_id": client,
                 "client_path": f"clients/{client}",
                 "event_id": str(event["id"]),
                 "marker_set_sha256": marker_digest,
+                "repository_tree_oid": repository_tree_oid,
             }
-        except BaseException:
-            if created and client_root.exists():
-                shutil.rmtree(client_root)
-            raise
-
-    result = company.store.run_idempotent(
-        idempotency_key,
-        "initialize_client",
-        command_payload,
-        operation,
-    )
-    assert isinstance(result, dict)
-    return dict(result)
+            company.store.complete_idempotency(
+                idempotency_key,
+                result,
+                command="initialize_client",
+                connection=connection,
+            )
+        return result
+    except BaseException:
+        if client_root.exists():
+            _remove_repository_tree(client_root)
+        release_claim()
+        raise
 
 
 def load_client_policy(
@@ -213,6 +308,12 @@ def load_client_policy(
         raise ValidationError("unsupported client policy schema")
     if config.get("client_id") != client:
         raise ValidationError("client policy identity mismatch")
+    if config.get("repository_layout") != "ISOLATED_GIT_REPOSITORY":
+        raise ValidationError("client policy does not use an isolated Git repository")
+    if not (source.parent / ".git").is_dir():
+        raise ValidationError("client Git repository is missing")
+    if Path(_git(source.parent, "rev-parse", "--show-toplevel")).resolve() != source.parent:
+        raise ValidationError("client policy is not the root of its Git repository")
     expected = client_sparse_patterns(client)
     actual = tuple(str(value) for value in config.get("sparse_checkout_patterns", []))
     if actual != expected:
@@ -258,6 +359,7 @@ def load_client_policy(
             or float(recorded.get("cost_limit_usd", -1)) != policy.cost_limit_usd
             or tuple(recorded.get("sparse_checkout_patterns", []))
             != policy.sparse_checkout_patterns
+            or recorded.get("repository_layout") != "ISOLATED_GIT_REPOSITORY"
         ):
             raise ValidationError("private client policy differs from canonical ledger")
     return policy
@@ -273,8 +375,8 @@ def validate_client_execution(
 ) -> tuple[str, ...]:
     """Fail closed before a model process can see another client or overspend."""
 
-    if Path(repository).resolve() != policy.private_root:
-        raise ValidationError("customer execution repository is not its private root")
+    if Path(repository).resolve() != policy.client_root:
+        raise ValidationError("customer execution repository is not its isolated client root")
     actual = tuple(str(item).replace("\\", "/").rstrip("/") for item in sparse_checkout_patterns)
     if actual != policy.sparse_checkout_patterns:
         raise ValidationError("customer sparse checkout does not exactly match its policy")
@@ -554,15 +656,41 @@ def delete_client_data(
     """Delete one client's active data and backups, then retain a hash-only proof."""
 
     private = Path(private_root).resolve()
-    policy = load_client_policy(private, client_id, company=company)
-    if confirmation != policy.client_id:
+    client = _valid_client_id(client_id)
+    if confirmation != client:
         raise ValidationError("client deletion confirmation does not match client_id")
-    active_entries = _file_manifest(policy.client_root)
+    with company.store.transaction(immediate=False) as connection:
+        prior = connection.execute(
+            "SELECT command, status, result_json FROM idempotency WHERE key = ?",
+            (idempotency_key,),
+        ).fetchone()
+    if prior is not None:
+        if prior["command"] != "delete_client_data":
+            raise ConflictError("deletion idempotency key belongs to another command")
+        if prior["status"] == "COMPLETED" and prior["result_json"]:
+            result = json.loads(prior["result_json"])
+            if result.get("client_id") != client:
+                raise ConflictError("deletion idempotency key belongs to another client")
+            return dict(result)
+        raise ConflictError("client deletion is already in progress or needs recovery")
+
+    policy = load_client_policy(private, client, company=company)
+    repository_entries = _file_manifest(policy.client_root)
+    git_history_entries = [
+        entry
+        for entry in repository_entries
+        if entry["path"] == ".git" or str(entry["path"]).startswith(".git/")
+    ]
+    active_entries = [
+        entry for entry in repository_entries if entry not in git_history_entries
+    ]
     backup_root = contained_path(private, "backups", policy.client_id)
     backup_entries = _file_manifest(backup_root) if backup_root.is_dir() else []
-    combined = [
-        {**entry, "scope": "active"} for entry in active_entries
-    ] + [{**entry, "scope": "backup"} for entry in backup_entries]
+    combined = (
+        [{**entry, "scope": "active"} for entry in active_entries]
+        + [{**entry, "scope": "backup"} for entry in backup_entries]
+        + [{**entry, "scope": "git-history"} for entry in git_history_entries]
+    )
     tree_digest = _tree_sha256(combined)
     deleted_bytes = sum(int(item["size"]) for item in combined)
     certificate_name = f"{policy.client_id}-{time.strftime('%Y%m%d-%H%M%S')}.json"
@@ -572,47 +700,101 @@ def delete_client_data(
         "pre_delete_tree_sha256": tree_digest,
         "deleted_file_count": len(combined),
         "deleted_bytes": deleted_bytes,
+        "deletion_scope_counts": {
+            "active": len(active_entries),
+            "backup": len(backup_entries),
+            "git_history": len(git_history_entries),
+        },
     }
 
-    def operation(connection: Any) -> dict[str, Any]:
-        shutil.rmtree(policy.client_root)
+    try:
+        with company.store.transaction() as connection:
+            claim = company.store.claim_idempotency(
+                idempotency_key,
+                "delete_client_data",
+                command_payload,
+                connection=connection,
+            )
+            if not claim.is_new:
+                raise ConflictError("client deletion is already claimed")
+    except IdempotencyConflict as exc:
+        raise ConflictError(str(exc)) from exc
+
+    try:
+        _remove_repository_tree(policy.client_root)
         if backup_root.exists():
-            shutil.rmtree(backup_root)
+            _remove_repository_tree(backup_root)
+        deleted_scopes = {
+            "active": {
+                "file_count": len(active_entries),
+                "bytes": sum(int(item["size"]) for item in active_entries),
+                "removed": not policy.client_root.exists(),
+            },
+            "backup": {
+                "file_count": len(backup_entries),
+                "bytes": sum(int(item["size"]) for item in backup_entries),
+                "removed": not backup_root.exists(),
+            },
+            "git_history": {
+                "file_count": len(git_history_entries),
+                "bytes": sum(int(item["size"]) for item in git_history_entries),
+                "removed": not policy.client_root.exists(),
+                "repository_directory_removed": not policy.client_root.exists(),
+            },
+        }
+        deletion_complete = all(
+            bool(scope["removed"]) for scope in deleted_scopes.values()
+        )
+        if not deletion_complete:
+            raise RuntimeError("customer deletion did not remove every managed scope")
         certificate = {
             "schema_version": 1,
             "status": "DELETED",
             **command_payload,
+            "deleted_scopes": deleted_scopes,
             "deleted_at": utc_now(),
-            "raw_customer_data_retained": False,
+            "raw_customer_data_retained": not deletion_complete,
         }
         atomic_write_json(certificate_path, certificate)
         certificate_sha = sha256_file(certificate_path)
-        event = company.store.append_event(
-            "CUSTOMER_DATA_DELETED",
-            aggregate_type="Client",
-            aggregate_id=policy.client_id,
-            payload={
-                **command_payload,
-                "certificate_path": f"deletion-evidence/{certificate_name}",
+        with company.store.transaction() as connection:
+            event = company.store.append_event(
+                "CUSTOMER_DATA_DELETED",
+                aggregate_type="Client",
+                aggregate_id=policy.client_id,
+                payload={
+                    **command_payload,
+                    "deleted_scopes": deleted_scopes,
+                    "certificate_path": f"deletion-evidence/{certificate_name}",
+                    "certificate_sha256": certificate_sha,
+                    "actor": "CEO",
+                },
+                connection=connection,
+            )
+            result = {
+                "status": "DELETED",
+                "client_id": policy.client_id,
+                "event_id": str(event["id"]),
+                "certificate_path": str(certificate_path),
                 "certificate_sha256": certificate_sha,
-                "actor": "CEO",
-            },
-            connection=connection,
-        )
-        return {
-            "status": "DELETED",
-            "client_id": policy.client_id,
-            "event_id": str(event["id"]),
-            "certificate_path": str(certificate_path),
-            "certificate_sha256": certificate_sha,
-            "deleted_file_count": len(combined),
-        }
-
-    result = company.store.run_idempotent(
-        idempotency_key,
-        "delete_client_data",
-        command_payload,
-        operation,
-    )
-    assert isinstance(result, dict)
-    return dict(result)
+                "deleted_file_count": len(combined),
+            }
+            company.store.complete_idempotency(
+                idempotency_key,
+                result,
+                command="delete_client_data",
+                connection=connection,
+            )
+        return result
+    except BaseException:
+        # A still-present repository means no truthful completion was recorded and
+        # the exact command can safely be retried.  If deletion already removed the
+        # repository, retain CLAIMED so recovery cannot silently issue a false retry.
+        if policy.client_root.exists():
+            with company.store.transaction() as connection:
+                connection.execute(
+                    "DELETE FROM idempotency WHERE key = ? AND command = ? "
+                    "AND status = 'CLAIMED'",
+                    (idempotency_key, "delete_client_data"),
+                )
+        raise

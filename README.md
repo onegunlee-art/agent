@@ -229,7 +229,8 @@ exact conversation and operating entry points, [V0.2 방향과 구현 순서](do
 for the approved build sequence, and [CLAUDE.md](CLAUDE.md) for manual review
 handoff rules. Customer handling is defined in
 [고객별 비공개 저장소 규칙](docs/PRIVATE_CUSTOMER_REPOSITORY_RULES_KO.md) and the
-[파일럿 체크리스트](docs/V05_PILOT_CHECKLIST_KO.md).
+[파일럿 체크리스트](docs/V05_PILOT_CHECKLIST_KO.md). The remaining V0.5
+boundaries are explicit in [known limitations](docs/known-limitations.md).
 
 ## Current boundaries
 
@@ -248,6 +249,8 @@ must not be used to validate a real Venture.
 The Context Manifest provides `LOGICAL_NAMESPACE_ONLY` organization. The
 coding executor therefore also uses a Git worktree plus Codex
 `workspace-write` sandboxing. Worktrees are isolation aids, not security
-boundaries. V0.5 reduces accidental cross-customer access through exact sparse
-patterns and private roots, but Git worktrees are still not security boundaries.
+boundaries. V0.5 gives every customer a separate private Git repository, copies
+the bounded production templates into it, and creates model worktrees only from
+that repository. Exact sparse patterns reduce accidental overexposure inside a
+customer repository; they are not an operating-system security boundary.
 Unattended multi-tenant production and remote access remain out of scope.

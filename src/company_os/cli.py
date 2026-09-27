@@ -40,6 +40,7 @@ from .model_executor import (
     validate_worktree,
 )
 from .roles import list_role_specs, serialize_role_spec
+from .review_package import build_review_materials
 from .skill_promotion import (
     approve_skill_candidate,
     candidate_tree_sha256,
@@ -176,6 +177,10 @@ def build_parser() -> argparse.ArgumentParser:
     review_ingest = review_commands.add_parser("ingest")
     review_ingest.add_argument("review_id")
     review_ingest.add_argument("--file", required=True, type=Path)
+    review_package = review_commands.add_parser("package")
+    review_package.add_argument("--baseline", required=True)
+    review_package.add_argument("--target", required=True)
+    review_package.add_argument("--output-dir", required=True, type=Path)
 
     evaluation = commands.add_parser(
         "evaluation",
@@ -564,6 +569,13 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         )
     if args.command == "review" and args.review_command == "ingest":
         return company.ingest_review_result(args.review_id, args.file)
+    if args.command == "review" and args.review_command == "package":
+        return build_review_materials(
+            company.root,
+            baseline_commit=args.baseline,
+            target_commit=args.target,
+            output_dir=args.output_dir,
+        )
     if args.command == "evaluation" and args.evaluation_command == "approve":
         approval_path = args.approval_file.resolve()
         if (
