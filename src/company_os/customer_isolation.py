@@ -1,0 +1,618 @@
+"""Local customer isolation, backup, and deletion controls for V0.5."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+import zipfile
+from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Sequence
+
+from .application import CompanyOS
+from .chatbot_line import draft_adversarial_evaluation
+from .errors import ValidationError
+from .utils import (
+    atomic_write_json,
+    atomic_write_text,
+    canonical_json,
+    contained_path,
+    payload_hash,
+    sha256_file,
+    utc_now,
+)
+
+
+_CLIENT_ID = re.compile(r"[a-z0-9][a-z0-9-]{1,63}")
+_CONFIG_NAME = "client.json"
+
+
+@dataclass(frozen=True)
+class ClientPolicy:
+    client_id: str
+    private_root: Path
+    client_root: Path
+    token_limit: int
+    cost_limit_usd: float
+    private_markers: tuple[str, ...]
+    customer_markers: tuple[str, ...]
+    sparse_checkout_patterns: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ClientBackupResult:
+    path: Path
+    sha256: str
+    file_count: int
+    tree_sha256: str
+
+
+@dataclass(frozen=True)
+class ClientBackupVerification:
+    ok: bool
+    hash_matches: bool
+    client_id: str | None
+    file_count: int
+    missing: tuple[str, ...]
+    mismatched: tuple[str, ...]
+
+
+def _valid_client_id(client_id: str) -> str:
+    value = str(client_id).strip()
+    if _CLIENT_ID.fullmatch(value) is None:
+        raise ValidationError("client_id must be lowercase kebab-case")
+    return value
+
+
+def _marker_list(values: Sequence[str], *, label: str) -> list[str]:
+    if isinstance(values, (str, bytes)):
+        raise ValidationError(f"{label} must be a list of marker strings")
+    result = [str(value).strip() for value in values]
+    if not result or any(not value for value in result):
+        raise ValidationError(f"{label} must contain non-empty marker strings")
+    if len(result) != len(set(result)):
+        raise ValidationError(f"{label} contains duplicate markers")
+    return result
+
+
+def _validate_private_root(company_root: Path, private_root: Path) -> Path:
+    public = company_root.resolve()
+    private = private_root.resolve()
+    if private == public or public in private.parents or private in public.parents:
+        raise ValidationError("private customer repository must be outside public source")
+    if "onedrive" in str(private).casefold():
+        raise ValidationError("private customer repository must not be in a sync folder")
+    return private
+
+
+def client_sparse_patterns(client_id: str) -> tuple[str, ...]:
+    client = _valid_client_id(client_id)
+    return (
+        f"clients/{client}",
+        "lines/chatbot",
+        "src/company_os",
+        "tests",
+    )
+
+
+def _client_config(private_root: Path, client_id: str) -> Path:
+    client = _valid_client_id(client_id)
+    return contained_path(private_root.resolve(), "clients", client, _CONFIG_NAME)
+
+
+def initialize_client(
+    company: CompanyOS,
+    private_root: str | Path,
+    client_id: str,
+    *,
+    private_markers: Sequence[str],
+    customer_markers: Sequence[str],
+    token_limit: int,
+    cost_limit_usd: float,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Create one private client folder while recording only redacted metadata."""
+
+    client = _valid_client_id(client_id)
+    private = _validate_private_root(company.root, Path(private_root))
+    secrets = _marker_list(private_markers, label="private_markers")
+    identities = _marker_list(customer_markers, label="customer_markers")
+    if token_limit <= 0:
+        raise ValidationError("client token limit must be positive")
+    if cost_limit_usd < 0:
+        raise ValidationError("client cost limit must be non-negative")
+    client_root = contained_path(private, "clients", client)
+    config_path = client_root / _CONFIG_NAME
+    patterns = client_sparse_patterns(client)
+    marker_digest = payload_hash(
+        {"private_markers": secrets, "customer_markers": identities}
+    )
+    config = {
+        "schema_version": 1,
+        "client_id": client,
+        "token_limit": int(token_limit),
+        "cost_limit_usd": float(cost_limit_usd),
+        "private_markers": secrets,
+        "customer_markers": identities,
+        "sparse_checkout_patterns": list(patterns),
+        "created_at": utc_now(),
+    }
+    command_payload = {
+        "client_id": client,
+        "token_limit": int(token_limit),
+        "cost_limit_usd": float(cost_limit_usd),
+        "marker_set_sha256": marker_digest,
+        "sparse_checkout_patterns": list(patterns),
+    }
+
+    def operation(connection: Any) -> dict[str, Any]:
+        if config_path.exists():
+            raise ValidationError(f"client already exists: {client}")
+        created = False
+        try:
+            (client_root / "material").mkdir(parents=True)
+            (client_root / "workspace").mkdir()
+            atomic_write_json(config_path, config)
+            created = True
+            event = company.store.append_event(
+                "CUSTOMER_ISOLATION_CREATED",
+                aggregate_type="Client",
+                aggregate_id=client,
+                payload={
+                    **command_payload,
+                    "client_path": f"clients/{client}",
+                    "raw_markers_recorded": False,
+                },
+                connection=connection,
+            )
+            return {
+                "status": "CREATED",
+                "client_id": client,
+                "client_path": f"clients/{client}",
+                "event_id": str(event["id"]),
+                "marker_set_sha256": marker_digest,
+            }
+        except BaseException:
+            if created and client_root.exists():
+                shutil.rmtree(client_root)
+            raise
+
+    result = company.store.run_idempotent(
+        idempotency_key,
+        "initialize_client",
+        command_payload,
+        operation,
+    )
+    assert isinstance(result, dict)
+    return dict(result)
+
+
+def load_client_policy(
+    private_root: str | Path,
+    client_id: str,
+    *,
+    company: CompanyOS | None = None,
+) -> ClientPolicy:
+    private = Path(private_root).resolve()
+    client = _valid_client_id(client_id)
+    source = _client_config(private, client)
+    if source.is_symlink() or not source.is_file():
+        raise ValidationError(f"client policy not found: {client}")
+    try:
+        config = json.loads(source.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValidationError("client policy must be valid UTF-8 JSON") from exc
+    if not isinstance(config, dict) or config.get("schema_version") != 1:
+        raise ValidationError("unsupported client policy schema")
+    if config.get("client_id") != client:
+        raise ValidationError("client policy identity mismatch")
+    expected = client_sparse_patterns(client)
+    actual = tuple(str(value) for value in config.get("sparse_checkout_patterns", []))
+    if actual != expected:
+        raise ValidationError("client policy sparse patterns were modified")
+    try:
+        token_limit = int(config["token_limit"])
+        cost_limit = float(config["cost_limit_usd"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValidationError("client policy limits are invalid") from exc
+    if token_limit <= 0 or cost_limit < 0:
+        raise ValidationError("client policy limits are invalid")
+    policy = ClientPolicy(
+        client,
+        private,
+        source.parent,
+        token_limit,
+        cost_limit,
+        tuple(_marker_list(config.get("private_markers", []), label="private_markers")),
+        tuple(_marker_list(config.get("customer_markers", []), label="customer_markers")),
+        expected,
+    )
+    if company is not None:
+        events = [
+            event
+            for event in company.events()
+            if event.get("aggregate_type") == "Client"
+            and event.get("aggregate_id") == client
+            and event.get("event_type")
+            in {"CUSTOMER_ISOLATION_CREATED", "CUSTOMER_DATA_DELETED"}
+        ]
+        if not events or events[-1]["event_type"] != "CUSTOMER_ISOLATION_CREATED":
+            raise ValidationError("active client policy was not found in canonical ledger")
+        recorded = events[-1]["payload"]
+        marker_digest = payload_hash(
+            {
+                "private_markers": list(policy.private_markers),
+                "customer_markers": list(policy.customer_markers),
+            }
+        )
+        if (
+            recorded.get("marker_set_sha256") != marker_digest
+            or int(recorded.get("token_limit", -1)) != policy.token_limit
+            or float(recorded.get("cost_limit_usd", -1)) != policy.cost_limit_usd
+            or tuple(recorded.get("sparse_checkout_patterns", []))
+            != policy.sparse_checkout_patterns
+        ):
+            raise ValidationError("private client policy differs from canonical ledger")
+    return policy
+
+
+def validate_client_execution(
+    policy: ClientPolicy,
+    *,
+    repository: str | Path,
+    sparse_checkout_patterns: Sequence[str],
+    token_limit: int,
+    cost_limit_usd: float,
+) -> tuple[str, ...]:
+    """Fail closed before a model process can see another client or overspend."""
+
+    if Path(repository).resolve() != policy.private_root:
+        raise ValidationError("customer execution repository is not its private root")
+    actual = tuple(str(item).replace("\\", "/").rstrip("/") for item in sparse_checkout_patterns)
+    if actual != policy.sparse_checkout_patterns:
+        raise ValidationError("customer sparse checkout does not exactly match its policy")
+    if token_limit > policy.token_limit:
+        raise ValidationError("WorkOrder token limit exceeds client token limit")
+    if cost_limit_usd > policy.cost_limit_usd:
+        raise ValidationError("WorkOrder cost limit exceeds client cost limit")
+    return actual
+
+
+def configure_customer_sparse_checkout(
+    workspace: str | Path,
+    patterns: Sequence[str],
+) -> None:
+    root = Path(workspace).resolve()
+    subprocess.run(
+        ["git", "sparse-checkout", "init", "--cone"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    subprocess.run(
+        ["git", "sparse-checkout", "set", "--", *patterns],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+
+
+def isolated_evaluation_draft(
+    private_root: str | Path,
+    client_id: str,
+    intake: dict[str, Any],
+    *,
+    company: CompanyOS | None = None,
+) -> dict[str, Any]:
+    """Build a DRAFT with this client's secrets and every other client marker."""
+
+    private = Path(private_root).resolve()
+    policy = load_client_policy(private, client_id, company=company)
+    if intake.get("customer_id") != policy.client_id:
+        raise ValidationError("evaluation intake client_id does not match policy")
+    other_markers: list[str] = []
+    clients_root = contained_path(private, "clients")
+    for entry in sorted(clients_root.iterdir(), key=lambda item: item.name):
+        if not entry.is_dir() or entry.name == policy.client_id:
+            continue
+        other = load_client_policy(private, entry.name, company=company)
+        other_markers.extend(other.private_markers)
+        other_markers.extend(other.customer_markers)
+    isolated = deepcopy(intake)
+    isolated["private_markers"] = list(policy.private_markers)
+    isolated["other_customer_markers"] = sorted(set(other_markers))
+    return draft_adversarial_evaluation(isolated)
+
+
+def save_isolated_evaluation_draft(
+    private_root: str | Path,
+    client_id: str,
+    intake_path: str | Path,
+    output_path: str | Path,
+    *,
+    company: CompanyOS | None = None,
+) -> dict[str, Any]:
+    """Write an isolated DRAFT only inside the selected client's folder."""
+
+    policy = load_client_policy(private_root, client_id, company=company)
+    source = Path(intake_path).resolve()
+    destination = Path(output_path).resolve()
+    if policy.client_root not in source.parents:
+        raise ValidationError("evaluation intake must stay inside the client folder")
+    if policy.client_root not in destination.parents:
+        raise ValidationError("evaluation output must stay inside the client folder")
+    if source.is_symlink() or not source.is_file() or source.stat().st_size > 1024 * 1024:
+        raise ValidationError("evaluation intake must be a regular file under 1 MiB")
+    if destination.is_symlink():
+        raise ValidationError("evaluation output must not be a symlink")
+    try:
+        intake = json.loads(source.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValidationError("evaluation intake must be valid UTF-8 JSON") from exc
+    if not isinstance(intake, dict):
+        raise ValidationError("evaluation intake must contain one JSON object")
+    draft = isolated_evaluation_draft(
+        private_root, client_id, intake, company=company
+    )
+    atomic_write_json(destination, draft)
+    return {
+        "status": "DRAFT",
+        "client_id": policy.client_id,
+        "evaluation_path": destination.relative_to(policy.private_root).as_posix(),
+        "evaluation_sha256": sha256_file(destination),
+        "case_count": len(draft["cases"]),
+        "critical_forbidden_count": len(draft["critical_forbidden"]),
+        "raw_markers_returned": False,
+    }
+
+
+def _file_manifest(root: Path) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for source in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+        if source.is_symlink():
+            raise ValidationError("customer data must not contain symlinks")
+        if source.is_file():
+            entries.append(
+                {
+                    "path": source.relative_to(root).as_posix(),
+                    "sha256": sha256_file(source),
+                    "size": source.stat().st_size,
+                }
+            )
+    return entries
+
+
+def _tree_sha256(entries: Sequence[dict[str, Any]]) -> str:
+    return hashlib.sha256(canonical_json(list(entries)).encode("utf-8")).hexdigest()
+
+
+def backup_client_data(
+    private_root: str | Path,
+    client_id: str,
+    backup_dir: str | Path,
+    *,
+    timestamp: str | None = None,
+    company: CompanyOS | None = None,
+) -> ClientBackupResult:
+    private = Path(private_root).resolve()
+    policy = load_client_policy(private, client_id, company=company)
+    entries = _file_manifest(policy.client_root)
+    destination = contained_path(Path(backup_dir).resolve(), policy.client_id)
+    destination.mkdir(parents=True, exist_ok=True)
+    stamp = timestamp or time.strftime("%Y%m%d-%H%M%S")
+    target = destination / f"client-data-{policy.client_id}-{stamp}.zip"
+    if target.exists():
+        raise FileExistsError(target)
+    manifest = {
+        "schema_version": 1,
+        "client_id": policy.client_id,
+        "tree_sha256": _tree_sha256(entries),
+        "files": entries,
+    }
+    with zipfile.ZipFile(
+        target,
+        "x",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+    ) as archive:
+        archive.writestr(
+            "manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True).encode(
+                "utf-8"
+            ),
+        )
+        for item in entries:
+            archive.write(
+                policy.client_root / str(item["path"]),
+                f"files/{item['path']}",
+            )
+    digest = sha256_file(target)
+    atomic_write_text(target.with_suffix(".sha256"), f"{digest}  {target.name}\n")
+    return ClientBackupResult(target, digest, len(entries), str(manifest["tree_sha256"]))
+
+
+def _safe_archive_name(name: str) -> str:
+    normalized = name.replace("\\", "/")
+    path = Path(normalized.replace("/", os.sep))
+    if path.is_absolute() or ".." in path.parts:
+        raise ValidationError(f"unsafe customer backup entry: {name}")
+    return normalized
+
+
+def verify_client_backup(bundle_path: str | Path) -> ClientBackupVerification:
+    source = Path(bundle_path).resolve()
+    sidecar = source.with_suffix(".sha256")
+    if not source.is_file() or not sidecar.is_file():
+        return ClientBackupVerification(False, False, None, 0, (), ("bundle",))
+    recorded = sidecar.read_text(encoding="utf-8").split()
+    hash_matches = bool(recorded) and recorded[0] == sha256_file(source)
+    missing: list[str] = []
+    mismatched: list[str] = []
+    client_id: str | None = None
+    file_count = 0
+    try:
+        with zipfile.ZipFile(source) as archive:
+            names = archive.namelist()
+            if len(names) != len(set(names)):
+                raise ValidationError("customer backup contains duplicate entries")
+            if "manifest.json" not in names:
+                raise ValidationError("customer backup manifest is missing")
+            manifest = json.loads(archive.read("manifest.json"))
+            if manifest.get("schema_version") != 1:
+                raise ValidationError("unsupported customer backup schema")
+            client_id = _valid_client_id(str(manifest["client_id"]))
+            entries = manifest.get("files")
+            if not isinstance(entries, list):
+                raise ValidationError("customer backup files manifest is invalid")
+            file_count = len(entries)
+            expected = {"manifest.json"}
+            for item in entries:
+                archive_name = _safe_archive_name(f"files/{item['path']}")
+                expected.add(archive_name)
+                if archive_name not in names:
+                    missing.append(archive_name)
+                    continue
+                content = archive.read(archive_name)
+                if (
+                    hashlib.sha256(content).hexdigest() != item["sha256"]
+                    or len(content) != int(item["size"])
+                ):
+                    mismatched.append(archive_name)
+            for unexpected in sorted(set(names) - expected):
+                mismatched.append(f"unexpected:{unexpected}")
+            if _tree_sha256(entries) != manifest.get("tree_sha256"):
+                mismatched.append("tree_sha256")
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+    ):
+        mismatched.append("bundle")
+    return ClientBackupVerification(
+        hash_matches and not missing and not mismatched,
+        hash_matches,
+        client_id,
+        file_count,
+        tuple(missing),
+        tuple(mismatched),
+    )
+
+
+def restore_client_backup(
+    bundle_path: str | Path,
+    new_private_root: str | Path,
+) -> Path:
+    source = Path(bundle_path).resolve()
+    checked = verify_client_backup(source)
+    if not checked.ok or checked.client_id is None:
+        raise ValidationError("customer backup verification failed")
+    destination = contained_path(
+        Path(new_private_root).resolve(), "clients", checked.client_id
+    )
+    if destination.exists():
+        raise FileExistsError(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="client-restore-") as temp_name:
+        staging = Path(temp_name) / checked.client_id
+        staging.mkdir()
+        with zipfile.ZipFile(source) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            for item in manifest["files"]:
+                relative = Path(_safe_archive_name(str(item["path"])).replace("/", os.sep))
+                target = contained_path(staging, relative)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(archive.read(f"files/{item['path']}"))
+        (staging / "material").mkdir(exist_ok=True)
+        (staging / "workspace").mkdir(exist_ok=True)
+        shutil.move(str(staging), str(destination))
+    load_client_policy(Path(new_private_root), checked.client_id)
+    return destination
+
+
+def delete_client_data(
+    company: CompanyOS,
+    private_root: str | Path,
+    client_id: str,
+    *,
+    confirmation: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Delete one client's active data and backups, then retain a hash-only proof."""
+
+    private = Path(private_root).resolve()
+    policy = load_client_policy(private, client_id, company=company)
+    if confirmation != policy.client_id:
+        raise ValidationError("client deletion confirmation does not match client_id")
+    active_entries = _file_manifest(policy.client_root)
+    backup_root = contained_path(private, "backups", policy.client_id)
+    backup_entries = _file_manifest(backup_root) if backup_root.is_dir() else []
+    combined = [
+        {**entry, "scope": "active"} for entry in active_entries
+    ] + [{**entry, "scope": "backup"} for entry in backup_entries]
+    tree_digest = _tree_sha256(combined)
+    deleted_bytes = sum(int(item["size"]) for item in combined)
+    certificate_name = f"{policy.client_id}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    certificate_path = contained_path(private, "deletion-evidence", certificate_name)
+    command_payload = {
+        "client_id": policy.client_id,
+        "pre_delete_tree_sha256": tree_digest,
+        "deleted_file_count": len(combined),
+        "deleted_bytes": deleted_bytes,
+    }
+
+    def operation(connection: Any) -> dict[str, Any]:
+        shutil.rmtree(policy.client_root)
+        if backup_root.exists():
+            shutil.rmtree(backup_root)
+        certificate = {
+            "schema_version": 1,
+            "status": "DELETED",
+            **command_payload,
+            "deleted_at": utc_now(),
+            "raw_customer_data_retained": False,
+        }
+        atomic_write_json(certificate_path, certificate)
+        certificate_sha = sha256_file(certificate_path)
+        event = company.store.append_event(
+            "CUSTOMER_DATA_DELETED",
+            aggregate_type="Client",
+            aggregate_id=policy.client_id,
+            payload={
+                **command_payload,
+                "certificate_path": f"deletion-evidence/{certificate_name}",
+                "certificate_sha256": certificate_sha,
+                "actor": "CEO",
+            },
+            connection=connection,
+        )
+        return {
+            "status": "DELETED",
+            "client_id": policy.client_id,
+            "event_id": str(event["id"]),
+            "certificate_path": str(certificate_path),
+            "certificate_sha256": certificate_sha,
+            "deleted_file_count": len(combined),
+        }
+
+    result = company.store.run_idempotent(
+        idempotency_key,
+        "delete_client_data",
+        command_payload,
+        operation,
+    )
+    assert isinstance(result, dict)
+    return dict(result)

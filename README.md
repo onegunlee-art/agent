@@ -1,9 +1,11 @@
-# AI Company OS V0.4
+# AI Company OS V0.5
 
-Status: **V0.4 implementation candidate**. V0.2 and the V0.3 model-execution
+Status: **V0.5 customer-isolation candidate**. V0.2 and the V0.3 model-execution
 lease integration passed independent review. V0.4 adds a reusable chatbot
 production line and has completed one synthetic customer B model Run; its
 automatically drafted evaluation remains non-official until CEO approval.
+V0.5 adds an outside-the-public-repository customer workspace, fail-closed
+sparse and budget policy, customer backup/restore, and auditable deletion.
 
 AI Company OS is a local, on-demand operating kernel that turns a one-line
 idea into a venture-scoped workspace, a mechanically checked WorkOrder,
@@ -225,14 +227,18 @@ See [architecture](docs/architecture.md) for the implemented flow and
 invariants, [개인 에이전트 코딩 업무 환경](docs/OPERATING_GUIDE_KO.md) for the
 exact conversation and operating entry points, [V0.2 방향과 구현 순서](docs/ROADMAP_V0.2_KO.md)
 for the approved build sequence, and [CLAUDE.md](CLAUDE.md) for manual review
-handoff rules.
+handoff rules. Customer handling is defined in
+[고객별 비공개 저장소 규칙](docs/PRIVATE_CUSTOMER_REPOSITORY_RULES_KO.md) and the
+[파일럿 체크리스트](docs/V05_PILOT_CHECKLIST_KO.md).
 
-## V0.2 boundaries
+## Current boundaries
 
 The OS still has exactly three C-level RoleSpecs: CTO, CPO, and CMO. It does
 not include a scheduler, daemon, external queue, vector database, web crawler,
 external messaging, payments, production deployment, or real customer data.
-All automated tests and the first model cycle use synthetic data.
+All automated tests and the first four model cycles use synthetic data. V0.5
+creates a file-pilot gate; no real customer data is authorized before complete
+independent review and a separate CEO approval.
 
 The built-in exact-text verifier remains `SYNTHETIC_ONLY`. A PASS proves only that
 the declared local path contains the expected bytes. It does not evaluate a
@@ -242,4 +248,6 @@ must not be used to validate a real Venture.
 The Context Manifest provides `LOGICAL_NAMESPACE_ONLY` organization. The
 coding executor therefore also uses a Git worktree plus Codex
 `workspace-write` sandboxing. Worktrees are isolation aids, not security
-boundaries. Confidential multi-tenant workloads remain out of scope.
+boundaries. V0.5 reduces accidental cross-customer access through exact sparse
+patterns and private roots, but Git worktrees are still not security boundaries.
+Unattended multi-tenant production and remote access remain out of scope.

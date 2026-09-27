@@ -10,6 +10,18 @@ from typing import Any, Sequence
 
 from .application import CompanyOS, ExistingArtifactExecutor
 from .dashboard import record_dashboard_action, serve_dashboard
+from .customer_isolation import (
+    backup_client_data,
+    client_sparse_patterns,
+    configure_customer_sparse_checkout,
+    delete_client_data,
+    initialize_client,
+    load_client_policy,
+    restore_client_backup,
+    save_isolated_evaluation_draft,
+    validate_client_execution,
+    verify_client_backup,
+)
 from .errors import CompanyOSError
 from .ledger_backup import (
     backup,
@@ -23,6 +35,7 @@ from .model_executor import (
     CliCodingExecutor,
     ExecutorRequest,
     build_instructions,
+    capture_workspace_identity,
     create_worktree,
     validate_worktree,
 )
@@ -155,6 +168,8 @@ def build_parser() -> argparse.ArgumentParser:
     model_run.add_argument("--test-arg", required=True, action="append")
     model_run.add_argument("--reuse-worktree", action="store_true")
     model_run.add_argument("--idempotency-key", required=True)
+    model_run.add_argument("--client-id")
+    model_run.add_argument("--private-root", type=Path)
 
     review = commands.add_parser("review", help="Ingest a supplied ReviewResult")
     review_commands = review.add_subparsers(dest="review_command", required=True)
@@ -230,6 +245,40 @@ def build_parser() -> argparse.ArgumentParser:
     skill_promote.add_argument("--approval-event")
     skill_promote.add_argument("--destination-root", type=Path)
     skill_promote.add_argument("--idempotency-key")
+
+    client = commands.add_parser(
+        "client", help="Manage isolated private customer workspaces"
+    )
+    client_commands = client.add_subparsers(dest="client_command", required=True)
+    client_init = client_commands.add_parser("init")
+    client_init.add_argument("client_id")
+    client_init.add_argument("--private-root", type=Path, required=True)
+    client_init.add_argument("--markers-file", type=Path, required=True)
+    client_init.add_argument("--token-limit", type=int, required=True)
+    client_init.add_argument("--cost-limit-usd", type=float, required=True)
+    client_init.add_argument("--idempotency-key", required=True)
+    client_policy = client_commands.add_parser("policy")
+    client_policy.add_argument("client_id")
+    client_policy.add_argument("--private-root", type=Path, required=True)
+    client_evaluation = client_commands.add_parser("evaluation-draft")
+    client_evaluation.add_argument("client_id")
+    client_evaluation.add_argument("--private-root", type=Path, required=True)
+    client_evaluation.add_argument("--intake", type=Path, required=True)
+    client_evaluation.add_argument("--output", type=Path, required=True)
+    client_backup = client_commands.add_parser("backup")
+    client_backup.add_argument("client_id")
+    client_backup.add_argument("--private-root", type=Path, required=True)
+    client_backup.add_argument("--dir", type=Path, required=True)
+    client_verify = client_commands.add_parser("verify-backup")
+    client_verify.add_argument("--bundle", type=Path, required=True)
+    client_restore = client_commands.add_parser("restore")
+    client_restore.add_argument("--bundle", type=Path, required=True)
+    client_restore.add_argument("--to-private-root", type=Path, required=True)
+    client_delete = client_commands.add_parser("delete")
+    client_delete.add_argument("client_id")
+    client_delete.add_argument("--private-root", type=Path, required=True)
+    client_delete.add_argument("--confirm-client-id", required=True)
+    client_delete.add_argument("--idempotency-key", required=True)
 
     ledger = commands.add_parser("ledger", help="Back up, verify, or restore the ledger")
     ledger_commands = ledger.add_subparsers(dest="ledger_command", required=True)
@@ -393,6 +442,24 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         work_order = company.work_order(args.work_order_id)
         repository = args.repository.resolve()
         worktree = args.worktree.resolve()
+        client_policy = None
+        if bool(args.client_id) != bool(args.private_root):
+            raise ValueError("customer model-run requires both --client-id and --private-root")
+        if args.client_id:
+            client_policy = load_client_policy(
+                args.private_root, args.client_id, company=company
+            )
+            if client_policy.client_root not in instructions_path.parents:
+                raise ValueError(
+                    "customer instructions file must stay inside its private client folder"
+                )
+            validate_client_execution(
+                client_policy,
+                repository=repository,
+                sparse_checkout_patterns=client_sparse_patterns(args.client_id),
+                token_limit=work_order.token_limit,
+                cost_limit_usd=work_order.cost_limit_usd,
+            )
         if worktree.exists():
             if not args.reuse_worktree:
                 raise ValueError(
@@ -401,6 +468,19 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
             workspace = validate_worktree(repository, args.branch, worktree)
         else:
             workspace = create_worktree(repository, args.branch, worktree)
+        if client_policy is not None:
+            if not args.reuse_worktree:
+                configure_customer_sparse_checkout(
+                    workspace, client_policy.sparse_checkout_patterns
+                )
+            identity = capture_workspace_identity(workspace)
+            validate_client_execution(
+                client_policy,
+                repository=repository,
+                sparse_checkout_patterns=identity.sparse_checkout_patterns,
+                token_limit=work_order.token_limit,
+                cost_limit_usd=work_order.cost_limit_usd,
+            )
         test_command = tuple(args.test_arg)
         instructions = build_instructions(
             instructions_path.read_text(encoding="utf-8"),
@@ -606,6 +686,56 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
             destination_root=args.destination_root,
             idempotency_key=args.idempotency_key
             or f"cli-skill-promote:{candidate_hash}:{args.approval_event}",
+        )
+    if args.command == "client":
+        if args.client_command == "init":
+            markers = read_json(args.markers_file.resolve())
+            if not isinstance(markers, dict):
+                raise ValueError("markers file must contain one JSON object")
+            return initialize_client(
+                company,
+                args.private_root,
+                args.client_id,
+                private_markers=markers.get("private_markers", []),
+                customer_markers=markers.get("customer_markers", []),
+                token_limit=args.token_limit,
+                cost_limit_usd=args.cost_limit_usd,
+                idempotency_key=args.idempotency_key,
+            )
+        if args.client_command == "policy":
+            return load_client_policy(
+                args.private_root, args.client_id, company=company
+            )
+        if args.client_command == "evaluation-draft":
+            return save_isolated_evaluation_draft(
+                args.private_root,
+                args.client_id,
+                args.intake,
+                args.output,
+                company=company,
+            )
+        if args.client_command == "backup":
+            return backup_client_data(
+                args.private_root,
+                args.client_id,
+                args.dir,
+                company=company,
+            )
+        if args.client_command == "verify-backup":
+            return verify_client_backup(args.bundle)
+        if args.client_command == "restore":
+            return {
+                "status": "RESTORED",
+                "client_root": restore_client_backup(
+                    args.bundle, args.to_private_root
+                ),
+            }
+        return delete_client_data(
+            company,
+            args.private_root,
+            args.client_id,
+            confirmation=args.confirm_client_id,
+            idempotency_key=args.idempotency_key,
         )
     if args.command == "ledger" and args.ledger_command == "backup":
         return backup(company.db_path, args.dir)
