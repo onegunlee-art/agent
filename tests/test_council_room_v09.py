@@ -272,3 +272,19 @@ def test_subscription_runner_uses_read_only_separate_cli_processes_and_safe_env(
     for _command, _cwd, environment, _timeout, _input in calls:
         assert "OPENAI_API_KEY" not in environment
         assert "ANTHROPIC_API_KEY" not in environment
+
+
+def test_default_codex_resolution_prefers_current_work_install_over_stale_path(
+    tmp_path, monkeypatch
+):
+    current = tmp_path / ".codex" / ".sandbox-bin" / "codex.exe"
+    current.parent.mkdir(parents=True)
+    current.write_bytes(b"synthetic executable")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(
+        "company_os.council_room.shutil.which", lambda _name: "C:/stale/codex.exe"
+    )
+
+    runner = SubscriptionExecutiveRunner()
+
+    assert runner._resolve("codex", provider="codex") == str(current.resolve())
