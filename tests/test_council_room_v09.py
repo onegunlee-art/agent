@@ -11,6 +11,7 @@ from company_os.council_room import (
     ExecutiveOutcome,
     ExecutiveRequest,
     InteractiveCouncil,
+    SubscriptionExecutiveRunner,
 )
 from company_os.errors import ConflictError, ValidationError
 
@@ -200,3 +201,68 @@ def test_turn_rejects_more_or_fewer_than_three_role_routes(council):
             runner=runner,
             role_routes={"cto": "codex", "cpo": "codex", "cmo": "codex"},
         )
+
+
+def test_subscription_runner_uses_read_only_separate_cli_processes_and_safe_env(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-leak")
+    calls = []
+
+    def process(command, *, cwd, environment, timeout, input_text):
+        calls.append((command, cwd, environment, timeout, input_text))
+        role = "cpo" if command[0].endswith("claude.exe") else "cto"
+        response = response_for(role, 1)
+        if role == "cto":
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text(json.dumps(response), encoding="utf-8")
+            stdout = json.dumps(
+                {
+                    "type": "turn.completed",
+                    "model": "gpt-current",
+                    "usage": {"input_tokens": 11, "output_tokens": 7},
+                }
+            )
+        else:
+            stdout = json.dumps(
+                {
+                    "structured_output": response,
+                    "model": "claude-current",
+                    "usage": {"input_tokens": 13, "output_tokens": 6},
+                }
+            )
+        import subprocess
+
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    runner = SubscriptionExecutiveRunner(
+        codex_executable="codex.exe",
+        claude_executable="C:/tools/claude.exe",
+        process_runner=process,
+    )
+    base = dict(
+        session_id="session-1",
+        turn_id="turn-1",
+        turn_number=1,
+        prompt="bounded prompt",
+        frozen_input_json="{}",
+        frozen_input_sha256="a" * 64,
+        time_limit_seconds=60,
+    )
+    codex = runner.run(
+        ExecutiveRequest(role="cto", provider="codex", workspace=tmp_path / "cto", **base)
+    )
+    claude = runner.run(
+        ExecutiveRequest(role="cpo", provider="claude", workspace=tmp_path / "cpo", **base)
+    )
+
+    assert codex.status == claude.status == "COMPLETED"
+    assert codex.model == "gpt-current"
+    assert claude.model == "claude-current"
+    assert "--sandbox" in calls[0][0] and "read-only" in calls[0][0]
+    assert "--no-session-persistence" in calls[1][0]
+    assert calls[0][1] != calls[1][1]
+    for _command, _cwd, environment, _timeout, _input in calls:
+        assert "OPENAI_API_KEY" not in environment
+        assert "ANTHROPIC_API_KEY" not in environment
