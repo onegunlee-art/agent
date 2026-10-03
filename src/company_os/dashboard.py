@@ -341,16 +341,104 @@ def read_dashboard(
             job = json.loads(row["value_json"])
             automation_jobs.append({key: job.get(key) for key in (
                 "id", "status", "repair_count", "model_calls", "total_tokens", "unknown_usage_calls")})
+        council_sessions = []
+        for session_row in connection.execute(
+            "SELECT * FROM council_sessions ORDER BY updated_at DESC, id DESC"
+        ).fetchall():
+            latest_turn = connection.execute(
+                "SELECT * FROM council_turns WHERE session_id=? ORDER BY turn_number DESC LIMIT 1",
+                (session_row["id"],),
+            ).fetchone()
+            role_outputs: dict[str, Any] = {}
+            unresolved_count = 0
+            if latest_turn is not None:
+                for role in ("cto", "cpo", "cmo"):
+                    run = connection.execute(
+                        "SELECT * FROM council_role_runs WHERE turn_id=? AND role=? ORDER BY attempt DESC LIMIT 1",
+                        (latest_turn["id"], role),
+                    ).fetchone()
+                    if run is None:
+                        continue
+                    role_outputs[role] = {
+                        "status": run["status"],
+                        "provider": run["provider"],
+                        "model": run["model"],
+                        "output_path": run["output_path"],
+                        "output_sha256": run["output_sha256"],
+                    }
+                    event = connection.execute(
+                        "SELECT payload_json FROM events WHERE event_type='COUNCIL_ROLE_EXECUTION_FINALIZED' "
+                        "AND aggregate_type='CouncilRoleRun' AND aggregate_id=? "
+                        "ORDER BY sequence DESC LIMIT 1",
+                        (run["id"],),
+                    ).fetchone()
+                    if event is not None:
+                        event_payload = json.loads(event["payload_json"])
+                        unresolved_count += int(event_payload.get("unresolved_count", 0))
+            turn_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM council_turns WHERE session_id=?",
+                    (session_row["id"],),
+                ).fetchone()[0]
+            )
+            council_sessions.append(
+                {
+                    "session_id": session_row["id"],
+                    "idea_id": session_row["idea_id"],
+                    "status": session_row["status"],
+                    "turn_count": turn_count,
+                    "latest_turn_status": None if latest_turn is None else latest_turn["status"],
+                    "latest_role_outputs": role_outputs,
+                    "unresolved_count": unresolved_count,
+                }
+            )
+        products = []
+        for product_row in connection.execute(
+            """
+            SELECT p.id, p.status, p.current_bundle_id,
+                   b.version, b.status AS bundle_status, b.approval_bundle_path,
+                   b.approval_bundle_sha256, b.user_scenarios_path,
+                   b.implementation_plan_path, b.target_json
+            FROM products p
+            LEFT JOIN product_bundles b ON b.id=p.current_bundle_id
+            ORDER BY p.updated_at DESC, p.id DESC
+            """
+        ).fetchall():
+            bundle_status = product_row["bundle_status"]
+            products.append(
+                {
+                    "product_id": product_row["id"],
+                    "status": product_row["status"],
+                    "bundle_id": product_row["current_bundle_id"],
+                    "bundle_version": product_row["version"],
+                    "bundle_status": bundle_status,
+                    "bundle_sha256": product_row["approval_bundle_sha256"],
+                    "approval_bundle_path": product_row["approval_bundle_path"],
+                    "user_scenarios_path": product_row["user_scenarios_path"],
+                    "implementation_plan_path": product_row["implementation_plan_path"],
+                    "target": json.loads(product_row["target_json"])
+                    if product_row["target_json"]
+                    else None,
+                    "attention_kind": (
+                        "SCENARIO_APPROVAL_PENDING" if bundle_status == "DRAFT" else None
+                    ),
+                }
+            )
+        product_attention = sum(
+            item["attention_kind"] is not None for item in products
+        )
         return {
             "read_only": True,
             "automation_jobs": automation_jobs,
+            "council_sessions": council_sessions,
+            "products": products,
             "work_orders": items,
             "attention_count": sum(
                 item["attention_kind"] is not None for item in items
-            ),
+            ) + product_attention,
             "approval_pending_count": sum(
                 item["attention_kind"] == "APPROVAL_PENDING" for item in items
-            ),
+            ) + product_attention,
             "decision_required_count": sum(
                 item["attention_kind"] == "CEO_DECISION_REQUIRED" for item in items
             ),
@@ -482,6 +570,47 @@ def _format_usd(value: Any, *, unknown: bool = False) -> str:
 
 
 def _render_page(snapshot: dict[str, Any], csrf_token: str, preview_url: str) -> str:
+    council_rows = "".join(
+        "<tr>"
+        f"<td><code>{html.escape(str(item['session_id']))}</code></td>"
+        f"<td>{html.escape(str(item['status']))}</td>"
+        f"<td>{int(item['turn_count'])}</td>"
+        f"<td>{html.escape(str(item.get('latest_turn_status') or '없음'))}</td>"
+        f"<td>{int(item.get('unresolved_count', 0))}</td>"
+        "<td>"
+        + " ".join(
+            f"<code>{html.escape(role.upper())}:{html.escape(str(value.get('status')))}</code>"
+            for role, value in item.get("latest_role_outputs", {}).items()
+        )
+        + "</td></tr>"
+        for item in snapshot.get("council_sessions", [])
+    )
+    council_section = (
+        '<section class="card"><h2>임원 회의</h2>'
+        '<p>CTO·CPO·CMO 발언 원문은 해시 결속된 로컬 파일에 보존됩니다.</p>'
+        '<div class="table-wrap"><table><tr><th>세션</th><th>상태</th><th>턴</th>'
+        '<th>최근 턴</th><th>미해결</th><th>역할 상태</th></tr>'
+        + (council_rows or '<tr><td colspan="6">열린 회의가 없습니다.</td></tr>')
+        + '</table></div></section>'
+    )
+    product_rows = "".join(
+        "<tr>"
+        f"<td><code>{html.escape(str(item['product_id']))}</code></td>"
+        f"<td>{html.escape(str(item.get('bundle_status') or item['status']))}</td>"
+        f"<td>{'사용자 시나리오 승인 대기' if item.get('attention_kind') else '진행 가능'}</td>"
+        f"<td><code>{html.escape(str(item.get('bundle_id') or '없음'))}</code></td>"
+        f"<td><code>{html.escape(str(item.get('bundle_sha256') or '없음'))}</code></td>"
+        "</tr>"
+        for item in snapshot.get("products", [])
+    )
+    product_section = (
+        '<section class="card"><h2>제품 설계·승인</h2>'
+        '<p>승인된 같은 묶음의 시나리오·설계·계획만 개발할 수 있습니다.</p>'
+        '<div class="table-wrap"><table><tr><th>제품</th><th>묶음 상태</th>'
+        '<th>CEO 확인</th><th>Bundle</th><th>SHA-256</th></tr>'
+        + (product_rows or '<tr><td colspan="5">제품 승인 묶음이 없습니다.</td></tr>')
+        + '</table></div></section>'
+    )
     queue_rows = "".join(
         "<tr>" + "".join("<td>" + html.escape(str(job.get(key, ""))) + "</td>" for key in (
             "id", "status", "repair_count", "model_calls", "total_tokens", "unknown_usage_calls")) + "</tr>"
@@ -667,7 +796,7 @@ background:white;border-radius:9px;padding:10px 13px;font-weight:750;cursor:poin
 <main class="shell"><section class="summary"><div class="metric"><span>CEO 확인 필요</span><strong>""" + str(snapshot["attention_count"]) + """</strong></div>
 <div class="metric"><span>승인 대기</span><strong>""" + str(snapshot["approval_pending_count"]) + """</strong></div>
 <div class="metric"><span>판단 필요</span><strong>""" + str(snapshot["decision_required_count"]) + """</strong></div></section>
-""" + queue_section + """<div class="section-title"><h2>WorkOrder 운영 현황</h2><span class="read-only">● SQLite read-only 조회</span></div>""" + "".join(cards) + "</main></body></html>"
+""" + council_section + product_section + queue_section + """<div class="section-title"><h2>WorkOrder 운영 현황</h2><span class="read-only">● SQLite read-only 조회</span></div>""" + "".join(cards) + "</main></body></html>"
 
 
 class DashboardServer(ThreadingHTTPServer):

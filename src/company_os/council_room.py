@@ -954,6 +954,14 @@ class InteractiveCouncil:
                         "fence_token": fence_token,
                         "output_sha256": output_sha,
                         "usage": outcome.usage,
+                        "question_count": len(response.get("questions", []))
+                        if response is not None
+                        else 0,
+                        "unresolved_count": len(
+                            response.get("unresolved_decisions", [])
+                        )
+                        if response is not None
+                        else 0,
                     },
                     connection=connection,
                 )
