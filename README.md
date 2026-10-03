@@ -14,7 +14,8 @@ The operating kernel remains an on-demand Python CLI. It includes an explicitly
 invoked Codex CLI executor, rubric evaluation, deterministic synthetic FAQ
 bots, a loopback-only status page, execution leases, online ledger backup, and
 candidate-to-approved reusable-skill promotion gates.
-CTO, CPO, CMO, and Claude interactions still use structured file handoffs.
+CTO, CPO, and CMO interactions use structured file handoffs. Claude review can
+use the manual handoff or the bounded `company work review --headless` command.
 The preview bot itself is deterministic FAQ retrieval; Codex is the coding
 executor, not the model generating each preview answer.
 
