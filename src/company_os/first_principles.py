@@ -158,7 +158,7 @@ class FirstPrinciplesGate:
         self,
         contract: Mapping[str, Any],
         *,
-        min_decision_level: str = "FP_LITE",
+        min_decision_level: str = "FP_STANDARD",
         trusted_evidence_refs: frozenset[str] = frozenset(),
         evidence_grants: Mapping[str, EvidenceGrant] | None = None,
         ceo_approved: bool = False,
@@ -235,6 +235,12 @@ class FirstPrinciplesGate:
 
         self._validate_governance_checks(contract, violations)
         if level == "FP_LITE":
+            self._add(
+                violations,
+                "FP_LITE_RETIRED",
+                "decision_level",
+                "FP_LITE is retained for historical diagnostics only; use FP_STANDARD or FP_FULL.",
+            )
             self._validate_lite(
                 contract,
                 trusted_refs,

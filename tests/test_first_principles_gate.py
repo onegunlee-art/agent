@@ -446,11 +446,16 @@ def test_gate_rejects_fact_with_mixed_trusted_and_untrusted_source_types() -> No
     }
 
 
-def test_gate_accepts_complete_lite_contract() -> None:
+def test_gate_retires_lite_even_with_explicit_legacy_minimum() -> None:
     result = validate_contract(valid_lite_contract())
 
-    assert result.passed is True
-    assert result.violations == ()
+    assert result.passed is False
+    assert "FP_LITE_RETIRED" in {item.code for item in result.violations}
+    contract = valid_lite_contract()
+    contract["claims"] = [{"id": "invented", "type": "FACT", "statement": "Unsupported"}]
+    result = FirstPrinciplesGate().validate(contract, min_decision_level="FP_LITE")
+    assert result.passed is False
+    assert "FP_LITE_RETIRED" in {item.code for item in result.violations}
 
 
 def test_gate_rejects_unstructured_lite_known_fact_even_when_nonempty() -> None:

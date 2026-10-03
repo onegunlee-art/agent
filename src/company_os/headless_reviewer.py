@@ -1,6 +1,6 @@
 """On-demand Claude review. SQLite owns leases; files are immutable receipts.
 
-V0.7 is deliberately not a scheduler or an autonomous repair loop. Tests are
+This adapter performs one review without implicit retries. Tests are
 run by the kernel in a committed product export. Claude receives read tools,
 the exact request, source, and test receipt, not write/shell/network tools.
 """
@@ -91,6 +91,7 @@ def response_schema(request: dict) -> dict:
     props.update(verdict={"type": "string", "enum": ["PASS", "CHANGES_REQUIRED"]},
                  findings=records(["code", "message"]),
                  required_changes=records(["id", "description"]))
+    props["required_changes"]["items"]["properties"]["id"]["pattern"] = r"^\S+$"
     return {"type": "object", "properties": props,
             "required": list(props), "additionalProperties": False}
 
@@ -289,6 +290,7 @@ def run_headless_review(company, work_order_id, *, repository: Path,
     result = None
     metadata = {}
     status = "CLI_FAILED"
+    model_calls = 0
     directory.mkdir()
     def remaining():
         seconds = state["expires_at"] - time.time()
@@ -341,6 +343,7 @@ def run_headless_review(company, work_order_id, *, repository: Path,
             )
             _write(directory / "prompt.txt", prompt)
             _json_write(directory / "command.json", command)
+            model_calls = 1
             completed = _run_process(command, cwd=workspace, environment=environment,
                                      timeout=remaining(), input_text=prompt)
             _write(directory / "stdout.json", completed.stdout)
@@ -368,7 +371,7 @@ def run_headless_review(company, work_order_id, *, repository: Path,
                "kernel_source": request.get("kernel_source"),
                "duration_seconds": round(time.time() - started, 3),
                "cost_usd": None, "total_tokens": None,
-               "model_call_unit": "CODING_AGENT_CLI_PROCESS",
+               "model_call_unit": "CODING_AGENT_CLI_PROCESS", "model_calls": model_calls,
                "token_limit_enforcement": "POST_EXECUTION_REJECTION",
                "evidence_directory": str(directory), **metadata}
     # A stale worker may preserve diagnostics but can never overwrite its successor.

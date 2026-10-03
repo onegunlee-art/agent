@@ -9,8 +9,9 @@ AI를 동시에 생산자로 쓰지 않는다. 내부 실행자가 필요할 때
 
 Codex는 현재 작업 트리와 `AGENTS.md`를 읽고 코드를 수정·시험하는 생산자다.
 `company` CLI는 대화형 에이전트가 아니라 승인 상태, Evidence, Event,
-WorkOrder를 보존하는 회사 원장이다. Claude Opus는 생성된 ReviewRequest와
-소스 ZIP을 받아 독립 검수하는 외부 수동 검토자다.
+WorkOrder를 보존하는 회사 원장이다. Claude는 수동 전달 또는 같은 PC의
+Claude Code 자동 검수로 제품을 읽는다. [V0.8](V08_ON_DEMAND_AUTOMATION_KO.md)의
+수동 실행 대기열은 검수·범위 내 수정·시험·재검수를 한 번의 전경 실행으로 연결한다.
 
 따라서 일상 사용에서 창구는 다음처럼 나뉜다.
 

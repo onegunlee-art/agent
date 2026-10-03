@@ -1,10 +1,16 @@
-# AI Company OS V0.7
+# AI Company OS V0.8
 
-Status: **V0.7 on-demand headless review implementation**. The existing ledger,
+Status: **V0.8 on-demand review and bounded automatic repair**. The existing ledger,
 execution leases, customer isolation, backup/deletion, and V0.6 notification
 boundaries remain intact. Automated review binds a committed product repository
 separately from the kernel version. A live Claude subscription login is required;
 installation or unit-test success alone does not constitute independent review.
+
+Explicitly enqueue a verified product order with `company queue add`, then use
+`company queue run` to review, repair scoped files, record real pytest receipts,
+and rereview. `company tick` processes one phase. Daily limits default to unlimited;
+usage remains recorded. No overnight schedule is installed.
+See [V0.8 operating flow](docs/V08_ON_DEMAND_AUTOMATION_KO.md).
 
 AI Company OS is a local, on-demand operating kernel that turns a one-line
 idea into a venture-scoped workspace, a mechanically checked WorkOrder,

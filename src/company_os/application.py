@@ -543,7 +543,7 @@ class CompanyOS:
         work = self.work_order(work_order_id)
         if work.status != "REPAIR_REQUIRED":
             raise ValidationError("TEST_RESULT requires a REPAIR_REQUIRED WorkOrder")
-        snapshot = self._source_snapshot()
+        snapshot = self._work_order_source_snapshot(work_order_id)
         if source_commit != snapshot.source_commit:
             raise ValidationError("TEST_RESULT source_commit does not match source")
         if declared_tree != snapshot.source_tree_sha256:
@@ -605,7 +605,7 @@ class CompanyOS:
         created_paths: list[Path] = []
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
-            current_snapshot = self._source_snapshot()
+            current_snapshot = self._work_order_source_snapshot(work_order_id)
             if current_snapshot != snapshot:
                 raise ValidationError(
                     "Source changed while registering TEST_RESULT Evidence"
@@ -3037,7 +3037,7 @@ class CompanyOS:
             if _repair_mode and verification.status == "PASS":
                 if _repair_manifest is None:
                     raise ValidationError("Repair PASS requires a repair manifest")
-                repair_snapshot = self._source_snapshot()
+                repair_snapshot = self._work_order_source_snapshot(work_order_id)
                 if (
                     repair_snapshot.source_commit
                     != _repair_manifest["source_commit"]
@@ -3832,6 +3832,7 @@ class CompanyOS:
         executor: Any,
         request: ExecutorRequest,
         idempotency_key: str,
+        repair_review_id: str | None = None,
     ) -> tuple[Run, ExecutorOutcome]:
         """Claim a WorkOrder lease, run one model process, and fence its result."""
 
@@ -3868,6 +3869,7 @@ class CompanyOS:
             "cost_limit_usd": request.cost_limit_usd,
             "model_call_limit": request.model_call_limit,
             "token_limit": request.token_limit,
+            "repair_review_id": repair_review_id,
         }
         execution_id = new_id("execution")
         claimed_at = utc_now()
@@ -3913,7 +3915,19 @@ class CompanyOS:
                     if current_row is None:
                         raise NotFoundError(f"WorkOrder not found: {work_order_id}")
                     current_work = self._work_order_from_row(current_row)
-                    if current_work.status not in {"READY", "VERIFICATION_FAILED"}:
+                    allowed_statuses = {"READY", "VERIFICATION_FAILED"}
+                    if repair_review_id is not None:
+                        repair_row = connection.execute(
+                            "SELECT * FROM reviews WHERE work_order_id=? AND status='CHANGES_REQUIRED' "
+                            "ORDER BY created_at DESC, id DESC LIMIT 1", (work_order_id,),
+                        ).fetchone()
+                        if repair_row is None or repair_row["id"] != repair_review_id:
+                            raise ValidationError("Model repair must bind the latest CHANGES_REQUIRED review")
+                        product = json.loads(repair_row["payload_json"])["request"].get("source_repository")
+                        if not product or Path(product).resolve() != request.workspace.resolve():
+                            raise ValidationError("Model repair workspace must match the reviewed product")
+                        allowed_statuses = {"REPAIR_REQUIRED"}
+                    if current_work.status not in allowed_statuses:
                         raise ValidationError(
                             "WorkOrder cannot model-run from status "
                             f"{current_work.status}"
@@ -5275,6 +5289,15 @@ class CompanyOS:
     ) -> Review:
         preflight_work = self.work_order(work_order_id)
         product_root = Path(source_repository).resolve() if source_repository is not None else None
+        if product_root is None and preflight_work.status == "AWAITING_REREVIEW":
+            previous = self.store.query_one(
+                "SELECT payload_json FROM reviews WHERE work_order_id=? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (work_order_id,),
+            )
+            if previous is not None:
+                bound = json.loads(previous["payload_json"])["request"].get("source_repository")
+                if bound:
+                    product_root = Path(bound).resolve()
         def capture_source() -> SourceSnapshot:
             return (GitSourceSnapshot(code_root=product_root).capture()
                     if product_root is not None else self._source_snapshot())
@@ -5865,6 +5888,14 @@ class CompanyOS:
         return (GitSourceSnapshot(code_root=repository).capture()
                 if repository else self._source_snapshot())
 
+    def _work_order_source_snapshot(self, work_order_id: str) -> SourceSnapshot:
+        """Repair receipts follow their product binding, not the kernel checkout."""
+        row = self.store.query_one(
+            "SELECT * FROM reviews WHERE work_order_id=? ORDER BY created_at DESC, id DESC LIMIT 1",
+            (work_order_id,),
+        )
+        return self._review_source_snapshot(row) if row is not None else self._source_snapshot()
+
     def ingest_review_result(
         self, review_id: str, result_file: str | Path,
         *, _headless_execution_id: str | None = None,
@@ -6307,7 +6338,7 @@ class CompanyOS:
             raise ValidationError(
                 "Repair manifest must reference the latest CHANGES_REQUIRED Review"
             )
-        snapshot = self._source_snapshot()
+        snapshot = self._review_source_snapshot(review_row)
         if repair_manifest["source_commit"] != snapshot.source_commit:
             raise ValidationError("Repair manifest source_commit does not match source")
         if repair_manifest["source_tree_sha256"] != snapshot.source_tree_sha256:
@@ -6670,9 +6701,13 @@ class CompanyOS:
             )
             if latest_run is None:
                 raise ValidationError("AWAITING_REREVIEW has no PASS repair Run")
+            review_count = int(self.store.scalar(
+                "SELECT COUNT(*) FROM reviews WHERE work_order_id = ?",
+                (work_order_id,),
+            ))
             return self.prepare_review(
                 work_order_id,
-                idempotency_key=f"rereview:{work_order_id}:{latest_run['id']}",
+                idempotency_key=f"resume-rereview:{work_order_id}:{latest_run['id']}:{review_count}",
             )
         next_attempt = len(self.runs_for_work_order(work_order_id)) + 1
         if work_order.status == "REPAIR_REQUIRED":

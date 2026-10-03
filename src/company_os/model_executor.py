@@ -403,7 +403,13 @@ class CliCodingExecutor:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-            stdout, stderr = process.communicate()
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = exc.stdout or "", exc.stderr or ""
+                process.stdout.close()
+                process.stderr.close()
             exc.stdout = stdout
             exc.stderr = stderr
             raise

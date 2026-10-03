@@ -334,8 +334,16 @@ def read_dashboard(
             None: 2,
         }
         items.sort(key=lambda item: (priority[item["attention_kind"]], item["id"]))
+        automation_jobs = []
+        for row in connection.execute(
+            "SELECT value_json FROM global_state WHERE key LIKE 'automation:job:%' ORDER BY updated_at DESC"
+        ).fetchall():
+            job = json.loads(row["value_json"])
+            automation_jobs.append({key: job.get(key) for key in (
+                "id", "status", "repair_count", "model_calls", "total_tokens", "unknown_usage_calls")})
         return {
             "read_only": True,
+            "automation_jobs": automation_jobs,
             "work_orders": items,
             "attention_count": sum(
                 item["attention_kind"] is not None for item in items
@@ -474,6 +482,19 @@ def _format_usd(value: Any, *, unknown: bool = False) -> str:
 
 
 def _render_page(snapshot: dict[str, Any], csrf_token: str, preview_url: str) -> str:
+    queue_rows = "".join(
+        "<tr>" + "".join("<td>" + html.escape(str(job.get(key, ""))) + "</td>" for key in (
+            "id", "status", "repair_count", "model_calls", "total_tokens", "unknown_usage_calls")) + "</tr>"
+        for job in snapshot.get("automation_jobs", [])
+    )
+    queue_section = (
+        '<section class="card"><h2>수동 실행 대기열</h2>'
+        '<p>Codex 작업 채팅에서 “대기열 한 단계 진행해”라고 지시합니다. 야간 예약은 꺼져 있습니다.</p>'
+        '<div class="table-wrap"><table><tr><th>작업</th><th>진행 상태</th><th>수정 횟수</th>'
+        '<th>CLI 호출</th><th>확인된 토큰</th><th>사용량 미확인</th></tr>'
+        + (queue_rows or '<tr><td colspan="6">등록된 대기열 작업이 없습니다.</td></tr>')
+        + '</table></div></section>'
+    )
     cards: list[str] = []
     csrf = html.escape(csrf_token, quote=True)
     for item in snapshot["work_orders"]:
@@ -646,7 +667,7 @@ background:white;border-radius:9px;padding:10px 13px;font-weight:750;cursor:poin
 <main class="shell"><section class="summary"><div class="metric"><span>CEO 확인 필요</span><strong>""" + str(snapshot["attention_count"]) + """</strong></div>
 <div class="metric"><span>승인 대기</span><strong>""" + str(snapshot["approval_pending_count"]) + """</strong></div>
 <div class="metric"><span>판단 필요</span><strong>""" + str(snapshot["decision_required_count"]) + """</strong></div></section>
-<div class="section-title"><h2>WorkOrder 운영 현황</h2><span class="read-only">● SQLite read-only 조회</span></div>""" + "".join(cards) + "</main></body></html>"
+""" + queue_section + """<div class="section-title"><h2>WorkOrder 운영 현황</h2><span class="read-only">● SQLite read-only 조회</span></div>""" + "".join(cards) + "</main></body></html>"
 
 
 class DashboardServer(ThreadingHTTPServer):
