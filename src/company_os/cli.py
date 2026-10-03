@@ -45,6 +45,7 @@ from .model_executor import (
     create_worktree,
     validate_worktree,
 )
+from .notifications import dispatch_pending_notifications
 from .roles import list_role_specs, serialize_role_spec
 from .review_package import build_review_materials
 from .skill_promotion import (
@@ -160,6 +161,13 @@ def build_parser() -> argparse.ArgumentParser:
     work_review = work_commands.add_parser("review")
     work_review.add_argument("work_order_id")
     work_review.add_argument("--idempotency-key")
+    work_review.add_argument("--headless", action="store_true")
+    work_review.add_argument("--repository", type=Path)
+    work_review.add_argument("--test-arg", action="append")
+    work_review.add_argument("--claude-executable", default="claude")
+    work_review.add_argument("--timeout-seconds", type=int, default=600)
+    work_review.add_argument("--token-limit", type=int, default=100000)
+    work_review.add_argument("--max-turns", type=int, default=8)
     work_resume = work_commands.add_parser("resume")
     work_resume.add_argument("work_order_id")
     work_resume.add_argument("--repair-manifest", type=Path)
@@ -344,6 +352,19 @@ def build_parser() -> argparse.ArgumentParser:
     audit_push.add_argument("--tag", action="append", required=True)
     audit_push.add_argument("--approval-file", type=Path, required=True)
     audit_push.add_argument("--idempotency-key", required=True)
+
+    notification = commands.add_parser(
+        "notification", help="Dispatch outbound-only CEO attention notices"
+    )
+    notification_commands = notification.add_subparsers(
+        dest="notification_command", required=True
+    )
+    notification_dispatch = notification_commands.add_parser("dispatch")
+    notification_dispatch.add_argument("--outbox", type=Path, required=True)
+    notification_dispatch.add_argument("--config", type=Path)
+    notification_dispatch.add_argument(
+        "--dashboard-url", default="http://127.0.0.1:8780/"
+    )
 
     events = commands.add_parser("events", help="Export the append-only ledger")
     event_commands = events.add_subparsers(dest="events_command", required=True)
@@ -586,6 +607,16 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
             args.work_order_id, idempotency_key=key
         )
     if args.command == "work" and args.work_command == "review":
+        if args.headless:
+            from .headless_reviewer import run_headless_review
+            if args.repository is None or not args.test_arg or not args.idempotency_key:
+                raise ValueError("--headless requires --repository, --test-arg and --idempotency-key")
+            return run_headless_review(
+                company, args.work_order_id, repository=args.repository,
+                test_command=args.test_arg, idempotency_key=args.idempotency_key,
+                executable=args.claude_executable, timeout_seconds=args.timeout_seconds,
+                token_limit=args.token_limit, max_turns=args.max_turns,
+            )
         review_count = int(
             company.store.scalar(
                 "SELECT COUNT(*) FROM reviews WHERE work_order_id = ?",
@@ -865,6 +896,16 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
             approval_file=args.approval_file,
             idempotency_key=args.idempotency_key,
         )
+    if (
+        args.command == "notification"
+        and args.notification_command == "dispatch"
+    ):
+        return dispatch_pending_notifications(
+            company,
+            outbox=args.outbox,
+            config_path=args.config,
+            dashboard_url=args.dashboard_url,
+        )
     if args.command == "events" and args.events_command == "export":
         path = company.export_event_ledger(args.output)
         return {"status": "EXPORTED", "path": path}
@@ -874,16 +915,18 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    company = CompanyOS(root=args.root, db_path=args.db)
+    company = None
     try:
+        company = CompanyOS(root=args.root, db_path=args.db)
         company.initialize()
         _print(_dispatch(company, args))
         return 0
-    except (CompanyOSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+    except (CompanyOSError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
         print(json.dumps({"error": type(exc).__name__, "message": str(exc)}), file=sys.stderr)
         return 2
     finally:
-        company.close()
+        if company is not None:
+            company.close()
 
 
 if __name__ == "__main__":

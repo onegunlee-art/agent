@@ -261,12 +261,12 @@ class FirstPrinciplesGate:
         violations: list[Violation],
     ) -> None:
         objective = contract.get("observable_objective")
-        if not _present(objective):
+        if not isinstance(objective, Mapping):
             self._add(
                 violations,
                 "OBSERVABLE_OBJECTIVE_REQUIRED",
                 "observable_objective",
-                "FP_LITE requires an observable objective.",
+                "FP_LITE requires a structured observable objective.",
             )
         elif isinstance(objective, Mapping):
             if not _non_empty_text(objective.get("statement")):
@@ -346,20 +346,12 @@ class FirstPrinciplesGate:
                         "Each known fact must be a structured FACT record with Evidence.",
                     )
 
-        self._require_present(
-            contract,
-            violations,
-            key="completion_criteria",
-            code="COMPLETION_CRITERIA_REQUIRED",
-            message="FP_LITE requires completion criteria.",
-        )
-        self._require_present(
-            contract,
-            violations,
-            key="verification_method",
-            code="VERIFICATION_METHOD_REQUIRED",
-            message="FP_LITE requires a verification method.",
-        )
+        for key, code in (
+            ("completion_criteria", "COMPLETION_CRITERIA_REQUIRED"),
+            ("verification_method", "VERIFICATION_METHOD_REQUIRED"),
+        ):
+            if not _non_empty_text(contract.get(key)):
+                self._add(violations, code, key, f"FP_LITE requires non-empty text for {key}.")
 
     def _validate_standard(
         self,

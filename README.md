@@ -1,11 +1,10 @@
-# AI Company OS V0.5
+# AI Company OS V0.7
 
-Status: **V0.5 customer-isolation candidate**. V0.2 and the V0.3 model-execution
-lease integration passed independent review. V0.4 adds a reusable chatbot
-production line and has completed one synthetic customer B model Run; its
-automatically drafted evaluation remains non-official until CEO approval.
-V0.5 adds an outside-the-public-repository customer workspace, fail-closed
-sparse and budget policy, customer backup/restore, and auditable deletion.
+Status: **V0.7 on-demand headless review implementation**. The existing ledger,
+execution leases, customer isolation, backup/deletion, and V0.6 notification
+boundaries remain intact. Automated review binds a committed product repository
+separately from the kernel version. A live Claude subscription login is required;
+installation or unit-test success alone does not constitute independent review.
 
 AI Company OS is a local, on-demand operating kernel that turns a one-line
 idea into a venture-scoped workspace, a mechanically checked WorkOrder,
@@ -15,7 +14,8 @@ The operating kernel remains an on-demand Python CLI. It includes an explicitly
 invoked Codex CLI executor, rubric evaluation, deterministic synthetic FAQ
 bots, a loopback-only status page, execution leases, online ledger backup, and
 candidate-to-approved reusable-skill promotion gates.
-CTO, CPO, CMO, and Claude interactions still use structured file handoffs.
+CTO, CPO, and CMO interactions use structured file handoffs. Claude review can
+use the manual handoff or the bounded `company work review --headless` command.
 The preview bot itself is deterministic FAQ retrieval; Codex is the coding
 executor, not the model generating each preview answer.
 
@@ -231,6 +231,8 @@ handoff rules. Customer handling is defined in
 [고객별 비공개 저장소 규칙](docs/PRIVATE_CUSTOMER_REPOSITORY_RULES_KO.md) and the
 [파일럿 체크리스트](docs/V05_PILOT_CHECKLIST_KO.md). The remaining V0.5
 boundaries are explicit in [known limitations](docs/known-limitations.md).
+[V0.6 승인 대기 알림](docs/V06_APPROVAL_NOTIFICATIONS_KO.md)은 고객 자료가 없는
+단방향 알림과 로컬 fallback만 제공하며 원격 승인 입력은 제공하지 않습니다.
 
 Customer material must never be committed to this public repository. It lives
 only in a private registry outside the repository, with one independent Git
@@ -241,7 +243,8 @@ handoffs are local untracked state as well.
 
 The OS still has exactly three C-level RoleSpecs: CTO, CPO, and CMO. It does
 not include a scheduler, daemon, external queue, vector database, web crawler,
-external messaging, payments, production deployment, or real customer data.
+payments, production deployment, or real customer data. V0.6 adds only explicit,
+on-demand outbound attention notifications; it adds no remote approval receiver.
 All automated tests and the first four model cycles use synthetic data. V0.5
 creates a file-pilot gate; no real customer data is authorized before complete
 independent review and a separate CEO approval.
@@ -259,3 +262,9 @@ the bounded production templates into it, and creates model worktrees only from
 that repository. Exact sparse patterns reduce accidental overexposure inside a
 customer repository; they are not an operating-system security boundary.
 Unattended multi-tenant production and remote access remain out of scope.
+# V0.7 자동 검수 진입점
+
+`company work review <WorkOrder-ID> --headless`로 고정된 제품 소스를 Claude Code에
+검수 요청하고 원장에 결과를 기록할 수 있습니다. 사용법, 합성 데모, 권한과 한계는
+[V0.7 운영 안내](docs/V07_HEADLESS_REVIEW_KO.md)를 참고하세요.
+사용량 대기·로그인 실패는 PASS가 아니며, 야간 예약과 자동 수정은 포함하지 않습니다.
