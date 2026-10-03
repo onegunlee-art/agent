@@ -70,6 +70,10 @@ _TABLES = frozenset(
         "council_sessions",
         "council_turns",
         "council_role_runs",
+        "products",
+        "product_bundles",
+        "product_work_orders",
+        "product_approvals",
         "contracts",
         "ventures",
         "assumptions",
@@ -167,6 +171,72 @@ CREATE TABLE IF NOT EXISTS council_role_runs (
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL,
     UNIQUE (turn_id, role, attempt)
+);
+
+CREATE TABLE IF NOT EXISTS products (
+    id                  TEXT PRIMARY KEY,
+    session_id          TEXT NOT NULL REFERENCES council_sessions(id),
+    status              TEXT NOT NULL DEFAULT 'PLANNING'
+                        CHECK (status IN (
+                            'PLANNING', 'APPROVED', 'EXECUTING',
+                            'REVIEWING', 'LOCAL_READY', 'DELIVERED'
+                        )),
+    current_bundle_id   TEXT,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS product_bundles (
+    id                          TEXT PRIMARY KEY,
+    product_id                  TEXT NOT NULL REFERENCES products(id),
+    version                     INTEGER NOT NULL CHECK (version > 0),
+    status                      TEXT NOT NULL DEFAULT 'DRAFT'
+                                CHECK (status IN ('DRAFT', 'APPROVED', 'SUPERSEDED')),
+    target_json                 TEXT NOT NULL CHECK (json_valid(target_json)),
+    product_brief_path          TEXT NOT NULL,
+    product_brief_sha256        TEXT NOT NULL,
+    development_schema_path     TEXT NOT NULL,
+    development_schema_sha256   TEXT NOT NULL,
+    user_scenarios_path         TEXT NOT NULL,
+    user_scenarios_sha256       TEXT NOT NULL,
+    implementation_plan_path    TEXT NOT NULL,
+    implementation_plan_sha256  TEXT NOT NULL,
+    approval_bundle_path        TEXT NOT NULL,
+    approval_bundle_sha256      TEXT NOT NULL,
+    created_at                  TEXT NOT NULL,
+    updated_at                  TEXT NOT NULL,
+    UNIQUE (product_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS product_work_orders (
+    id                  TEXT PRIMARY KEY,
+    bundle_id           TEXT NOT NULL REFERENCES product_bundles(id),
+    work_key            TEXT NOT NULL,
+    title               TEXT NOT NULL,
+    order_index         INTEGER NOT NULL CHECK (order_index >= 0),
+    dependencies_json   TEXT NOT NULL CHECK (json_valid(dependencies_json)),
+    specification_json  TEXT NOT NULL CHECK (json_valid(specification_json)),
+    status              TEXT NOT NULL DEFAULT 'BLOCKED'
+                        CHECK (status IN (
+                            'BLOCKED', 'READY', 'EXECUTING', 'TEST_FAILED',
+                            'REVIEW_REQUIRED', 'CHANGES_REQUIRED', 'COMPLETED'
+                        )),
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    UNIQUE (bundle_id, work_key),
+    UNIQUE (bundle_id, order_index)
+);
+
+CREATE TABLE IF NOT EXISTS product_approvals (
+    id                  TEXT PRIMARY KEY,
+    product_id          TEXT NOT NULL REFERENCES products(id),
+    bundle_id           TEXT NOT NULL UNIQUE REFERENCES product_bundles(id),
+    status              TEXT NOT NULL CHECK (status = 'APPROVED'),
+    actor               TEXT NOT NULL DEFAULT 'CEO',
+    approval_text       TEXT NOT NULL,
+    approval_sha256     TEXT NOT NULL,
+    bundle_sha256       TEXT NOT NULL,
+    created_at          TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS contracts (
@@ -402,6 +472,10 @@ CREATE INDEX IF NOT EXISTS idx_council_turns_session
     ON council_turns(session_id, turn_number);
 CREATE INDEX IF NOT EXISTS idx_council_role_runs_turn
     ON council_role_runs(turn_id, role, attempt);
+CREATE INDEX IF NOT EXISTS idx_product_bundles_product
+    ON product_bundles(product_id, version);
+CREATE INDEX IF NOT EXISTS idx_product_work_orders_bundle
+    ON product_work_orders(bundle_id, order_index);
 CREATE INDEX IF NOT EXISTS idx_contracts_idea ON contracts(idea_id);
 CREATE INDEX IF NOT EXISTS idx_ventures_idea ON ventures(idea_id);
 CREATE INDEX IF NOT EXISTS idx_assumptions_venture ON assumptions(venture_id);

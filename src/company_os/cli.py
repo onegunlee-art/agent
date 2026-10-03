@@ -47,6 +47,7 @@ from .model_executor import (
     validate_worktree,
 )
 from .notifications import dispatch_pending_notifications
+from .product_factory import ProductFactory
 from .roles import list_role_specs, serialize_role_spec
 from .review_package import build_review_materials
 from .skill_promotion import (
@@ -182,6 +183,27 @@ def build_parser() -> argparse.ArgumentParser:
     roles_commands.add_parser("list")
     role_show = roles_commands.add_parser("show")
     role_show.add_argument("role", choices=("cto", "cpo", "cmo"))
+
+    product = commands.add_parser(
+        "product", help="Draft and approve a scenario-bound product plan"
+    )
+    product_commands = product.add_subparsers(dest="product_command", required=True)
+    product_draft = product_commands.add_parser("draft")
+    product_draft.add_argument("session_id")
+    product_draft.add_argument("--definition-file", required=True, type=Path)
+    product_draft.add_argument("--idempotency-key", required=True)
+    product_bundle = product_commands.add_parser("bundle")
+    product_bundle.add_argument("bundle_id")
+    product_approval_text = product_commands.add_parser("approval-text")
+    product_approval_text.add_argument("bundle_id")
+    product_approve = product_commands.add_parser("approve")
+    product_approve.add_argument("bundle_id")
+    product_approve.add_argument("--expected-sha256", required=True)
+    product_approve.add_argument("--approval-file", required=True, type=Path)
+    product_approve.add_argument("--idempotency-key", required=True)
+    product_plan = product_commands.add_parser("plan")
+    product_plan.add_argument("product_id")
+    product_plan.add_argument("bundle_id")
 
     venture = commands.add_parser(
         "venture", help="Create a venture-scoped local workspace"
@@ -580,6 +602,26 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         return {"roles": [name for name, _ in list_role_specs()]}
     if args.command == "roles" and args.roles_command == "show":
         return serialize_role_spec(args.role)
+    if args.command == "product":
+        factory = ProductFactory(company)
+        if args.product_command == "draft":
+            return factory.draft(
+                args.session_id,
+                definition_file=args.definition_file,
+                idempotency_key=args.idempotency_key,
+            )
+        if args.product_command == "bundle":
+            return factory.bundle(args.bundle_id)
+        if args.product_command == "approval-text":
+            return {"approval_text": factory.approval_text(args.bundle_id)}
+        if args.product_command == "approve":
+            return factory.approve(
+                args.bundle_id,
+                expected_sha256=args.expected_sha256,
+                approval_file=args.approval_file,
+                idempotency_key=args.idempotency_key,
+            )
+        return factory.execution_plan(args.product_id, args.bundle_id)
     if args.command == "venture" and args.venture_command == "scaffold":
         key = args.idempotency_key or (
             f"cli-scaffold:{args.contract_id}:{args.approval_status}"
