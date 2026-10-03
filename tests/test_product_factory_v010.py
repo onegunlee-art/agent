@@ -7,6 +7,7 @@ import pytest
 
 from company_os.application import CompanyOS
 from company_os.council_room import ExecutiveOutcome, InteractiveCouncil
+from company_os.dashboard import _render_page, read_dashboard
 from company_os.errors import ValidationError
 from company_os.product_factory import ProductFactory
 
@@ -227,3 +228,27 @@ def test_changed_scenario_after_approval_fails_closed(factory, tmp_path):
 
     with pytest.raises(ValidationError, match="changed after CEO approval"):
         product_factory.execution_plan("synthetic-memo", bundle["bundle_id"])
+
+
+def test_dashboard_surfaces_council_speeches_and_scenario_approval(factory, tmp_path):
+    company, product_factory, session_id = factory
+    bundle = product_factory.draft(
+        session_id,
+        definition_file=write_json(tmp_path / "definition.json", valid_definition()),
+        idempotency_key="draft-dashboard",
+    )
+
+    snapshot = read_dashboard(company.db_path)
+
+    assert snapshot["council_sessions"][0]["session_id"] == session_id
+    assert snapshot["council_sessions"][0]["turn_count"] == 2
+    assert set(snapshot["council_sessions"][0]["latest_role_outputs"]) == {
+        "cto",
+        "cpo",
+        "cmo",
+    }
+    assert snapshot["products"][0]["bundle_id"] == bundle["bundle_id"]
+    assert snapshot["products"][0]["attention_kind"] == "SCENARIO_APPROVAL_PENDING"
+    page = _render_page(snapshot, "test-token", "http://127.0.0.1:8765/")
+    assert "임원 회의" in page
+    assert "사용자 시나리오 승인 대기" in page
