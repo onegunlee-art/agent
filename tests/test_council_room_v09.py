@@ -224,7 +224,6 @@ def test_subscription_runner_uses_read_only_separate_cli_processes_and_safe_env(
             stdout = json.dumps(
                 {
                     "type": "turn.completed",
-                    "model": "gpt-current",
                     "usage": {"input_tokens": 11, "output_tokens": 7},
                 }
             )
@@ -243,6 +242,8 @@ def test_subscription_runner_uses_read_only_separate_cli_processes_and_safe_env(
     runner = SubscriptionExecutiveRunner(
         codex_executable="codex.exe",
         claude_executable="C:/tools/claude.exe",
+        codex_model="configured-astra",
+        codex_effort="xhigh",
         process_runner=process,
     )
     base = dict(
@@ -262,9 +263,10 @@ def test_subscription_runner_uses_read_only_separate_cli_processes_and_safe_env(
     )
 
     assert codex.status == claude.status == "COMPLETED"
-    assert codex.model == "gpt-current"
+    assert codex.model == "configured-astra"
     assert claude.model == "claude-current"
     assert "--sandbox" in calls[0][0] and "read-only" in calls[0][0]
+    assert calls[0][0][calls[0][0].index("--model") + 1] == "configured-astra"
     assert "--no-session-persistence" in calls[1][0]
     assert calls[0][1] != calls[1][1]
     for _command, _cwd, environment, _timeout, _input in calls:
