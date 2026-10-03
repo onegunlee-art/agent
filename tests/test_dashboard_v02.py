@@ -21,7 +21,9 @@ def _post(url: str, payload: dict[str, str]) -> tuple[int, str]:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=5) as response:
+    # The server gives its CLI subprocess 30 seconds; keep the HTTP client
+    # bounded but alive long enough to receive either success or that timeout.
+    with urllib.request.urlopen(request, timeout=35) as response:
         return response.status, response.read().decode("utf-8")
 
 
