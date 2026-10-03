@@ -81,16 +81,24 @@ _RESPONSE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "schema_version": {"const": 1},
-        "role": {"enum": list(ROLE_NAMES)},
+        "schema_version": {"type": "integer", "const": 1},
+        "role": {"type": "string", "enum": list(ROLE_NAMES)},
         "speech": {"type": "string", "minLength": 1},
-        "contribution": {"type": "object"},
-        "questions": {"type": "array", "items": {"type": ["string", "object"]}},
-        "advisory": {"type": "array", "items": {"type": ["string", "object"]}},
-        "evidence_refs": {"type": "array", "items": {"type": ["string", "object"]}},
+        "contribution": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "summary": {"type": "string"},
+                "details": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["summary", "details"],
+        },
+        "questions": {"type": "array", "items": {"type": "string"}},
+        "advisory": {"type": "array", "items": {"type": "string"}},
+        "evidence_refs": {"type": "array", "items": {"type": "string"}},
         "unresolved_decisions": {
             "type": "array",
-            "items": {"type": ["string", "object"]},
+            "items": {"type": "string"},
         },
     },
     "required": [

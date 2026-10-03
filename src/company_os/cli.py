@@ -68,6 +68,15 @@ def _json_default(value: Any) -> Any:
     raise TypeError(f"Cannot serialize {type(value).__name__}")
 
 
+def _configure_text_streams() -> None:
+    """Make structured CLI output lossless on Windows legacy code pages."""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 def _print(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, default=_json_default))
 
@@ -1049,6 +1058,7 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    _configure_text_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
     company = None
