@@ -233,7 +233,7 @@ def run_headless_review(company, work_order_id, *, repository: Path,
     """One bounded review, no retries. A new key explicitly authorizes a retry."""
     if (not idempotency_key or not test_command or not all(isinstance(s, str) and s for s in test_command)
             or not 1 <= timeout_seconds <= 1200 or not 1 <= max_turns <= 30
-            or not 1 <= token_limit <= 250000):
+            or not 1 <= token_limit <= 2000000):
         raise ValidationError("Review requires a key, test command, and bounded limits")
     repository = Path(repository).resolve()
     spec = {"work_order_id": work_order_id, "repository": str(repository),
@@ -297,6 +297,16 @@ def run_headless_review(company, work_order_id, *, repository: Path,
         if seconds <= 0:
             raise subprocess.TimeoutExpired("headless-review", timeout_seconds)
         return seconds
+    def export_changed(stage):
+        observed = _files(source)
+        if observed == fingerprint:
+            return False
+        _json_write(directory / "source-change.json", {
+            "stage": stage, "added": sorted(set(observed) - set(fingerprint)),
+            "removed": sorted(set(fingerprint) - set(observed)),
+            "changed": sorted(p for p in set(observed) & set(fingerprint) if observed[p] != fingerprint[p]),
+        })
+        return True
     try:
         _json_write(directory / "review_request.json", request)
         _json_write(workspace / "review_request.json", request)
@@ -315,7 +325,7 @@ def run_headless_review(company, work_order_id, *, repository: Path,
         }
         _json_write(directory / "test_receipt.json", test_receipt)
         _json_write(workspace / "test_receipt.json", test_receipt)
-        if _files(source) != fingerprint:
+        if export_changed("AFTER_TESTS"):
             status = "SOURCE_CHANGED"
         elif tested.returncode != 0:
             status = "TESTS_FAILED"
@@ -349,7 +359,7 @@ def run_headless_review(company, work_order_id, *, repository: Path,
             _write(directory / "stdout.json", completed.stdout)
             _write(directory / "stderr.txt", completed.stderr)
             status, result, metadata = _decode(completed, request, token_limit)
-            if _files(source) != fingerprint:
+            if export_changed("AFTER_REVIEW"):
                 status, result = "SOURCE_CHANGED", None
         current = GitSourceSnapshot(code_root=repository).capture()
         if (current.source_commit != request["source_commit"]
@@ -359,7 +369,8 @@ def run_headless_review(company, work_order_id, *, repository: Path,
         status, result = "CLI_NOT_FOUND", None
     except subprocess.TimeoutExpired:
         status, result = "TIMEOUT", None
-    except SourceSnapshotError:
+    except SourceSnapshotError as exc:
+        _json_write(directory / "source-error.json", {"message": str(exc)})
         status, result = "SOURCE_CHANGED", None
     except (OSError, ValueError, ValidationError, subprocess.SubprocessError) as exc:
         _json_write(directory / "diagnostic.json", {"error_type": type(exc).__name__, "message": str(exc)})

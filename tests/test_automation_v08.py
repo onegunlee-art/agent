@@ -276,3 +276,54 @@ def test_repair_ceiling_stops_without_another_model_call(job_setup, monkeypatch)
     assert steps[-1]["last_receipt"]["reason"] == "REPAIR_LIMIT_REACHED"
     assert executor.calls == 1
     assert company.work_order(work.id).status == "REPAIR_REQUIRED"
+
+
+def test_missing_cli_is_rejected_before_model_claim_and_not_counted_as_unknown(job_setup, monkeypatch):
+    from company_os.automation import enqueue, tick, usage
+    from company_os.model_executor import CliCodingExecutor
+    company, work, _, plan = job_setup
+    install_reviewer(monkeypatch, company)
+    enqueue(company, plan, idempotency_key="job")
+    tick(company)
+    before = len(company.runs_for_work_order(work.id))
+    result = tick(company, executor=CliCodingExecutor(command=["missing-v08-cli-12345", "{instructions}"]))
+    assert result["status"] == "NEEDS_ATTENTION"
+    assert len(company.runs_for_work_order(work.id)) == before
+    assert result["last_receipt"]["model_calls"] == 0
+    assert usage(company)["unknown_usage_calls"] == 0
+
+
+def test_repair_can_add_declared_new_test_without_changing_existing_expectations(job_setup, monkeypatch):
+    from company_os.automation import enqueue, run_queue
+    company, work, repo, plan = job_setup
+    install_reviewer(monkeypatch, company)
+    before = (repo / "test_writer.py").read_bytes()
+    enqueue(company, {**plan, "new_test_files": ["test_render_exact.py"]}, idempotency_key="job")
+    class AddRegression(RepairExecutor):
+        def run(self, request):
+            outcome = super().run(request)
+            (request.workspace / "test_render_exact.py").write_text(
+                "from writer import VALUE\ndef test_exact():\n    assert VALUE == 'correct'\n", encoding="utf-8")
+            return outcome
+    steps = run_queue(company, executor=AddRegression(company))
+    assert [step["status"] for step in steps] == ["REPAIR", "REVIEW", "READY_FOR_CEO", "IDLE"]
+    assert (repo / "test_writer.py").read_bytes() == before
+    assert steps[1]["last_receipt"]["test_count"] == 2
+    assert company.work_order(work.id).status == "COMPLETED"
+
+
+def test_exception_after_executor_entry_preserves_call_and_unknown_usage(job_setup, monkeypatch):
+    from company_os.automation import enqueue, tick, usage
+    company, _, _, plan = job_setup
+    install_reviewer(monkeypatch, company)
+    enqueue(company, plan, idempotency_key="job")
+    tick(company)
+    class BrokenExecutor:
+        def run(self, request):
+            assert not company.store.connection.in_transaction
+            raise RuntimeError("synthetic parser failure after executor entry")
+    result = tick(company, executor=BrokenExecutor())
+    assert result["status"] == "NEEDS_ATTENTION"
+    assert result["last_receipt"]["model_calls"] == 1
+    assert usage(company)["calls"] == 2
+    assert usage(company)["unknown_usage_calls"] == 1

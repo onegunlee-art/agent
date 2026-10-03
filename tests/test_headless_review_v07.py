@@ -124,6 +124,23 @@ def test_changes_required_does_not_claim_completion(setup_review, monkeypatch):
     assert company.work_order(work.id).status == "REPAIR_REQUIRED"
 
 
+def test_mutated_export_reports_changed_files(setup_review, monkeypatch):
+    from company_os import headless_reviewer as module
+    company, _, _ = setup_review
+    install_process_stub(monkeypatch, company)
+    stub = module._run_process
+    def mutate(command, **kwargs):
+        result = stub(command, **kwargs)
+        if "--output-format" in command:
+            (kwargs["cwd"] / "source/app.py").write_text("ANSWER = 0\n", encoding="utf-8")
+        return result
+    monkeypatch.setattr(module, "_run_process", mutate)
+    result = execute(setup_review)
+    assert result["status"] == "SOURCE_CHANGED"
+    diagnostic = json.loads((Path(result["evidence_directory"]) / "source-change.json").read_text())
+    assert "app.py" in diagnostic["changed"]
+
+
 @pytest.mark.parametrize("kind,expected", [
     ("quota", "QUOTA_WAIT"), ("auth", "AUTH_REQUIRED"),
     ("json", "INVALID_RESPONSE"), ("nonzero", "CLI_FAILED"),

@@ -58,7 +58,8 @@ def prepare(company, *, codex, claude):
     atomic_write_text(venture.workspace_path / work.artifact_relative_path, work.expected_content)
     company.verify_existing_artifact(work.id, idempotency_key="v08-demo-artifact")
     plan = {"schema_version": 1, "work_order_id": work.id, "repository": str(repository),
-            "allowed_files": ["writer.py"], "test_command": [sys.executable, "-B", "-m", "pytest", "-q"],
+            "allowed_files": ["writer.py"], "new_test_files": ["test_render_exact.py"],
+            "test_command": [sys.executable, "-B", "-m", "pytest", "-q"],
             "codex_executable": codex, "claude_executable": claude, "max_repairs": 3}
     job = enqueue(company, plan, idempotency_key="v08-demo-job")
     result = {"work_order_id": work.id, "job_id": job["id"], "repository": str(repository),

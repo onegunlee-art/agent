@@ -39,6 +39,7 @@ push는 이번 사용자가 승인한 개발 작업으로 수행한다. 역할 3
   "work_order_id": "work_order_...",
   "repository": "C:/dev/company-products/synthetic-product",
   "allowed_files": ["writer.py"],
+  "new_test_files": ["test_render_exact.py"],
   "test_command": ["C:/dev/ai-company-os/.venv/Scripts/python.exe", "-B", "-m", "pytest", "-q"],
   "codex_executable": "codex",
   "claude_executable": "claude",
@@ -62,7 +63,9 @@ cd C:\dev\ai-company-os
 
 ## 범위와 중단
 
-실행자는 허용된 제품 파일만 수정한다. 시험·평가·설정·AGENTS 파일은 보호한다.
+실행자는 허용된 제품 파일만 수정한다. 기존 시험·평가·설정·AGENTS 파일은 보호한다.
+계획의 `new_test_files`에 미리 지정한, 아직 존재하지 않는 회귀 시험 파일은 최대 3개
+추가할 수 있다. 첫 채택 후에는 이 파일도 해시로 고정한다. 최종 검수는 시험의 충분성도 확인한다.
 이는 신뢰 로컬 사용자의 workspace-write 실행 및 **실행 후 파일 검사**다. 파일별 OS 권한으로
 모든 쓰기를 사전 차단한다는 주장은 하지 않는다. 범위를 벗어난 파일은 채택하지 않고 보존한다.
 JUnit에 실제 통과 시험이 없거나 실패/skip이 있으면 수정 완료로 처리하지 않는다.
