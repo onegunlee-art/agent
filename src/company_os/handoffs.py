@@ -168,6 +168,8 @@ def validate_review_result(
                 f"ReviewResult required_changes[{index}] requires id and description"
             )
     change_ids = [change["id"] for change in payload["required_changes"]]
+    if any(any(character.isspace() for character in change_id) for change_id in change_ids):
+        raise ValidationError("ReviewResult required_change ids must not contain whitespace")
     if len(change_ids) != len(set(change_ids)):
         raise ValidationError("ReviewResult required_change ids must be unique")
     if payload["verdict"] == "CHANGES_REQUIRED" and not payload["required_changes"]:

@@ -223,3 +223,32 @@ def test_preview_keeps_answer_sources_collapsed_until_user_expands_them() -> Non
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_preview_offers_bus_stop_question_on_first_screen() -> None:
+    server = create_server(CAFE_A / "faq_data.json", port=0)
+    host, port = server.server_address
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/", timeout=3) as response:
+            page = response.read().decode("utf-8")
+        assert '<button id="bus-stop-question" type="button"' in page
+        assert 'data-question="버스정류소 위치는 어디인가요?"' in page
+        assert '>버스정류소 위치</button>' in page
+        assert page.index('id="bus-stop-question"') < page.index('id="form"')
+        # Both typed and quick questions use the same submit/request path.
+        assert "quickQuestion.addEventListener('click'" in page
+        assert "input.value=quickQuestion.dataset.question" in page
+        assert "form.requestSubmit()" in page
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_unknown_bus_stop_location_is_refused_without_invented_source() -> None:
+    result = answer("버스정류소 위치는 어디인가요?", DATA)
+    assert result["refused"] is True
+    assert result["sources"] == []
+    assert result["source_details"] == []
+    assert DATA["refusal_text"] in result["answer_text"]

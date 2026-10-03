@@ -157,6 +157,47 @@ def _manifest(
     }
 
 
+@pytest.mark.parametrize("change_id", [" CHANGE-X", "CHANGE-X ", "CHANGE X", "CHANGE\nX", "CHANGE\tX"])
+def test_review_rejects_whitespace_change_ids(tmp_path: Path, change_id: str) -> None:
+    with CompanyOS(tmp_path, source_snapshotter=MutableSnapshot(_snapshot())) as company:
+        work, _, review = _verified_review(company, "whitespace-change")
+        with pytest.raises(ValidationError, match="whitespace"):
+            company.ingest_review_result(
+                review.id,
+                _write_result(tmp_path / "bad-change.json", _result(
+                    review, verdict="CHANGES_REQUIRED",
+                    changes=[{"id": change_id, "description": "Repair."}],
+                )),
+            )
+        assert company.work_order(work.id).status == "WAITING_FOR_OPUS"
+
+
+def test_resume_does_not_replay_superseded_rereview(tmp_path: Path) -> None:
+    source = MutableSnapshot(_snapshot())
+    with CompanyOS(tmp_path, source_snapshotter=source) as company:
+        work, initial, parent = _verified_review(company, "superseded-replay")
+        _require_change(company, tmp_path, parent)
+        source.snapshot = _snapshot("d" * 40, "e" * 64)
+        evidence = next(item for item in company.evidence_for_run(initial.id)
+                        if item.kind == "VERIFIER_OUTPUT")
+        company.repair_once(work.id, executor=FakeExecutor(), idempotency_key="repair",
+                            repair_manifest=_manifest(company, parent, source,
+                                                      evidence.id, evidence.path))
+        child = company.store.query_one(
+            "SELECT * FROM reviews WHERE work_order_id=? AND status='WAITING_FOR_OPUS'",
+            (work.id,),
+        )
+        # Durable state left if a refresh supersedes a damaged handoff and its
+        # replacement creation fails. The original rereview key is completed.
+        with company.store.transaction() as connection:
+            connection.execute("UPDATE reviews SET status='SUPERSEDED' WHERE id=?", (child["id"],))
+            connection.execute("UPDATE work_orders SET status='AWAITING_REREVIEW' WHERE id=?", (work.id,))
+        replacement = company.resume_work_order(work.id, executor=FakeExecutor())
+        assert replacement.id != child["id"]
+        assert replacement.status == "WAITING_FOR_OPUS"
+        assert company.work_order(work.id).status == "WAITING_FOR_OPUS"
+
+
 def test_dirty_source_cannot_create_review_request(tmp_path: Path) -> None:
     source = MutableSnapshot(_snapshot(dirty=True))
     with CompanyOS(tmp_path, source_snapshotter=source) as company:

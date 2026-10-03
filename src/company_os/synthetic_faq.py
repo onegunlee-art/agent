@@ -132,12 +132,18 @@ PAGE = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <title>합성 고객 챗봇 미리보기</title><style>
 body{font-family:system-ui,sans-serif;max-width:700px;margin:2rem auto;padding:0 1rem}
 #log{border:1px solid #bbb;border-radius:10px;min-height:220px;padding:1rem;white-space:pre-wrap}
-form{display:flex;gap:.5rem;margin-top:1rem}input{flex:1;padding:.7rem}</style></head>
+form{display:flex;gap:.5rem;margin-top:1rem}input{flex:1;padding:.7rem}
+.quick-questions{margin-top:1rem}.quick-questions button{padding:.6rem 1rem;cursor:pointer;
+border:1px solid #aaa;border-radius:20px;background:#f4f4f4}</style></head>
 <body><h1 id="title"></h1><p>로컬 합성 데이터 전용 미리보기입니다.</p><div id="log"></div>
+<div class="quick-questions" role="group" aria-label="빠른 질문">
+<button id="bus-stop-question" type="button" data-question="버스정류소 위치는 어디인가요?">버스정류소 위치</button>
+</div>
 <form id="form"><input id="question" maxlength="500" placeholder="질문을 입력하세요"><button>질문</button></form>
 <script>const title=document.getElementById('title'),log=document.getElementById('log');let sourceCount=0;
-title.textContent=%CUSTOMER%;document.getElementById('form').addEventListener('submit',async(e)=>{
-e.preventDefault();const input=document.getElementById('question'),q=input.value.trim();if(!q)return;
+const form=document.getElementById('form'),input=document.getElementById('question'),quickQuestion=document.getElementById('bus-stop-question');
+title.textContent=%CUSTOMER%;form.addEventListener('submit',async(e)=>{
+e.preventDefault();const q=input.value.trim();if(!q)return;
 const qn=document.createElement('p');qn.textContent='Q. '+q;log.appendChild(qn);
 const response=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
 const data=await response.json(),an=document.createElement('p');an.textContent=data.answer_text;log.appendChild(an);
@@ -147,7 +153,8 @@ sources.id='sources-'+(++sourceCount);button.type='button';button.textContent='�
 sources.hidden=true;data.source_details.forEach(detail=>{const item=document.createElement('p');item.textContent=detail;sources.appendChild(item);});
 button.addEventListener('click',()=>{const expanded=button.getAttribute('aria-expanded')==='true';button.setAttribute('aria-expanded',String(!expanded));sources.hidden=expanded;button.textContent=expanded?'출처 보기':'출처 접기';});
 log.appendChild(button);log.appendChild(sources);}
-input.value='';});</script>
+input.value='';});
+quickQuestion.addEventListener('click',()=>{input.value=quickQuestion.dataset.question;form.requestSubmit();});</script>
 </body></html>"""
 
 

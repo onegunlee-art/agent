@@ -73,13 +73,28 @@ def _print(value: Any) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="company",
-        description="Local, resumable AI Company OS V0.2",
+        description="Local, resumable AI Company OS V0.8",
     )
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--db", type=Path)
     commands = parser.add_subparsers(dest="command", required=True)
 
     commands.add_parser("init", help="Initialize local canonical state")
+    commands.add_parser("tick", help="Process one queued review or repair on demand")
+    queue = commands.add_parser("queue", help="Explicit product review/repair queue")
+    queue_commands = queue.add_subparsers(dest="queue_command", required=True)
+    queue_add = queue_commands.add_parser("add")
+    queue_add.add_argument("--file", required=True, type=Path)
+    queue_add.add_argument("--idempotency-key", required=True)
+    queue_commands.add_parser("list")
+    queue_commands.add_parser("usage")
+    queue_run = queue_commands.add_parser("run", help="Run a bounded queue loop in the foreground")
+    queue_run.add_argument("--max-steps", type=int, default=7)
+    queue_retry = queue_commands.add_parser("retry")
+    queue_retry.add_argument("job_id")
+    queue_limits = queue_commands.add_parser("limits")
+    queue_limits.add_argument("--tokens", type=int)
+    queue_limits.add_argument("--calls", type=int)
 
     idea = commands.add_parser("idea", help="Manage one-line ideas")
     idea_commands = idea.add_subparsers(dest="idea_command", required=True)
@@ -119,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     council_compile.add_argument(
         "--min-level",
         default="FP_STANDARD",
-        choices=("FP_LITE", "FP_STANDARD", "FP_FULL"),
+        choices=("FP_STANDARD", "FP_FULL"),
     )
     council_compile.add_argument("--idempotency-key")
     council_resolve = council_commands.add_parser("resolve")
@@ -128,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     council_resolve.add_argument(
         "--min-level",
         default="FP_STANDARD",
-        choices=("FP_LITE", "FP_STANDARD", "FP_FULL"),
+        choices=("FP_STANDARD", "FP_FULL"),
     )
     council_resolve.add_argument("--idempotency-key")
 
@@ -374,6 +389,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
+    if args.command in {"tick", "queue"}:
+        from .automation import configure_daily_limits, enqueue, jobs, retry_waiting, run_queue, tick, usage
+        if args.command == "tick":
+            return tick(company)
+        if args.queue_command == "add":
+            return enqueue(company, read_json(args.file), idempotency_key=args.idempotency_key)
+        if args.queue_command == "list":
+            return jobs(company)
+        if args.queue_command == "usage":
+            return usage(company)
+        if args.queue_command == "run":
+            return run_queue(company, max_steps=args.max_steps)
+        if args.queue_command == "retry":
+            return retry_waiting(company, args.job_id)
+        return configure_daily_limits(company, tokens=args.tokens, calls=args.calls)
     if args.command == "init":
         return {
             "status": "INITIALIZED",
