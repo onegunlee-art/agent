@@ -97,6 +97,7 @@ def validate_review_result(
     source_commit: str | None = None,
     source_tree_sha256: str | None = None,
     allow_fake_reviewer: bool = False,
+    allow_headless_reviewer: bool = False,
 ) -> None:
     require_fields(
         payload,
@@ -137,6 +138,8 @@ def validate_review_result(
     if payload["verdict"] not in {"PASS", "CHANGES_REQUIRED"}:
         raise ValidationError("ReviewResult verdict is invalid")
     allowed_sources = {"user_supplied"}
+    if allow_headless_reviewer is True:
+        allowed_sources.add("headless_claude")
     if allow_fake_reviewer is True:
         allowed_sources.add("fake_reviewer")
     if payload["source"] not in allowed_sources:

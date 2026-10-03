@@ -161,6 +161,13 @@ def build_parser() -> argparse.ArgumentParser:
     work_review = work_commands.add_parser("review")
     work_review.add_argument("work_order_id")
     work_review.add_argument("--idempotency-key")
+    work_review.add_argument("--headless", action="store_true")
+    work_review.add_argument("--repository", type=Path)
+    work_review.add_argument("--test-arg", action="append")
+    work_review.add_argument("--claude-executable", default="claude")
+    work_review.add_argument("--timeout-seconds", type=int, default=600)
+    work_review.add_argument("--token-limit", type=int, default=100000)
+    work_review.add_argument("--max-turns", type=int, default=8)
     work_resume = work_commands.add_parser("resume")
     work_resume.add_argument("work_order_id")
     work_resume.add_argument("--repair-manifest", type=Path)
@@ -600,6 +607,16 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
             args.work_order_id, idempotency_key=key
         )
     if args.command == "work" and args.work_command == "review":
+        if args.headless:
+            from .headless_reviewer import run_headless_review
+            if args.repository is None or not args.test_arg or not args.idempotency_key:
+                raise ValueError("--headless requires --repository, --test-arg and --idempotency-key")
+            return run_headless_review(
+                company, args.work_order_id, repository=args.repository,
+                test_command=args.test_arg, idempotency_key=args.idempotency_key,
+                executable=args.claude_executable, timeout_seconds=args.timeout_seconds,
+                token_limit=args.token_limit, max_turns=args.max_turns,
+            )
         review_count = int(
             company.store.scalar(
                 "SELECT COUNT(*) FROM reviews WHERE work_order_id = ?",

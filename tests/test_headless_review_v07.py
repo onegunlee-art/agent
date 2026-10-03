@@ -4,19 +4,21 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import os
+from hashlib import sha256
 
 import pytest
 
 from company_os.application import CompanyOS
 from company_os.errors import ConflictError, ValidationError
 from company_os.fakes import FakeExecutor
-from company_os.source_snapshot import GitSourceSnapshot
+from company_os.source_snapshot import GitSourceSnapshot, SourceSnapshot, SourceSnapshotError
 from company_os.utils import atomic_write_json
 from .helpers import CleanSourceSnapshotter, build_venture
 
 
 @pytest.fixture
-def setup_review(tmp_path):
+def setup_review(tmp_path, monkeypatch, request):
     repo = tmp_path / "product"
     repo.mkdir()
     (repo / "app.py").write_text("ANSWER = 42\n", encoding="utf-8")
@@ -29,6 +31,22 @@ def setup_review(tmp_path):
     company.initialize()
     _, _, _, work = build_venture(company, "headless")
     company.execute_work_order(work.id, executor=FakeExecutor(), idempotency_key="run")
+    if request.node.name != "test_real_git_product_binding" and not request.node.get_closest_marker("integration"):
+        # Orchestration tests isolate the already-covered Git snapshot adapter.
+        # One real-adapter acceptance test below still exercises the full path.
+        from company_os import application, headless_reviewer
+        initial = (repo / "app.py").read_bytes()
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                                capture_output=True, text=True, timeout=20, check=True).stdout.strip()
+        class ProductSnapshot:
+            def __init__(self, *, code_root):
+                assert Path(code_root).resolve() == repo.resolve()
+            def capture(self):
+                if (repo / "app.py").read_bytes() != initial:
+                    raise SourceSnapshotError("dirty product")
+                return SourceSnapshot(commit, "d" * 40, sha256(initial).hexdigest(), False)
+        monkeypatch.setattr(application, "GitSourceSnapshot", ProductSnapshot)
+        monkeypatch.setattr(headless_reviewer, "GitSourceSnapshot", ProductSnapshot)
     yield company, work, repo
     company.close()
 
@@ -86,7 +104,8 @@ def test_pass_is_product_bound_durable_and_idempotent(setup_review, monkeypatch)
     result = execute(setup_review)
     assert result["status"] == "PASS"
     assert company.work_order(work.id).status == "COMPLETED"
-    assert result["source_commit"] == GitSourceSnapshot(code_root=repo).capture().source_commit
+    request = json.loads(company.review(result["review_id"]).json_path.read_text(encoding="utf-8"))
+    assert result["source_commit"] == request["source_commit"] != "a" * 40
     assert result["cost_usd"] is None
     assert result["execution_id"] and result["fence_token"] == 1
     assert execute(setup_review) == result
@@ -206,3 +225,67 @@ def test_dashboard_includes_review_attempts(setup_review, monkeypatch):
     snapshot = read_dashboard(company.db_path)
     assert snapshot["work_orders"][0]["review_attempts"][0]["status"] == "PASS"
     assert "자동 검수 이력" in _render_page(snapshot, "test", "http://127.0.0.1:8765/")
+
+
+@pytest.mark.slow
+def test_real_git_product_binding(setup_review, monkeypatch):
+    company, _, repo = setup_review
+    install_process_stub(monkeypatch, company)
+    result = execute(setup_review)
+    assert result["status"] == "PASS"
+    assert result["source_tree_sha256"] == GitSourceSnapshot(code_root=repo).capture().source_tree_sha256
+
+
+def test_expired_attempt_is_reclaimed_and_old_result_cannot_win(setup_review, monkeypatch):
+    from company_os import headless_reviewer as module
+    company, _, _ = setup_review
+    nested = []
+    def callback(request):
+        if nested:
+            return
+        nested.append(True)
+        key = module._state_key(request["review_request_id"])
+        state = company.store.get_global_state(key)
+        company.store.set_global_state(key, {**state, "expires_at": 0})
+        nested.append(execute(setup_review, idempotency_key="after-restart"))
+    install_process_stub(monkeypatch, company, callback=callback)
+    old = execute(setup_review)
+    assert old["status"] == "STALE_RESULT_REJECTED"
+    assert nested[1]["status"] == "PASS"
+    assert nested[1]["fence_token"] == 2
+    assert sum(e["event_type"] == "REVIEW_RESULT_INGESTED" for e in company.events()) == 1
+    assert any(e["event_type"] == "HEADLESS_REVIEW_EXPIRED" for e in company.events())
+
+
+def test_subscription_environment_excludes_api_keys(monkeypatch, tmp_path):
+    from company_os.headless_reviewer import _environment
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic-not-a-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-not-a-key")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://example.invalid")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-subscription-token")
+    env = _environment(tmp_path)
+    assert "ANTHROPIC_API_KEY" not in env and "OPENAI_API_KEY" not in env
+    assert "ANTHROPIC_BASE_URL" not in env
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-subscription-token"
+
+
+def test_manual_refresh_cannot_rebind_product_review_to_kernel(setup_review, monkeypatch):
+    company, work, repo = setup_review
+    review = company.prepare_review(work.id, idempotency_key="prepare", source_repository=repo)
+    again = company.prepare_review(work.id, idempotency_key="manual-refresh")
+    assert again.id == review.id
+    assert json.loads(again.json_path.read_text(encoding="utf-8"))["source_repository"] == str(repo.resolve())
+
+
+@pytest.mark.integration
+def test_live_claude_review_only_when_explicitly_enabled(setup_review):
+    from company_os.headless_reviewer import run_headless_review
+    binary = os.environ.get("COMPANY_LIVE_CLAUDE")
+    if not binary:
+        pytest.skip("Set COMPANY_LIVE_CLAUDE to explicitly authorize a subscription call")
+    company, work, repo = setup_review
+    receipt = run_headless_review(
+        company, work.id, repository=repo,
+        test_command=[sys.executable, "-B", "-c", "assert True"],
+        executable=binary, idempotency_key="explicit-live-integration")
+    assert receipt["status"] in {"PASS", "CHANGES_REQUIRED"}

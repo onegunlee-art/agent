@@ -227,6 +227,26 @@ def read_dashboard(
         items: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
+            latest_review = connection.execute(
+                "SELECT payload_json FROM reviews WHERE work_order_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            item["review_result"] = (
+                json.loads(latest_review["payload_json"]).get("result") if latest_review else None
+            )
+            review_events = connection.execute(
+                "SELECT payload_json, occurred_at FROM events WHERE aggregate_type = 'WorkOrder' "
+                "AND aggregate_id = ? AND event_type IN ('HEADLESS_REVIEW_STARTED', "
+                "'HEADLESS_REVIEW_FINISHED', 'HEADLESS_REVIEW_EXPIRED') ORDER BY sequence DESC",
+                (row["id"],),
+            ).fetchall()
+            item["review_attempts"] = []
+            seen_review_executions = set()
+            for event in review_events:
+                attempt = json.loads(event["payload_json"])
+                if attempt["execution_id"] not in seen_review_executions:
+                    seen_review_executions.add(attempt["execution_id"])
+                    item["review_attempts"].append({**attempt, "occurred_at": event["occurred_at"]})
             run_rows = connection.execute(
                 """
                 SELECT id, status, outcome, cost_usd, duration_seconds,
@@ -297,6 +317,8 @@ def read_dashboard(
                 latest_action=latest_action,
                 pending_decisions=pending_decisions,
             )
+            if item["review_attempts"] and item["review_attempts"][0]["status"] not in {"PASS", "RUNNING"}:
+                item["attention_kind"] = "CEO_DECISION_REQUIRED"
             item["last_ceo_action"] = (
                 None
                 if latest_action is None
@@ -509,6 +531,39 @@ def _render_page(snapshot: dict[str, Any], csrf_token: str, preview_url: str) ->
             else ""
         )
         work_order_id = html.escape(str(item["id"]), quote=True)
+        review_rows = []
+        for attempt in item.get("review_attempts", []):
+            review_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(attempt['status']))}</td>"
+                f"<td><code>{html.escape(str(attempt.get('source_commit', ''))[:12])}</code></td>"
+                f"<td>{html.escape(_format_tokens(attempt.get('total_tokens')))}</td>"
+                f"<td>{html.escape(_format_seconds(attempt.get('duration_seconds')))}</td>"
+                f"<td><code>{html.escape(str(attempt['execution_id']))}</code></td></tr>"
+            )
+        review_html = (
+            '<details open><summary>자동 검수 이력 (V0.7)</summary>'
+            '<p class="muted">사용량 대기는 PASS가 아닙니다. 테스트는 커널이 실행하고 '
+            'Claude는 고정된 제품 소스와 시험 결과를 검토합니다. USD는 측정 불가입니다.</p>'
+            '<div class="table-wrap"><table><thead><tr><th>결과</th><th>제품 버전</th>'
+            '<th>토큰</th><th>시간</th><th>실행 ID</th></tr></thead><tbody>'
+            + "".join(review_rows) + '</tbody></table></div></details>'
+        ) if review_rows else ''
+        reviewed = item.get("review_result")
+        if reviewed:
+            findings = ''.join(
+                '<li><code>' + html.escape(finding['code']) + '</code> ' + html.escape(finding['message']) + '</li>'
+                for finding in reviewed.get('findings', [])
+            )
+            changes = ''.join(
+                '<li><code>' + html.escape(change['id']) + '</code> ' + html.escape(change['description']) + '</li>'
+                for change in reviewed.get('required_changes', [])
+            )
+            review_html += (
+                '<details><summary>검수 판정과 지적 사항: ' + html.escape(reviewed['verdict']) + '</summary>'
+                '<p>출처: ' + html.escape(reviewed['source']) + '</p><ul>' + findings + '</ul>'
+                '<p>필수 수정</p><ul>' + changes + '</ul></details>'
+            )
         cards.append(
             '<article class="work-card">'
             '<div class="card-head"><div>'
@@ -537,6 +592,7 @@ def _render_page(snapshot: dict[str, Any], csrf_token: str, preview_url: str) ->
             f'<a href="{html.escape(preview_url, quote=True)}" target="_blank" rel="noreferrer">미리보기 열기 ↗</a>'
             "</div>"
             f"{history_html}"
+            f"{review_html}"
             '<div class="actions"><div><strong>CEO 작업</strong>'
             '<p>버튼은 원장 상태를 직접 덮어쓰지 않습니다. 승인 Event만 추가하며 '
             '모든 쓰기는 별도 company CLI 명령으로 기록됩니다.</p></div>'

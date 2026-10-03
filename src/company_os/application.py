@@ -5271,9 +5271,37 @@ class CompanyOS:
         work_order_id: str,
         *,
         idempotency_key: str,
+        source_repository: str | Path | None = None,
     ) -> Review:
         preflight_work = self.work_order(work_order_id)
+        product_root = Path(source_repository).resolve() if source_repository is not None else None
+        def capture_source() -> SourceSnapshot:
+            return (GitSourceSnapshot(code_root=product_root).capture()
+                    if product_root is not None else self._source_snapshot())
         if preflight_work.status == "WAITING_FOR_OPUS":
+            if product_root is None:
+                waiting = self.store.query_one(
+                    "SELECT payload_json FROM reviews WHERE work_order_id = ? AND status = 'WAITING_FOR_OPUS'",
+                    (work_order_id,),
+                )
+                if waiting is not None:
+                    bound = json.loads(waiting["payload_json"])["request"].get("source_repository")
+                    if bound:
+                        product_root = Path(bound).resolve()
+            if product_root is not None:
+                existing = self.store.query_one(
+                    "SELECT * FROM reviews WHERE work_order_id = ? AND status = 'WAITING_FOR_OPUS'",
+                    (work_order_id,),
+                )
+                if existing is None:
+                    raise ValidationError("Missing waiting ReviewRequest")
+                request = json.loads(existing["payload_json"])["request"]
+                current = capture_source()
+                if (request.get("source_repository") != str(product_root)
+                        or current.source_commit != existing["source_commit"]
+                        or current.source_tree_sha256 != existing["source_tree_sha256"]):
+                    raise ValidationError("Waiting review is bound to another product/source version")
+                return self.review(existing["id"])
             return self._refresh_waiting_review(work_order_id)
         try:
             observed_verifier_hash = verifier_hash(preflight_work.verifier_path)
@@ -5296,7 +5324,7 @@ class CompanyOS:
             raise ValidationError(
                 "ReviewRequest cannot be created because the verifier definition changed"
             )
-        source_snapshot = self._source_snapshot()
+        source_snapshot = capture_source()
         if preflight_work.status in {"VERIFIED", "AWAITING_REREVIEW"}:
             preflight_run, preflight_evidence, preflight_artifacts = (
                 self._review_materials(work_order_id)
@@ -5323,6 +5351,8 @@ class CompanyOS:
             "source_commit": source_snapshot.source_commit,
             "source_tree_sha256": source_snapshot.source_tree_sha256,
         }
+        if product_root is not None:
+            command_payload["source_repository"] = str(product_root)
         created_review_directories: list[Path] = []
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
@@ -5353,7 +5383,7 @@ class CompanyOS:
                 raise ValidationError(
                     f"Review cannot be prepared from status {current_row['status']}"
                 )
-            current_source_snapshot = self._source_snapshot()
+            current_source_snapshot = capture_source()
             if current_source_snapshot != source_snapshot:
                 raise ValidationError(
                     "Source snapshot changed while preparing the ReviewRequest"
@@ -5723,6 +5753,14 @@ class CompanyOS:
                     },
                 },
             }
+            if product_root is not None:
+                kernel = self._source_snapshot()
+                request_core["source_repository"] = str(product_root)
+                request_core["source_kind"] = "PRODUCT_REPOSITORY"
+                request_core["kernel_source"] = {
+                    "source_commit": kernel.source_commit,
+                    "source_tree_sha256": kernel.source_tree_sha256,
+                }
             request_digest = payload_hash(request_core)
             request = {**request_core, "review_request_hash": request_digest}
             atomic_write_json(json_path, request)
@@ -5821,8 +5859,15 @@ class CompanyOS:
             ),
         )
 
+    def _review_source_snapshot(self, row: Any) -> SourceSnapshot:
+        request = json.loads(row["payload_json"])["request"]
+        repository = request.get("source_repository")
+        return (GitSourceSnapshot(code_root=repository).capture()
+                if repository else self._source_snapshot())
+
     def ingest_review_result(
-        self, review_id: str, result_file: str | Path
+        self, review_id: str, result_file: str | Path,
+        *, _headless_execution_id: str | None = None,
     ) -> dict[str, Any]:
         row = self._row("reviews", review_id)
         review = self.review(review_id)
@@ -5864,7 +5909,7 @@ class CompanyOS:
         if not isinstance(result, dict):
             raise ValidationError("ReviewResult must be a JSON object")
         if int(row["schema_version"]) >= 2:
-            current_source = self._source_snapshot()
+            current_source = self._review_source_snapshot(row)
             if (
                 current_source.source_commit != row["source_commit"]
                 or current_source.source_tree_sha256 != row["source_tree_sha256"]
@@ -5895,6 +5940,7 @@ class CompanyOS:
                 row["source_tree_sha256"] if int(row["schema_version"]) >= 2 else None
             ),
             allow_fake_reviewer=self.allow_test_reviewers,
+            allow_headless_reviewer=_headless_execution_id is not None,
         )
         if int(row["schema_version"]) < 2 and result["verdict"] == "PASS":
             raise ValidationError(
@@ -5911,6 +5957,9 @@ class CompanyOS:
         )
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            if result.get("source") == "headless_claude":
+                from .headless_reviewer import authorize_ingest
+                authorize_ingest(self, review_id, _headless_execution_id, result)
             current_row = connection.execute(
                 "SELECT * FROM reviews WHERE id = ?",
                 (review_id,),
@@ -5940,7 +5989,7 @@ class CompanyOS:
                     "content changed during ingest"
                 )
             if int(current_row["schema_version"]) >= 2:
-                commit_snapshot = self._source_snapshot()
+                commit_snapshot = self._review_source_snapshot(current_row)
                 if (
                     commit_snapshot.source_commit != current_row["source_commit"]
                     or commit_snapshot.source_tree_sha256
