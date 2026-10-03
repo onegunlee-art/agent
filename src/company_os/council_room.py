@@ -17,6 +17,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import tomllib
 from typing import Any, Mapping, Protocol, TYPE_CHECKING
 
 from .errors import (
@@ -138,10 +139,15 @@ class SubscriptionExecutiveRunner:
         *,
         codex_executable: str = "codex",
         claude_executable: str = "claude",
+        codex_model: str | None = None,
+        codex_effort: str | None = None,
         process_runner: Any | None = None,
     ) -> None:
         self.codex_executable = codex_executable
         self.claude_executable = claude_executable
+        discovered_model, discovered_effort = self._codex_config()
+        self.codex_model = codex_model or discovered_model
+        self.codex_effort = codex_effort or discovered_effort
         self._process_runner = process_runner or self._run_process
         self._resolve_executables = process_runner is None
 
@@ -174,6 +180,13 @@ class SubscriptionExecutiveRunner:
                 "--json",
                 "-",
             ]
+            if self.codex_model:
+                command[2:2] = ["--model", self.codex_model]
+            if self.codex_effort:
+                command[2:2] = [
+                    "--config",
+                    f'model_reasoning_effort="{self.codex_effort}"',
+                ]
         elif request.provider == "claude":
             executable = self._resolve(self.claude_executable, provider="claude")
             command = [
@@ -237,7 +250,7 @@ class SubscriptionExecutiveRunner:
             if request.provider == "codex":
                 response = json.loads(output_path.read_text(encoding="utf-8"))
                 usage: dict[str, int] = {}
-                model = None
+                model = self.codex_model
                 for line in completed.stdout.splitlines():
                     try:
                         event = json.loads(line)
@@ -258,6 +271,12 @@ class SubscriptionExecutiveRunner:
                 envelope = json.loads(completed.stdout)
                 response = envelope.get("structured_output")
                 model = envelope.get("model") if isinstance(envelope.get("model"), str) else None
+                if model is None and isinstance(envelope.get("modelUsage"), dict):
+                    model_names = [
+                        str(name) for name in envelope["modelUsage"] if str(name).strip()
+                    ]
+                    if len(model_names) == 1:
+                        model = model_names[0]
                 raw_usage = envelope.get("usage")
                 usage = (
                     {
@@ -305,6 +324,20 @@ class SubscriptionExecutiveRunner:
             if fallback.is_file():
                 return str(fallback)
         raise FileNotFoundError(f"{provider} subscription CLI not found: {configured}")
+
+    @staticmethod
+    def _codex_config() -> tuple[str | None, str | None]:
+        path = Path.home() / ".codex" / "config.toml"
+        try:
+            value = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            return None, None
+        model = value.get("model")
+        effort = value.get("model_reasoning_effort")
+        return (
+            model if isinstance(model, str) and model.strip() else None,
+            effort if isinstance(effort, str) and effort.strip() else None,
+        )
 
     @staticmethod
     def _failure_status(output: str) -> str:
