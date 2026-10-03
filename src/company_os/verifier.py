@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -61,18 +62,21 @@ def run_verifier(spec_path: Path, workspace_path: Path) -> VerifierResult:
             details={"reason": "MISSING_ARTIFACT"},
         )
 
-    actual = artifact_path.read_text(encoding=str(spec.get("encoding", "utf-8")))
-    expected = str(spec["expected_content"])
+    # EXACT_TEXT is byte-exact, not universal-newline text comparison. Hash
+    # the same read we compared, rather than reopening a possibly changed file.
+    actual = artifact_path.read_bytes()
+    expected = str(spec["expected_content"]).encode(str(spec.get("encoding", "utf-8")))
     status = "PASS" if actual == expected else "FAIL"
     return VerifierResult(
         status=status,
         message="Artifact content matched." if status == "PASS" else "Artifact content differed.",
         artifact_path=artifact_path,
-        artifact_sha256=sha256_file(artifact_path),
+        artifact_sha256=sha256(actual).hexdigest(),
         details={
             "reason": "MATCH" if status == "PASS" else "CONTENT_MISMATCH",
             "actual_length": len(actual),
             "expected_length": len(expected),
+            "length_unit": "bytes",
         },
     )
 

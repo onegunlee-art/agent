@@ -184,11 +184,11 @@ SQLite만 복구하려면 `company ledger backup/verify/restore`를 사용한다
 
 ## 현재 구축 수준
 
-V0.2 생산 사이클과 V0.3 R2 모델 lease 통합은 Claude 독립 검수 PASS와 CEO
-로컬 병합 승인을 통과했다. 현재 V0.3 작업 브랜치는 그 기반 위에 승인 대기,
-전체 실행 이력, 요청 원가, 백업 시각을 보여주는 로컬 운영 현황판 최소판을
-구현한다. 이 현황판 변경은 자체 테스트 결과이며 아직 별도 독립 검수 결과로
-표현하지 않는다.
+현재 main 기준선은 V0.5 통합본이다. V0.6 작업 브랜치는 그 기반 위에
+단방향 승인 대기 알림과 재현된 검증·소스 결속 결함 수정을 제공한다.
+이 변경의 자체 테스트와 Claude 독립 검수는 구분하며, 독립 PASS 전에는
+V0.6 정식 종료나 실고객 운영 검증 완료로 표현하지 않는다.
+다음 종료 절차와 사용 경계는 [V0.6 종료 관문](V06_RELEASE_GATE_KO.md)에 정리했다.
 
 OpenClaw, Deep Agents, Langfuse, Graphiti, Browser Use, OpenSandbox, Docling,
 DSPy를 한꺼번에 설치하지 않는다. 반복해서 검증된 절차만 다음 버전의 생산

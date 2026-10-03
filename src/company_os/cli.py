@@ -898,16 +898,18 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    company = CompanyOS(root=args.root, db_path=args.db)
+    company = None
     try:
+        company = CompanyOS(root=args.root, db_path=args.db)
         company.initialize()
         _print(_dispatch(company, args))
         return 0
-    except (CompanyOSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+    except (CompanyOSError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
         print(json.dumps({"error": type(exc).__name__, "message": str(exc)}), file=sys.stderr)
         return 2
     finally:
-        company.close()
+        if company is not None:
+            company.close()
 
 
 if __name__ == "__main__":

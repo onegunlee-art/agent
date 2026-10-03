@@ -102,6 +102,24 @@ the owner value remains authoritative.
   interpreter and installed dependency environment are a separate trusted
   boundary and are not attested by this source digest.
 
+Review capture disables `core.fsmonitor` on Git calls and also compares each
+tracked working file with its canonical blob. Missing files and byte mismatches
+fail closed even if Git reports clean status. Only CRLF-to-LF equivalence enabled
+by Git text attributes or `core.autocrlf` is accepted (never for `-text`/binary
+content). Custom filter transformations are not accepted as byte equivalence.
+This validation does not change the v2 manifest definition or historical hashes.
+It detects changes during capture but is not a filesystem lock against edits
+made after capture; review still requires a frozen source revision.
+
+`EXACT_TEXT` compares the expected string encoded using the declared encoding
+against one byte read of the artifact, and hashes that same read. CRLF, LF and
+lone CR are different; result lengths are explicitly bytes. Invalid text bytes
+are a mismatch rather than a decoding crash. FP_LITE requires a structured
+objective (`statement` text, `observable=true`) and nonempty text completion and
+verification criteria; booleans/numbers/containers cannot replace these fields.
+Operational minimum-level policy remains FP_STANDARD; explicit FP_LITE callers
+are still supported under that stricter field validation.
+
 Source-tree manifest v1 hashed ordinary tracked files from worktree bytes and
 therefore remains meaningful only in the checkout environment where it was
 recorded. Existing v1 Evidence is immutable and is neither rewritten nor

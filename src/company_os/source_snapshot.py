@@ -344,7 +344,9 @@ class GitSourceSnapshot:
         return bool(is_junction is not None and is_junction())
 
     def _git(self, cwd: Path, *arguments: str) -> bytes:
-        command = [self.git_executable, *arguments]
+        # Ignore fsmonitor hints/hooks at the review trust boundary. A hook
+        # claiming no changes must never substitute for reading source files.
+        command = [self.git_executable, "-c", "core.fsmonitor=false", *arguments]
         environment = self._git_environment()
         try:
             completed = subprocess.run(
@@ -491,6 +493,13 @@ class GitSourceSnapshot:
         """
 
         manifest = bytearray(_MANIFEST_HEADER)
+        eol_attributes = {}
+        for record in self._nul_values(self._git(repository_root, "ls-files", "--eol", "-z")):
+            metadata, path_bytes = record.split(b"\t", 1)
+            eol_attributes[path_bytes] = metadata.split(b"attr/", 1)[-1].strip().split()
+        autocrlf = self._git(
+            repository_root, "config", "--default", "false", "--get", "core.autocrlf"
+        ).strip().lower() in {b"true", b"input"}
         effective_entries: list[tuple[bytes, bytes, bytes]] = []
         for entry in entries:
             if entry.path_bytes in deleted_paths:
@@ -501,6 +510,13 @@ class GitSourceSnapshot:
                 repository_root,
                 entry,
                 path,
+                allow_crlf=(
+                    b"-text" not in eol_attributes.get(entry.path_bytes, [])
+                    and (autocrlf or any(
+                        value in {b"text", b"text=auto", b"eol=lf", b"eol=crlf"}
+                        for value in eol_attributes.get(entry.path_bytes, [])
+                    ))
+                ),
             )
             effective_entries.append((entry.path_bytes, mode.encode("ascii"), digest))
 
@@ -516,6 +532,8 @@ class GitSourceSnapshot:
         repository_root: Path,
         entry: _TrackedEntry,
         path: Path,
+        *,
+        allow_crlf: bool,
     ) -> bytes:
         if entry.mode == "160000":
             raise SourceSnapshotError(
@@ -525,15 +543,24 @@ class GitSourceSnapshot:
             raise SourceSnapshotError(
                 f"Tracked symlinks are not permitted in a review source snapshot: {path}"
             )
-        if path.exists() and not path.is_file():
+        if not path.is_file():
             raise SourceSnapshotError(
                 f"Tracked source path is not a file, symlink, or gitlink: {path}"
             )
-        # Git blob bytes are the canonical tracked content. Reading the
-        # worktree here would make an otherwise identical tree hash differ
-        # after checkout-level CRLF/LF conversion. This also covers clean
-        # sparse-checkout paths that are intentionally absent from disk.
+        # The digest remains v2 Git-blob based. Independently verify that the
+        # file being executed actually matches it. Only Git-authorized text
+        # CRLF conversion is tolerated; arbitrary clean filters cannot hide
+        # other changed bytes. Sparse/assume-unchanged paths are already denied.
         blob = self._git(repository_root, "cat-file", "blob", entry.object_id)
+        try:
+            actual = path.read_bytes()
+        except OSError as exc:
+            raise SourceSnapshotError(f"Tracked source could not be read: {path}") from exc
+        if actual != blob and not (
+            allow_crlf and b"\0" not in blob and b"\r" not in blob
+            and actual.replace(b"\r\n", b"\n") == blob
+        ):
+            raise SourceSnapshotError(f"Tracked worktree differs from Git blob: {path}")
         return sha256(blob).digest()
 
     @staticmethod

@@ -6,7 +6,9 @@ import hashlib
 import json
 import os
 import smtplib
+import re
 import urllib.request
+from urllib.parse import urlsplit
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Callable
@@ -25,6 +27,26 @@ _SUMMARY = {
 }
 
 
+def _dashboard_link(value: Any) -> str:
+    try:
+        parsed = urlsplit(value) if isinstance(value, str) else None
+        if (parsed is None or parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
+                or parsed.username is not None or parsed.password is not None
+                or parsed.port is None or not 1 <= parsed.port <= 65535
+                or parsed.path not in {"", "/"} or parsed.query or parsed.fragment
+                or any(char.isspace() for char in value)):
+            raise ValueError("invalid local dashboard link")
+    except ValueError as exc:
+        raise ValidationError("dashboard link must be a bare http://127.0.0.1:PORT/ URL") from exc
+    return value
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # The CEO configured one endpoint, not an arbitrary redirect chain.
+        return None
+
+
 def _load_settings(
     config_path: str | Path | None,
     *,
@@ -33,9 +55,9 @@ def _load_settings(
     if config_path is None:
         return {
             "channel": "local_file",
-            "dashboard_url": dashboard_url,
+            "dashboard_url": _dashboard_link(dashboard_url),
         }
-    source = Path(config_path).resolve()
+    source = Path(config_path).absolute()
     if source.is_symlink() or not source.is_file():
         raise ValidationError("notification config must be a regular file")
     try:
@@ -50,16 +72,21 @@ def _load_settings(
     target = settings.get("target")
     if not isinstance(target, str) or not target.strip():
         raise ValueError("notification config requires a single target string")
-    if channel == "webhook" and not target.startswith("https://"):
-        raise ValidationError("notification webhook must use HTTPS")
-    if channel == "email" and "@" not in target:
-        raise ValidationError("notification email target is invalid")
-    configured_dashboard = settings.get("dashboard_url", dashboard_url)
-    if not isinstance(configured_dashboard, str) or not configured_dashboard.startswith(
-        "http://127.0.0.1:"
-    ):
-        raise ValidationError("dashboard link must use 127.0.0.1")
-    return {**settings, "target": target.strip(), "dashboard_url": configured_dashboard}
+    target = target.strip()
+    if channel == "webhook":
+        try:
+            parsed = urlsplit(target)
+            if (parsed.scheme != "https" or not parsed.hostname
+                    or parsed.username is not None or parsed.password is not None
+                    or parsed.fragment or any(char.isspace() for char in target)
+                    or (parsed.port is not None and not 1 <= parsed.port <= 65535)):
+                raise ValueError("invalid webhook")
+        except ValueError as exc:
+            raise ValidationError("notification webhook requires one HTTPS endpoint without userinfo") from exc
+    if channel == "email" and re.fullmatch(r"[^\s@,;<>:]+@[^\s@,;<>:]+", target) is None:
+        raise ValidationError("notification email requires one plain mailbox address")
+    configured_dashboard = _dashboard_link(settings.get("dashboard_url", dashboard_url))
+    return {**settings, "target": target, "dashboard_url": configured_dashboard}
 
 
 def _default_sender(settings: dict[str, Any], message: dict[str, Any]) -> None:
@@ -71,7 +98,7 @@ def _default_sender(settings: dict[str, Any], message: dict[str, Any]) -> None:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.build_opener(_NoRedirect()).open(request, timeout=10) as response:
             if not 200 <= response.status < 300:
                 raise OSError(f"notification webhook returned HTTP {response.status}")
         return
@@ -170,13 +197,19 @@ def dispatch_pending_notifications(
             source_event_id=str(source_event["id"]),
             dashboard_url=str(settings["dashboard_url"]),
         )
-        key = f"dispatch-notification:{message['notification_id']}"
+        # Local fallback is not external delivery. Bind deduplication to the
+        # selected route without placing webhook secrets/mailboxes in Events.
+        route_sha256 = hashlib.sha256(canonical_json({
+            key: settings.get(key) for key in ("channel", "target", "smtp_host", "smtp_port")
+        }).encode("utf-8")).hexdigest()
+        key = f"dispatch-notification:{message['notification_id']}:{route_sha256}"
         claim_payload = {
             "notification_id": message["notification_id"],
             "work_order_id": work_order_id,
             "attention_kind": attention_kind,
             "source_event_id": message["source_event_id"],
             "channel": settings["channel"],
+            "route_sha256": route_sha256,
         }
         try:
             with company.store.transaction() as connection:

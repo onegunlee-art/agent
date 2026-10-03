@@ -7,8 +7,9 @@ import pytest
 
 from company_os.application import CompanyOS
 from company_os.cli import build_parser
+from company_os.errors import ValidationError
 from company_os.model_executor import ExecutorOutcome
-from company_os.notifications import dispatch_pending_notifications
+from company_os.notifications import dispatch_pending_notifications, _load_settings
 
 from .helpers import build_venture
 
@@ -207,3 +208,69 @@ def test_notification_cli_has_dispatch_only_and_no_remote_approval_route() -> No
     assert parsed.notification_command == "dispatch"
     with pytest.raises(SystemExit):
         parser.parse_args(["notification", "approve"])
+
+
+@pytest.mark.parametrize("url", [
+    "https://outside.invalid/", "http://127.0.0.1:8780@outside.invalid/",
+    "http://127.0.0.1:8780/?customer=private", "http://127.0.0.1:8780/private",
+    "http://127.0.0.1:99999/", "http://127.0.0.1:8780/#private",
+])
+def test_dashboard_link_is_local_and_cannot_carry_customer_content(url):
+    with pytest.raises((ValueError, ValidationError)):
+        _load_settings(None, dashboard_url=url)
+
+
+@pytest.mark.parametrize("channel,target", [
+    ("email", "a@example.invalid,b@example.invalid"),
+    ("email", "a@example.invalid\nBcc: b@example.invalid"),
+    ("webhook", "https://"),
+    ("webhook", "https://user:password@notify.invalid/path"),
+])
+def test_destination_validation_rejects_ambiguous_or_multiple_targets(tmp_path, channel, target):
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"schema_version": 1, "channel": channel, "target": target}), encoding="utf-8")
+    with pytest.raises((ValueError, ValidationError)):
+        _load_settings(config, dashboard_url="http://127.0.0.1:8780/")
+
+
+def test_local_fallback_does_not_consume_later_external_delivery(tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"schema_version": 1, "channel": "webhook", "target": "https://notify.invalid/ceo"}), encoding="utf-8")
+    deliveries = []
+    with CompanyOS(tmp_path / "company") as company:
+        _, _, _, order = build_venture(company, "notify-fallback")
+        company.record_model_execution(order.id, _successful_outcome(), idempotency_key="fallback-run")
+        before = dict(company.store.query_one("SELECT * FROM work_orders WHERE id = ?", (order.id,)))
+        def deliver(settings, message):
+            assert not company.store.connection.in_transaction
+            deliveries.append(message)
+        assert dispatch_pending_notifications(company, outbox=tmp_path / "outbox")["sent_count"] == 1
+        assert dispatch_pending_notifications(company, outbox=tmp_path / "outbox", config_path=config, sender=deliver)["sent_count"] == 1
+        assert dispatch_pending_notifications(company, outbox=tmp_path / "outbox", config_path=config, sender=deliver)["skipped_count"] == 1
+        assert dict(company.store.query_one("SELECT * FROM work_orders WHERE id = ?", (order.id,))) == before
+    assert len(deliveries) == 1
+
+
+def test_webhook_transport_disallows_redirects(monkeypatch):
+    from company_os.notifications import _default_sender
+    import urllib.request
+    handlers = []
+    class Response:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    class Opener:
+        def open(self, request, *, timeout):
+            assert timeout == 10
+            return Response()
+    def build(*items):
+        handlers.extend(items)
+        return Opener()
+    monkeypatch.setattr(urllib.request, "build_opener", build)
+    def no_network(*args, **kwargs):
+        raise AssertionError("transport must use the redirect-blocking opener")
+    monkeypatch.setattr(urllib.request, "urlopen", no_network)
+    _default_sender({"channel": "webhook", "target": "https://notify.invalid/one"}, {"summary": "safe"})
+    redirect = next(item for item in handlers if isinstance(item, urllib.request.HTTPRedirectHandler))
+    request = urllib.request.Request("https://notify.invalid/one", data=b"safe")
+    assert redirect.redirect_request(request, None, 302, "Found", {}, "https://other.invalid/") is None

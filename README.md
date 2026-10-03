@@ -243,7 +243,8 @@ handoffs are local untracked state as well.
 
 The OS still has exactly three C-level RoleSpecs: CTO, CPO, and CMO. It does
 not include a scheduler, daemon, external queue, vector database, web crawler,
-external messaging, payments, production deployment, or real customer data.
+payments, production deployment, or real customer data. V0.6 adds only explicit,
+on-demand outbound attention notifications; it adds no remote approval receiver.
 All automated tests and the first four model cycles use synthetic data. V0.5
 creates a file-pilot gate; no real customer data is authorized before complete
 independent review and a separate CEO approval.
