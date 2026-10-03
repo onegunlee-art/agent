@@ -314,6 +314,12 @@ class SubscriptionExecutiveRunner:
         candidate = Path(configured).expanduser()
         if candidate.is_file():
             return str(candidate.resolve())
+        if provider == "codex" and configured.casefold() in {"codex", "codex.exe"}:
+            work_binary = Path.home() / ".codex" / ".sandbox-bin" / (
+                "codex.exe" if os.name == "nt" else "codex"
+            )
+            if work_binary.is_file():
+                return str(work_binary.resolve())
         located = shutil.which(configured)
         if located:
             return located
