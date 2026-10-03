@@ -28,6 +28,7 @@ from .customer_isolation import (
     validate_client_execution,
     verify_client_backup,
 )
+from .council_room import InteractiveCouncil, SubscriptionExecutiveRunner
 from .errors import CompanyOSError
 from .ledger_backup import (
     backup,
@@ -125,6 +126,35 @@ def build_parser() -> argparse.ArgumentParser:
     council_commands = council.add_subparsers(dest="council_command", required=True)
     council_prepare = council_commands.add_parser("prepare")
     council_prepare.add_argument("idea_id")
+    council_open = council_commands.add_parser(
+        "open", help="Open a durable multi-turn executive meeting"
+    )
+    council_open.add_argument("idea_id")
+    council_open.add_argument("--idempotency-key", required=True)
+    council_turn = council_commands.add_parser(
+        "turn", help="Record one CEO message and invoke all three executives"
+    )
+    council_turn.add_argument("session_id")
+    council_turn.add_argument("--message-file", required=True, type=Path)
+    council_turn.add_argument("--idempotency-key", required=True)
+    council_turn.add_argument("--codex-executable", default="codex")
+    council_turn.add_argument("--claude-executable", default="claude")
+    council_turn.add_argument("--time-limit-seconds", type=int, default=600)
+    council_status = council_commands.add_parser("status")
+    council_status.add_argument("session_id")
+    council_retry = council_commands.add_parser(
+        "retry", help="Retry one unfinished role without creating a new turn"
+    )
+    council_retry.add_argument("session_id")
+    council_retry.add_argument("--turn", required=True, type=int)
+    council_retry.add_argument("--role", required=True, choices=("cto", "cpo", "cmo"))
+    council_retry.add_argument("--idempotency-key", required=True)
+    council_retry.add_argument("--codex-executable", default="codex")
+    council_retry.add_argument("--claude-executable", default="claude")
+    council_retry.add_argument("--time-limit-seconds", type=int, default=600)
+    council_close = council_commands.add_parser("close")
+    council_close.add_argument("session_id")
+    council_close.add_argument("--idempotency-key", required=True)
     council_ingest = council_commands.add_parser("ingest")
     council_ingest.add_argument("idea_id")
     council_ingest.add_argument("--role", required=True, choices=("cto", "cpo", "cmo"))
@@ -447,6 +477,40 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         )
     if args.command == "council" and args.council_command == "prepare":
         return company.prepare_council(args.idea_id)
+    if args.command == "council" and args.council_command in {
+        "open",
+        "turn",
+        "status",
+        "retry",
+        "close",
+    }:
+        runner = SubscriptionExecutiveRunner(
+            codex_executable=getattr(args, "codex_executable", "codex"),
+            claude_executable=getattr(args, "claude_executable", "claude"),
+        )
+        room = InteractiveCouncil(
+            company,
+            runner=runner,
+            time_limit_seconds=getattr(args, "time_limit_seconds", 600),
+        )
+        if args.council_command == "open":
+            return room.open(args.idea_id, idempotency_key=args.idempotency_key)
+        if args.council_command == "turn":
+            return room.turn(
+                args.session_id,
+                message_file=args.message_file,
+                idempotency_key=args.idempotency_key,
+            )
+        if args.council_command == "status":
+            return room.status(args.session_id)
+        if args.council_command == "retry":
+            return room.retry(
+                args.session_id,
+                turn_number=args.turn,
+                role=args.role,
+                idempotency_key=args.idempotency_key,
+            )
+        return room.close(args.session_id, idempotency_key=args.idempotency_key)
     if args.command == "council" and args.council_command == "ingest":
         path = company.ingest_council_response(
             args.idea_id,

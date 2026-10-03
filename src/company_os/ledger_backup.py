@@ -62,6 +62,9 @@ class RecoveryRestoreResult:
 
 _REFERENCED_PATH_COLUMNS = (
     ("council_responses", "source_path"),
+    ("council_turns", "ceo_message_path"),
+    ("council_turns", "frozen_input_path"),
+    ("council_role_runs", "output_path"),
     ("ventures", "context_manifest_path"),
     ("work_orders", "verifier_path"),
     ("reviews", "request_json_path"),

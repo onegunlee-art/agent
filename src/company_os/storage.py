@@ -67,6 +67,9 @@ _TABLES = frozenset(
     {
         "ideas",
         "council_responses",
+        "council_sessions",
+        "council_turns",
+        "council_role_runs",
         "contracts",
         "ventures",
         "assumptions",
@@ -112,6 +115,58 @@ CREATE TABLE IF NOT EXISTS council_responses (
     updated_at      TEXT NOT NULL,
     UNIQUE (idea_id, role, version),
     UNIQUE (idea_id, role, response_hash)
+);
+
+CREATE TABLE IF NOT EXISTS council_sessions (
+    id                  TEXT PRIMARY KEY,
+    idea_id             TEXT NOT NULL REFERENCES ideas(id),
+    status              TEXT NOT NULL DEFAULT 'OPEN'
+                        CHECK (status IN ('OPEN', 'CLOSED')),
+    role_routes_json    TEXT NOT NULL CHECK (json_valid(role_routes_json)),
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS council_turns (
+    id                  TEXT PRIMARY KEY,
+    session_id          TEXT NOT NULL REFERENCES council_sessions(id),
+    turn_number         INTEGER NOT NULL CHECK (turn_number > 0),
+    status              TEXT NOT NULL DEFAULT 'RUNNING'
+                        CHECK (status IN ('RUNNING', 'PARTIAL', 'COMPLETED')),
+    ceo_message_path    TEXT NOT NULL,
+    ceo_message_sha256  TEXT NOT NULL,
+    frozen_input_path   TEXT NOT NULL,
+    frozen_input_sha256 TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    UNIQUE (session_id, turn_number)
+);
+
+CREATE TABLE IF NOT EXISTS council_role_runs (
+    id                  TEXT PRIMARY KEY,
+    turn_id             TEXT NOT NULL REFERENCES council_turns(id),
+    role                TEXT NOT NULL CHECK (role IN ('cto', 'cpo', 'cmo')),
+    provider            TEXT NOT NULL CHECK (provider IN ('codex', 'claude')),
+    status              TEXT NOT NULL
+                        CHECK (status IN (
+                            'EXECUTING', 'COMPLETED', 'QUOTA_WAIT',
+                            'AUTH_REQUIRED', 'TIMEOUT', 'INVALID_RESPONSE',
+                            'CLI_NOT_FOUND', 'CLI_FAILED', 'EXPIRED'
+                        )),
+    attempt             INTEGER NOT NULL CHECK (attempt > 0),
+    execution_id        TEXT NOT NULL,
+    fence_token         INTEGER NOT NULL CHECK (fence_token > 0),
+    lease_expires_at    TEXT NOT NULL,
+    input_sha256        TEXT NOT NULL,
+    output_path         TEXT,
+    output_sha256       TEXT,
+    model               TEXT,
+    usage_json          TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(usage_json)),
+    duration_seconds    REAL,
+    error               TEXT,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    UNIQUE (turn_id, role, attempt)
 );
 
 CREATE TABLE IF NOT EXISTS contracts (
@@ -341,6 +396,12 @@ CREATE TABLE IF NOT EXISTS idempotency (
 
 CREATE INDEX IF NOT EXISTS idx_council_responses_idea
     ON council_responses(idea_id);
+CREATE INDEX IF NOT EXISTS idx_council_sessions_idea
+    ON council_sessions(idea_id);
+CREATE INDEX IF NOT EXISTS idx_council_turns_session
+    ON council_turns(session_id, turn_number);
+CREATE INDEX IF NOT EXISTS idx_council_role_runs_turn
+    ON council_role_runs(turn_id, role, attempt);
 CREATE INDEX IF NOT EXISTS idx_contracts_idea ON contracts(idea_id);
 CREATE INDEX IF NOT EXISTS idx_ventures_idea ON ventures(idea_id);
 CREATE INDEX IF NOT EXISTS idx_assumptions_venture ON assumptions(venture_id);
