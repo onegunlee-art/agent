@@ -9,6 +9,7 @@ from __future__ import annotations
 from hashlib import sha1, sha256
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -176,16 +177,20 @@ def _stage_attachments(company, value, workspace):
 
 
 def _decode(completed, request, token_limit):
-    text = (completed.stdout + "\n" + completed.stderr).lower()
     try:
         envelope = json.loads(completed.stdout)
     except (ValueError, TypeError):
         envelope = None
     # Do not classify phrases in a successful review finding as provider errors.
     if completed.returncode != 0 or (isinstance(envelope, dict) and envelope.get("is_error")):
-        if any(word in text for word in ("rate_limit", "rate limit", "usage limit", "hit your limit", "429")):
+        errors = ({key: envelope.get(key) for key in ("error", "errors", "result", "status_code")}
+                  if isinstance(envelope, dict) else completed.stdout)
+        text = (json.dumps(errors) + "\n" + completed.stderr).lower()
+        if (any(word in text for word in ("rate_limit", "rate limit", "usage limit", "hit your limit"))
+                or re.search(r"\b429\b", text)):
             return "QUOTA_WAIT", None, {}
-        if any(word in text for word in ("not logged in", "authentication", "unauthorized", "401")):
+        if (any(word in text for word in ("not logged in", "authentication", "unauthorized"))
+                or re.search(r"\b401\b", text)):
             return "AUTH_REQUIRED", None, {}
         return "CLI_FAILED", None, {}
     if (not isinstance(envelope, dict) or envelope.get("type") != "result"
@@ -253,6 +258,13 @@ def run_headless_review(company, work_order_id, *, repository: Path,
     with company.store.transaction() as conn:
         if company.is_stopped():
             raise ConflictError("Company is stopped")
+        current_review = conn.execute(
+            "SELECT r.status AS review_status, w.status AS work_status FROM reviews r "
+            "JOIN work_orders w ON w.id = r.work_order_id WHERE r.id = ?", (review.id,),
+        ).fetchone()
+        if (current_review is None or current_review["review_status"] != "WAITING_FOR_OPUS"
+                or current_review["work_status"] != "WAITING_FOR_OPUS"):
+            raise ConflictError("Review and WorkOrder must still be waiting at claim")
         # Recheck the key under the same write lock as lease acquisition.
         if company.store.get_global_state(key):
             raise ConflictError("Headless attempt already claimed")

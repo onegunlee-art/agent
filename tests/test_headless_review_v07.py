@@ -289,3 +289,25 @@ def test_live_claude_review_only_when_explicitly_enabled(setup_review):
         test_command=[sys.executable, "-B", "-c", "assert True"],
         executable=binary, idempotency_key="explicit-live-integration")
     assert receipt["status"] in {"PASS", "CHANGES_REQUIRED"}
+
+
+def test_claim_rechecks_review_state_before_starting_process(setup_review, monkeypatch):
+    company, work, _ = setup_review
+    original = company._review_resolution_integrity_issues
+    def concurrent_completion(row, **kwargs):
+        result = original(row, **kwargs)
+        company.store.connection.execute("UPDATE reviews SET status = 'COMPLETED' WHERE id = ?", (row["id"],))
+        return result
+    monkeypatch.setattr(company, "_review_resolution_integrity_issues", concurrent_completion)
+    calls = install_process_stub(monkeypatch, company)
+    with pytest.raises(ConflictError, match="waiting"):
+        execute(setup_review)
+    assert not calls
+
+
+def test_error_classifier_does_not_read_status_codes_from_source_hashes():
+    from company_os.headless_reviewer import _decode
+    envelope = {"type": "result", "is_error": False, "subtype": "success",
+                "structured_output": {"reviewed_commit": "abc401def429abc"}}
+    process = subprocess.CompletedProcess(["claude"], 1, json.dumps(envelope), "")
+    assert _decode(process, {}, 100)[0] == "CLI_FAILED"
