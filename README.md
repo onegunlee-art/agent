@@ -1,6 +1,6 @@
-# AI Company OS V0.8
+# AI Company OS V0.10 Alpha
 
-Status: **V0.8 on-demand review and bounded automatic repair**. The existing ledger,
+Status: **V0.10 interactive council and scenario-bound product planning**. The existing ledger,
 execution leases, customer isolation, backup/deletion, and V0.6 notification
 boundaries remain intact. Automated review binds a committed product repository
 separately from the kernel version. A live Claude subscription login is required;
@@ -11,6 +11,13 @@ Explicitly enqueue a verified product order with `company queue add`, then use
 and rereview. `company tick` processes one phase. Daily limits default to unlimited;
 usage remains recorded. No overnight schedule is installed.
 See [V0.8 operating flow](docs/V08_ON_DEMAND_AUTOMATION_KO.md).
+
+The existing Codex work chat can now start the repository-scoped
+`.agents/skills/council-room/` workflow. It records each delivered CEO message,
+invokes separate CTO/CPO/CMO subscription CLI processes, survives restart, and
+creates a hash-bound product brief, development design, user scenarios, DAG plan,
+and approval bundle. Product implementation remains blocked until the CEO approves
+that exact bundle. See [AI Agent Factory 사용 안내](docs/AI_AGENT_FACTORY_KO.md).
 
 AI Company OS is a local, on-demand operating kernel that turns a one-line
 idea into a venture-scoped workspace, a mechanically checked WorkOrder,
