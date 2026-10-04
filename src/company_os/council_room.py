@@ -222,7 +222,6 @@ class SubscriptionExecutiveRunner:
                 "--effort",
                 "max",
                 "--no-session-persistence",
-                request.prompt,
             ]
         else:
             raise ValidationError(f"Unsupported executive provider: {request.provider}")
@@ -232,7 +231,7 @@ class SubscriptionExecutiveRunner:
                 cwd=request.workspace,
                 environment=environment,
                 timeout=request.time_limit_seconds,
-                input_text=request.prompt if request.provider == "codex" else None,
+                input_text=request.prompt,
             )
         except FileNotFoundError as exc:
             return ExecutiveOutcome(
@@ -395,7 +394,7 @@ class SubscriptionExecutiveRunner:
         )
         try:
             stdout, stderr = process.communicate(input=input_text, timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except BaseException:
             if os.name == "nt":
                 subprocess.run(
                     ["taskkill", "/PID", str(process.pid), "/T", "/F"],
@@ -406,7 +405,10 @@ class SubscriptionExecutiveRunner:
                 )
             else:
                 process.kill()
-            process.communicate(timeout=10)
+            try:
+                process.communicate(timeout=10)
+            except BaseException:
+                pass
             raise
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
@@ -536,6 +538,14 @@ class InteractiveCouncil:
                     raise NotFoundError(f"Council session not found: {session_id}")
                 if session["status"] != "OPEN":
                     raise ValidationError("Council session is closed")
+                unfinished_prior = connection.execute(
+                    "SELECT COUNT(*) FROM council_turns WHERE session_id=? AND status!='COMPLETED'",
+                    (session_id,),
+                ).fetchone()[0]
+                if unfinished_prior:
+                    raise ValidationError(
+                        "Council session has an unfinished prior turn; resume it before adding a CEO message"
+                    )
                 turn_number = int(
                     connection.execute(
                         "SELECT COALESCE(MAX(turn_number), 0) + 1 FROM council_turns WHERE session_id=?",
@@ -661,7 +671,7 @@ class InteractiveCouncil:
             and datetime.now(timezone.utc)
             > datetime.fromisoformat(latest["lease_expires_at"])
         )
-        if latest is None or (
+        if latest is not None and (
             latest["status"] not in RETRYABLE_STATUSES and not expired_execution
         ):
             raise ConflictError("Only an unfinished executive role can be retried")
@@ -669,7 +679,7 @@ class InteractiveCouncil:
             "session_id": session_id,
             "turn_number": int(turn_number),
             "role": normalized_role,
-            "prior_run_id": latest["id"],
+            "prior_run_id": None if latest is None else latest["id"],
         }
         try:
             with self.company.store.transaction() as connection:
@@ -692,6 +702,8 @@ class InteractiveCouncil:
                     command="retry_interactive_council_role",
                     connection=connection,
                 )
+                if result["status"] == "COMPLETED":
+                    self._complete_interrupted_turn_claims(connection, turn, result)
             return result
         except IdempotencyConflict as exc:
             raise ConflictError(str(exc)) from exc
@@ -1076,11 +1088,22 @@ class InteractiveCouncil:
             frozen_input_sha256=turn["frozen_input_sha256"],
             time_limit_seconds=self.time_limit_seconds,
         )
+        interrupted: KeyboardInterrupt | SystemExit | None = None
         try:
             outcome = self.runner.run(request)
             if not isinstance(outcome, ExecutiveOutcome):
                 raise TypeError("Executive runner must return ExecutiveOutcome")
-        except BaseException as exc:
+        except (KeyboardInterrupt, SystemExit) as exc:
+            interrupted = exc
+            outcome = ExecutiveOutcome(
+                status="CLI_FAILED",
+                response=None,
+                provider=self.role_routes[role],
+                model=None,
+                duration_seconds=0.0,
+                error=f"{type(exc).__name__}: executive process interrupted",
+            )
+        except Exception as exc:
             outcome = ExecutiveOutcome(
                 status="CLI_FAILED",
                 response=None,
@@ -1205,6 +1228,8 @@ class InteractiveCouncil:
                 self._update_turn_status(connection, turn_id)
         if stale and output_path is not None:
             output_path.unlink(missing_ok=True)
+        if interrupted is not None:
+            raise interrupted
 
     def _turn_status(self, turn_id: str) -> dict[str, Any]:
         turn = self.company.store.query_one(
@@ -1220,9 +1245,10 @@ class InteractiveCouncil:
                 continue
             response = None
             if run["output_path"]:
-                response = json.loads(
-                    self.company._absolute(run["output_path"]).read_text(encoding="utf-8")
-                )
+                response_path = self.company._absolute(run["output_path"])
+                if sha256_file(response_path) != run["output_sha256"]:
+                    raise ValidationError("Executive response failed its hash binding")
+                response = json.loads(response_path.read_text(encoding="utf-8"))
             roles[role] = {
                 "run_id": run["id"],
                 "status": run["status"],
@@ -1234,14 +1260,19 @@ class InteractiveCouncil:
                 "response": response,
                 "error": run["error"],
             }
+        message_path = self.company._absolute(turn["ceo_message_path"])
+        if sha256_file(message_path) != turn["ceo_message_sha256"]:
+            raise ValidationError("CEO message failed its hash binding")
+        frozen_path = self.company._absolute(turn["frozen_input_path"])
+        frozen_text = frozen_path.read_text(encoding="utf-8").strip()
+        if sha256(frozen_text.encode("utf-8")).hexdigest() != turn["frozen_input_sha256"]:
+            raise ValidationError("Frozen council input failed its hash binding")
         return {
             "turn_id": turn_id,
             "session_id": turn["session_id"],
             "turn_number": int(turn["turn_number"]),
             "status": turn["status"],
-            "ceo_message": self.company._absolute(turn["ceo_message_path"])
-            .read_text(encoding="utf-8")
-            .strip(),
+            "ceo_message": message_path.read_text(encoding="utf-8").strip(),
             "ceo_message_sha256": turn["ceo_message_sha256"],
             "frozen_input_sha256": turn["frozen_input_sha256"],
             "roles": roles,
@@ -1282,6 +1313,13 @@ class InteractiveCouncil:
             (session["id"],),
         ).fetchall()
         for row in rows:
+            message_path = self.company._absolute(row["ceo_message_path"])
+            if sha256_file(message_path) != row["ceo_message_sha256"]:
+                raise ValidationError("Prior CEO message failed its hash binding")
+            frozen_path = self.company._absolute(row["frozen_input_path"])
+            frozen_text = frozen_path.read_text(encoding="utf-8").strip()
+            if sha256(frozen_text.encode("utf-8")).hexdigest() != row["frozen_input_sha256"]:
+                raise ValidationError("Prior frozen council input failed its hash binding")
             outputs: dict[str, Any] = {}
             for role in ROLE_NAMES:
                 run = connection.execute(
@@ -1289,15 +1327,14 @@ class InteractiveCouncil:
                     (row["id"], role),
                 ).fetchone()
                 if run is not None and run["output_path"]:
-                    outputs[role] = json.loads(
-                        self.company._absolute(run["output_path"]).read_text(encoding="utf-8")
-                    )
+                    output_path = self.company._absolute(run["output_path"])
+                    if sha256_file(output_path) != run["output_sha256"]:
+                        raise ValidationError("Prior executive response failed its hash binding")
+                    outputs[role] = json.loads(output_path.read_text(encoding="utf-8"))
             prior_turns.append(
                 {
                     "turn_number": int(row["turn_number"]),
-                    "ceo_message": self.company._absolute(row["ceo_message_path"])
-                    .read_text(encoding="utf-8")
-                    .strip(),
+                    "ceo_message": message_path.read_text(encoding="utf-8").strip(),
                     "role_outputs": outputs,
                 }
             )
@@ -1314,6 +1351,33 @@ class InteractiveCouncil:
             "prior_turns": prior_turns,
             "sharing_rule": "CURRENT_TURN_ROLE_OUTPUTS_ARE_SHARED_NEXT_TURN_ONLY",
         }
+
+    def _complete_interrupted_turn_claims(
+        self,
+        connection: sqlite3.Connection,
+        turn: sqlite3.Row,
+        result: dict[str, Any],
+    ) -> None:
+        message = self.company._absolute(turn["ceo_message_path"]).read_text(
+            encoding="utf-8"
+        ).strip()
+        message_sha256 = sha256(message.encode("utf-8")).hexdigest()
+        rows = connection.execute(
+            """
+            SELECT key FROM idempotency
+            WHERE command='interactive_council_turn' AND status='CLAIMED'
+              AND json_extract(request_json, '$.session_id')=?
+              AND json_extract(request_json, '$.message_sha256')=?
+            """,
+            (turn["session_id"], message_sha256),
+        ).fetchall()
+        for row in rows:
+            self.company.store.complete_idempotency(
+                row["key"],
+                result,
+                command="interactive_council_turn",
+                connection=connection,
+            )
 
     @staticmethod
     def _update_turn_status(connection: sqlite3.Connection, turn_id: str) -> None:

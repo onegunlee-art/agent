@@ -176,6 +176,14 @@ class ProductFactory:
                 self.company.store.insert_row(
                     "product_bundles", row_values, connection=connection
                 )
+                connection.execute(
+                    """
+                    UPDATE product_bundles
+                    SET status='SUPERSEDED', updated_at=?
+                    WHERE product_id=? AND id!=? AND status IN ('DRAFT', 'APPROVED')
+                    """,
+                    (now, product_id, bundle_id),
+                )
                 for index, item in enumerate(ordered_plan):
                     self.company.store.insert_row(
                         "product_work_orders",
@@ -238,12 +246,18 @@ class ProductFactory:
     def approval_text(self, bundle_id: str) -> str:
         row = self._bundle(bundle_id)
         target = json.loads(row["target_json"])
-        delivery = "main 병합과 push" if target["merge_to_main"] else "승인된 브랜치 push"
+        if target["push"] and target["merge_to_main"]:
+            delivery = f"{target['delivery_ref']} push와 main 병합"
+        elif target["push"]:
+            delivery = f"{target['delivery_ref']} push"
+        else:
+            delivery = "로컬 코드 전달"
         return (
             f"제품 {row['product_id']}의 사용자 시나리오·개발 설계·작업계획 "
             f"v{int(row['version'])} (approval bundle SHA-256: "
             f"{row['approval_bundle_sha256']})을 승인합니다. "
-            f"대상은 {target['remote_url']}#{target['delivery_ref']}이며 {delivery}까지 승인하고, "
+            f"대상은 {target['remote_url']} (base {target['base_ref']}, "
+            f"delivery {target['delivery_ref']})이며 {delivery}만 승인하고, "
             "서버 배포는 제외합니다."
         )
 
@@ -256,6 +270,9 @@ class ProductFactory:
         idempotency_key: str,
     ) -> dict[str, Any]:
         row = self._bundle(bundle_id)
+        product = self.company.store.get_row("products", row["product_id"])
+        if product is None or product["current_bundle_id"] != bundle_id:
+            raise ValidationError("Only the current product bundle can be approved")
         if row["status"] != "DRAFT":
             existing = self.company.store.query_one(
                 "SELECT * FROM product_approvals WHERE bundle_id=?", (bundle_id,)
@@ -282,7 +299,15 @@ class ProductFactory:
             current = connection.execute(
                 "SELECT * FROM product_bundles WHERE id=?", (bundle_id,)
             ).fetchone()
-            if current is None or current["status"] != "DRAFT":
+            current_product = connection.execute(
+                "SELECT * FROM products WHERE id=?", (row["product_id"],)
+            ).fetchone()
+            if (
+                current is None
+                or current["status"] != "DRAFT"
+                or current_product is None
+                or current_product["current_bundle_id"] != bundle_id
+            ):
                 raise ValidationError("Product bundle changed before CEO approval")
             approval_id = new_id("product_approval")
             now = utc_now()
@@ -326,7 +351,7 @@ class ProductFactory:
                     "kind": "PRODUCT_APPROVAL_BUNDLE",
                     "path": current["approval_bundle_path"],
                     "sha256": expected_sha256,
-                    "trusted": 1,
+                    "trusted": 0,
                     "payload_json": canonical_json(
                         {
                             "approval_id": approval_id,
@@ -334,6 +359,7 @@ class ProductFactory:
                             "bundle_id": bundle_id,
                             "actor": "CEO",
                             "approval_sha256": payload["approval_sha256"],
+                            "supports_scope_decisions": True,
                             "supports_external_fact": False,
                         }
                     ),
@@ -369,6 +395,9 @@ class ProductFactory:
         row = self._bundle(bundle_id)
         if row["product_id"] != product_id:
             raise ValidationError("Approval bundle belongs to a different product")
+        product = self.company.store.get_row("products", product_id)
+        if product is None or product["current_bundle_id"] != bundle_id:
+            raise ValidationError("Product execution requires the current product bundle")
         approval = self.company.store.query_one(
             "SELECT * FROM product_approvals WHERE bundle_id=? AND product_id=?",
             (bundle_id, product_id),
@@ -533,6 +562,8 @@ class ProductFactory:
             raise ValidationError("Server deployment must be explicitly excluded")
         if not isinstance(target.get("merge_to_main"), bool) or not isinstance(target.get("push"), bool):
             raise ValidationError("Git delivery flags must be boolean")
+        if target["merge_to_main"] and not target["push"]:
+            raise ValidationError("merge_to_main requires push")
         plan = value.get("implementation_plan")
         if not isinstance(plan, list) or len(plan) < 2:
             raise ValidationError("Implementation plan requires at least two WorkOrders")
