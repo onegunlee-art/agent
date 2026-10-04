@@ -62,6 +62,14 @@ class RecoveryRestoreResult:
 
 _REFERENCED_PATH_COLUMNS = (
     ("council_responses", "source_path"),
+    ("council_turns", "ceo_message_path"),
+    ("council_turns", "frozen_input_path"),
+    ("council_role_runs", "output_path"),
+    ("product_bundles", "product_brief_path"),
+    ("product_bundles", "development_schema_path"),
+    ("product_bundles", "user_scenarios_path"),
+    ("product_bundles", "implementation_plan_path"),
+    ("product_bundles", "approval_bundle_path"),
     ("ventures", "context_manifest_path"),
     ("work_orders", "verifier_path"),
     ("reviews", "request_json_path"),
