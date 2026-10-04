@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -13,7 +14,7 @@ from company_os.council_room import (
     InteractiveCouncil,
     SubscriptionExecutiveRunner,
 )
-from company_os.errors import ConflictError, ValidationError
+from company_os.errors import CompanyStoppedError, ConflictError, ValidationError
 
 
 ROLES = ("cto", "cpo", "cmo")
@@ -218,6 +219,121 @@ def test_retry_reclaims_an_interrupted_expired_role_attempt(council, tmp_path):
     assert [row["status"] for row in attempts] == ["EXPIRED", "COMPLETED"]
 
 
+def test_stopped_turn_resumes_roles_that_never_started_without_duplicate_statement(
+    council, tmp_path
+):
+    company, idea, room, runner = council
+    stopped_once = False
+    normal_run = runner.run
+
+    def stop_after_cto(request):
+        nonlocal stopped_once
+        outcome = normal_run(request)
+        if request.role == "cto" and not stopped_once:
+            stopped_once = True
+            company.stop()
+        return outcome
+
+    runner.run = stop_after_cto
+    session_id = room.open(idea.id, idempotency_key="open-stop-resume")["session_id"]
+    message = write_message(tmp_path / "stop.txt", "중단 뒤 같은 턴을 이어간다.")
+
+    with pytest.raises(CompanyStoppedError):
+        room.turn(session_id, message_file=message, idempotency_key="turn-stop-resume")
+    partial = room.status(session_id)["turns"][0]
+    assert partial["roles"]["cto"]["status"] == "COMPLETED"
+    assert partial["roles"]["cpo"]["status"] == "PENDING"
+
+    company.resume()
+    room.retry(
+        session_id, turn_number=1, role="cpo", idempotency_key="resume-cpo"
+    )
+    completed = room.retry(
+        session_id, turn_number=1, role="cmo", idempotency_key="resume-cmo"
+    )
+
+    assert completed["status"] == "COMPLETED"
+    assert company.store.scalar(
+        "SELECT COUNT(*) FROM evidence WHERE kind='CEO_STATEMENT'"
+    ) == 1
+    replay = room.turn(
+        session_id, message_file=message, idempotency_key="turn-stop-resume"
+    )
+    assert replay["turn_id"] == completed["turn_id"]
+
+
+def test_crash_before_first_role_claim_resumes_same_turn(council, tmp_path, monkeypatch):
+    company, idea, room, _runner = council
+    session_id = room.open(idea.id, idempotency_key="open-preclaim-crash")["session_id"]
+    message = write_message(tmp_path / "crash.txt", "첫 역할 청구 전 중단을 복구한다.")
+    execute_role = room._execute_role
+    crashed = False
+
+    def crash_once(turn_id, role, *, retry=False):
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise KeyboardInterrupt()
+        return execute_role(turn_id, role, retry=retry)
+
+    monkeypatch.setattr(room, "_execute_role", crash_once)
+    with pytest.raises(KeyboardInterrupt):
+        room.turn(session_id, message_file=message, idempotency_key="turn-preclaim")
+    monkeypatch.setattr(room, "_execute_role", execute_role)
+
+    for role in ROLES:
+        result = room.retry(
+            session_id,
+            turn_number=1,
+            role=role,
+            idempotency_key=f"resume-{role}",
+        )
+    assert result["status"] == "COMPLETED"
+    assert company.store.scalar("SELECT COUNT(*) FROM council_turns") == 1
+    assert company.store.scalar(
+        "SELECT COUNT(*) FROM evidence WHERE kind='CEO_STATEMENT'"
+    ) == 1
+
+
+def test_new_turn_rejects_unfinished_prior_turn(council, tmp_path):
+    _company, idea, room, runner = council
+    runner.fail_once.add((1, "cpo"))
+    session_id = room.open(idea.id, idempotency_key="open-prior-partial")["session_id"]
+    room.turn(
+        session_id,
+        message_file=write_message(tmp_path / "partial.txt", "첫 턴이다."),
+        idempotency_key="partial-turn",
+    )
+
+    with pytest.raises(ValidationError, match="unfinished prior turn"):
+        room.turn(
+            session_id,
+            message_file=write_message(tmp_path / "too-soon.txt", "다음 턴이다."),
+            idempotency_key="too-soon-turn",
+        )
+
+
+def test_prior_message_and_role_output_hashes_are_checked_before_reuse(council, tmp_path):
+    company, idea, room, _runner = council
+    session_id = room.open(idea.id, idempotency_key="open-tamper-history")["session_id"]
+    room.turn(
+        session_id,
+        message_file=write_message(tmp_path / "history.txt", "보존할 첫 메시지다."),
+        idempotency_key="history-turn",
+    )
+    turn = company.store.query_one("SELECT * FROM council_turns WHERE session_id=?", (session_id,))
+    company._absolute(turn["ceo_message_path"]).write_text("tampered", encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="hash binding"):
+        room.status(session_id)
+    with pytest.raises(ValidationError, match="hash binding"):
+        room.turn(
+            session_id,
+            message_file=write_message(tmp_path / "second.txt", "두 번째 메시지다."),
+            idempotency_key="second-after-tamper",
+        )
+
+
 def test_ceo_external_fact_is_preserved_but_cannot_be_trusted_fact(council, tmp_path):
     company, idea, room, _runner = council
     session_id = room.open(idea.id, idempotency_key="open-3")["session_id"]
@@ -354,11 +470,12 @@ def test_subscription_runner_uses_read_only_separate_cli_processes_and_safe_env(
         codex_effort="xhigh",
         process_runner=process,
     )
+    long_prompt = "긴 프롬프트" * 5000
     base = dict(
         session_id="session-1",
         turn_id="turn-1",
         turn_number=1,
-        prompt="bounded prompt",
+        prompt=long_prompt,
         frozen_input_json="{}",
         frozen_input_sha256="a" * 64,
         time_limit_seconds=60,
@@ -376,10 +493,71 @@ def test_subscription_runner_uses_read_only_separate_cli_processes_and_safe_env(
     assert "--sandbox" in calls[0][0] and "read-only" in calls[0][0]
     assert calls[0][0][calls[0][0].index("--model") + 1] == "configured-astra"
     assert "--no-session-persistence" in calls[1][0]
+    assert long_prompt not in calls[1][0]
+    assert calls[1][4] == long_prompt
     assert calls[0][1] != calls[1][1]
     for _command, _cwd, environment, _timeout, _input in calls:
         assert "OPENAI_API_KEY" not in environment
         assert "ANTHROPIC_API_KEY" not in environment
+
+
+def test_process_runner_kills_child_tree_on_keyboard_interrupt(monkeypatch, tmp_path):
+    class InterruptedProcess:
+        pid = 4321
+        returncode = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def communicate(self, *, input=None, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise KeyboardInterrupt()
+            return "", ""
+
+    process = InterruptedProcess()
+    killed = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: killed.append(command)
+        or subprocess.CompletedProcess(command, 0, "", ""),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        SubscriptionExecutiveRunner._run_process(
+            ["synthetic-cli"],
+            cwd=tmp_path,
+            environment={},
+            timeout=10,
+            input_text="prompt",
+        )
+
+    assert process.calls == 2
+    if __import__("os").name == "nt":
+        assert killed == [["taskkill", "/PID", "4321", "/T", "/F"]]
+
+
+def test_keyboard_interrupt_records_failed_role_and_does_not_start_next_role(
+    council, tmp_path
+):
+    company, idea, room, runner = council
+
+    def interrupt(_request):
+        raise KeyboardInterrupt()
+
+    runner.run = interrupt
+    session_id = room.open(idea.id, idempotency_key="open-interrupt")["session_id"]
+    with pytest.raises(KeyboardInterrupt):
+        room.turn(
+            session_id,
+            message_file=write_message(tmp_path / "interrupt.txt", "실행을 중단한다."),
+            idempotency_key="turn-interrupt",
+        )
+
+    runs = company.store.query_all("SELECT role, status FROM council_role_runs")
+    assert [(row["role"], row["status"]) for row in runs] == [("cto", "CLI_FAILED")]
 
 
 def test_default_codex_resolution_prefers_current_work_install_over_stale_path(

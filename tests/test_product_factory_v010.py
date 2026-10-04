@@ -253,6 +253,117 @@ def test_changed_scenario_after_approval_fails_closed(factory, tmp_path):
         product_factory.execution_plan("synthetic-memo", bundle["bundle_id"])
 
 
+def test_new_bundle_supersedes_old_draft_and_approved_versions(factory, tmp_path):
+    company, product_factory, session_id = factory
+    first = product_factory.draft(
+        session_id,
+        definition_file=write_json(tmp_path / "first.json", valid_definition()),
+        idempotency_key="draft-version-1",
+    )
+    approval_file = tmp_path / "approval-v1.txt"
+    approval_file.write_text(product_factory.approval_text(first["bundle_id"]), encoding="utf-8")
+    product_factory.approve(
+        first["bundle_id"],
+        expected_sha256=first["bundle_sha256"],
+        approval_file=approval_file,
+        idempotency_key="approve-version-1",
+    )
+    second_definition = valid_definition()
+    second_definition["user_scenarios"][0]["observations"].append("두 번째 버전이다.")
+    second = product_factory.draft(
+        session_id,
+        definition_file=write_json(tmp_path / "second.json", second_definition),
+        idempotency_key="draft-version-2",
+    )
+
+    assert product_factory.bundle(first["bundle_id"])["status"] == "SUPERSEDED"
+    assert product_factory.bundle(second["bundle_id"])["status"] == "DRAFT"
+    with pytest.raises(ValidationError, match="current product bundle"):
+        product_factory.execution_plan("synthetic-memo", first["bundle_id"])
+    assert company.store.get_row("products", "synthetic-memo")["current_bundle_id"] == second["bundle_id"]
+
+
+def test_old_draft_cannot_be_approved_after_new_version(factory, tmp_path):
+    _company, product_factory, session_id = factory
+    first = product_factory.draft(
+        session_id,
+        definition_file=write_json(tmp_path / "old.json", valid_definition()),
+        idempotency_key="draft-old",
+    )
+    newer = valid_definition()
+    newer["product_brief"]["features"].append("검색")
+    product_factory.draft(
+        session_id,
+        definition_file=write_json(tmp_path / "new.json", newer),
+        idempotency_key="draft-new",
+    )
+    approval_file = tmp_path / "stale-approval.txt"
+    approval_file.write_text(product_factory.approval_text(first["bundle_id"]), encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="current product bundle"):
+        product_factory.approve(
+            first["bundle_id"],
+            expected_sha256=first["bundle_sha256"],
+            approval_file=approval_file,
+            idempotency_key="approve-old",
+        )
+
+
+def test_approval_sentence_matches_no_push_delivery_scope(factory, tmp_path):
+    _company, product_factory, session_id = factory
+    definition = valid_definition()
+    definition["target"]["push"] = False
+    definition["target"]["merge_to_main"] = False
+    bundle = product_factory.draft(
+        session_id,
+        definition_file=write_json(tmp_path / "local-only.json", definition),
+        idempotency_key="draft-local-only",
+    )
+
+    sentence = product_factory.approval_text(bundle["bundle_id"])
+    assert "push" not in sentence
+    assert "로컬 코드 전달" in sentence
+    assert "base main" in sentence and "delivery main" in sentence
+
+
+def test_merge_to_main_without_push_is_rejected(factory, tmp_path):
+    _company, product_factory, session_id = factory
+    definition = valid_definition()
+    definition["target"]["push"] = False
+
+    with pytest.raises(ValidationError, match="merge_to_main requires push"):
+        product_factory.draft(
+            session_id,
+            definition_file=write_json(tmp_path / "contradictory.json", definition),
+            idempotency_key="draft-contradictory",
+        )
+
+
+def test_product_approval_evidence_is_provenance_not_trusted_fact(factory, tmp_path):
+    company, product_factory, session_id = factory
+    bundle = product_factory.draft(
+        session_id,
+        definition_file=write_json(tmp_path / "evidence.json", valid_definition()),
+        idempotency_key="draft-evidence-policy",
+    )
+    approval_file = tmp_path / "evidence-approval.txt"
+    approval_file.write_text(product_factory.approval_text(bundle["bundle_id"]), encoding="utf-8")
+    product_factory.approve(
+        bundle["bundle_id"],
+        expected_sha256=bundle["bundle_sha256"],
+        approval_file=approval_file,
+        idempotency_key="approve-evidence-policy",
+    )
+
+    evidence = company.store.query_one(
+        "SELECT * FROM evidence WHERE kind='PRODUCT_APPROVAL_BUNDLE'"
+    )
+    assert evidence["trusted"] == 0
+    payload = json.loads(evidence["payload_json"])
+    assert payload["supports_scope_decisions"] is True
+    assert payload["supports_external_fact"] is False
+
+
 def test_dashboard_surfaces_council_speeches_and_scenario_approval(factory, tmp_path):
     company, product_factory, session_id = factory
     bundle = product_factory.draft(
