@@ -13,6 +13,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -404,7 +405,10 @@ class SubscriptionExecutiveRunner:
                     timeout=10,
                 )
             else:
-                process.kill()
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             try:
                 process.communicate(timeout=10)
             except BaseException:
@@ -1015,6 +1019,16 @@ class InteractiveCouncil:
                     )
                 elif not retry:
                     return
+            frozen_path = self.company._absolute(turn["frozen_input_path"])
+            try:
+                frozen_json = frozen_path.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError) as exc:
+                raise ValidationError("Frozen council input could not be read") from exc
+            if (
+                sha256(frozen_json.encode("utf-8")).hexdigest()
+                != turn["frozen_input_sha256"]
+            ):
+                raise ValidationError("Frozen council input failed its hash binding")
             attempt = 1 if latest is None else int(latest["attempt"]) + 1
             fence_token = 1 if latest is None else int(latest["fence_token"]) + 1
             execution_id = new_id("council_execution")
@@ -1065,8 +1079,6 @@ class InteractiveCouncil:
                 connection=connection,
             )
 
-        frozen_path = self.company._absolute(turn["frozen_input_path"])
-        frozen_json = frozen_path.read_text(encoding="utf-8").strip()
         workspace = contained_path(
             self.company.root,
             "var",

@@ -621,10 +621,14 @@ def test_process_runner_kills_posix_process_group_on_keyboard_interrupt(
         def killpg(pid, sig):
             killed.append((pid, sig))
 
+    class PosixSignal:
+        SIGKILL = getattr(signal, "SIGKILL", 9)
+
     process = InterruptedProcess()
     killed = []
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
     monkeypatch.setattr(council_room_module, "os", PosixOS)
+    monkeypatch.setattr(council_room_module, "signal", PosixSignal)
 
     with pytest.raises(KeyboardInterrupt):
         SubscriptionExecutiveRunner._run_process(
@@ -636,7 +640,7 @@ def test_process_runner_kills_posix_process_group_on_keyboard_interrupt(
         )
 
     assert process.calls == 2
-    assert killed == [(8765, signal.SIGKILL)]
+    assert killed == [(8765, PosixSignal.SIGKILL)]
 
 
 def test_keyboard_interrupt_records_failed_role_and_does_not_start_next_role(
