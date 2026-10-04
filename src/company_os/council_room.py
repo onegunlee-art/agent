@@ -84,22 +84,39 @@ _RESPONSE_SCHEMA = {
     "properties": {
         "schema_version": {"type": "integer", "const": 1},
         "role": {"type": "string", "enum": list(ROLE_NAMES)},
-        "speech": {"type": "string", "minLength": 1},
+        "speech": {"type": "string", "minLength": 1, "maxLength": 3000},
         "contribution": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "summary": {"type": "string"},
-                "details": {"type": "array", "items": {"type": "string"}},
+                "summary": {"type": "string", "maxLength": 2000},
+                "details": {
+                    "type": "array",
+                    "maxItems": 12,
+                    "items": {"type": "string", "maxLength": 1000},
+                },
             },
             "required": ["summary", "details"],
         },
-        "questions": {"type": "array", "items": {"type": "string"}},
-        "advisory": {"type": "array", "items": {"type": "string"}},
-        "evidence_refs": {"type": "array", "items": {"type": "string"}},
+        "questions": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {"type": "string", "maxLength": 1000},
+        },
+        "advisory": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {"type": "string", "maxLength": 1000},
+        },
+        "evidence_refs": {
+            "type": "array",
+            "maxItems": 12,
+            "items": {"type": "string", "maxLength": 500},
+        },
         "unresolved_decisions": {
             "type": "array",
-            "items": {"type": "string"},
+            "maxItems": 6,
+            "items": {"type": "string", "maxLength": 1000},
         },
     },
     "required": [
@@ -1128,6 +1145,8 @@ class InteractiveCouncil:
             "Do not invoke tools, other agents, company commands, or council commands. "
             "Use only the frozen shared input and your role specification. "
             "Return exactly the requested JSON object.\n\n"
+            "Keep the response decision-useful and bounded by the schema. "
+            "Do not restate the full meeting transcript.\n\n"
             f"ROLE_SPEC={canonical_json(role_spec)}\n"
             f"FROZEN_INPUT={frozen_input_json}"
         )
