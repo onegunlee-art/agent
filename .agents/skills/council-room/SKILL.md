@@ -26,7 +26,12 @@ through a real `company council` command and return its receipt.
 5. Show the CTO, CPO, and CMO `speech` fields separately and without rewriting
    them. A clearly labeled moderator summary may follow. Summarize at most three
    important questions under: confirmed, unresolved, disagreements, next step.
-6. Return a receipt containing the session ID, turn ID/number, CEO-message
+6. Inspect `unresolved_decisions` before closing. If any remain, ask the CEO for
+   an explicit decision, write the version-1 decision JSON, and run
+   `company council decide <session-id> --decision-file <path> --idempotency-key <key>`.
+   Never invent a CEO decision. Closing is expected to fail until the current
+   unresolved-decision set is hash-bound to that decision.
+7. Return a receipt containing the session ID, turn ID/number, CEO-message
    SHA-256, frozen-input SHA-256, and each role's provider/model/status/output
    SHA-256. A file hash proves the stored text, not how an app rendered it.
 

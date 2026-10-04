@@ -33,6 +33,7 @@ company council open <idea-id> --idempotency-key <key>
 company council turn <session-id> --message-file <utf8-file> --idempotency-key <key>
 company council status <session-id>
 company council retry <session-id> --turn <n> --role <cto|cpo|cmo> --idempotency-key <new-key>
+company council decide <session-id> --decision-file <utf8-json> --idempotency-key <key>
 company council close <session-id> --idempotency-key <key>
 
 company product draft <session-id> --definition-file <json> --idempotency-key <key>
@@ -46,6 +47,12 @@ company product plan <product-id> <bundle-id>
 `turn`은 세 역할을 각각 별도 프로세스로 실행합니다. 한 역할만 실패하면 성공 답변은
 보존하고 `retry`로 그 역할만 다시 실행합니다. `QUOTA_WAIT`와 `AUTH_REQUIRED`는
 로그인이나 한도 상태를 사람이 해결하기 전에 반복 호출하지 않습니다.
+
+임원 응답에 미해결 결정이 하나라도 있으면 `close`는 거부됩니다. CEO가
+`schema_version`, `session_id`, `decisions`를 담은 JSON을 `council decide`로
+기록해야 합니다. 각 결정에는 `decision_id`, `decision`, `rationale`가 필요합니다.
+결정 원문은 Evidence와 Event에 해시 결속되지만 외부 사실의 검증 증거로 승격되지는
+않습니다.
 
 ## 사용자 시나리오 승인
 

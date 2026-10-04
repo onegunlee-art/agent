@@ -165,6 +165,12 @@ def build_parser() -> argparse.ArgumentParser:
     council_close = council_commands.add_parser("close")
     council_close.add_argument("session_id")
     council_close.add_argument("--idempotency-key", required=True)
+    council_decide = council_commands.add_parser(
+        "decide", help="Record CEO decisions that resolve current executive disagreements"
+    )
+    council_decide.add_argument("session_id")
+    council_decide.add_argument("--decision-file", required=True, type=Path)
+    council_decide.add_argument("--idempotency-key", required=True)
     council_ingest = council_commands.add_parser("ingest")
     council_ingest.add_argument("idea_id")
     council_ingest.add_argument("--role", required=True, choices=("cto", "cpo", "cmo"))
@@ -513,6 +519,7 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
         "turn",
         "status",
         "retry",
+        "decide",
         "close",
     }:
         runner = SubscriptionExecutiveRunner(
@@ -539,6 +546,12 @@ def _dispatch(company: CompanyOS, args: argparse.Namespace) -> Any:
                 args.session_id,
                 turn_number=args.turn,
                 role=args.role,
+                idempotency_key=args.idempotency_key,
+            )
+        if args.council_command == "decide":
+            return room.resolve_decisions(
+                args.session_id,
+                decision_file=args.decision_file,
                 idempotency_key=args.idempotency_key,
             )
         return room.close(args.session_id, idempotency_key=args.idempotency_key)

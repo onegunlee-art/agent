@@ -706,6 +706,9 @@ class InteractiveCouncil:
             "SELECT * FROM council_turns WHERE session_id=? ORDER BY turn_number",
             (session_id,),
         )
+        unresolved = self._unresolved_decisions(session_id)
+        unresolved_sha256 = self._unresolved_sha256(unresolved)
+        resolution = self._latest_resolution(session_id)
         return {
             "session_id": session_id,
             "idea_id": session["idea_id"],
@@ -713,7 +716,156 @@ class InteractiveCouncil:
             "role_routes": json.loads(session["role_routes_json"]),
             "turn_count": len(turns),
             "turns": [self._turn_status(turn["id"]) for turn in turns],
+            "unresolved_decisions": unresolved,
+            "unresolved_decisions_sha256": unresolved_sha256,
+            "decisions_resolved": not unresolved
+            or (
+                resolution is not None
+                and resolution.get("unresolved_decisions_sha256") == unresolved_sha256
+            ),
+            "decision_resolution": resolution,
         }
+
+    def resolve_decisions(
+        self,
+        session_id: str,
+        *,
+        decision_file: str | Path,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        source = Path(decision_file).resolve()
+        if (
+            source.is_symlink()
+            or not source.is_file()
+            or source.stat().st_size > _MAX_MESSAGE_BYTES
+        ):
+            raise ValidationError("Council decision file must be a regular file of at most 128 KiB")
+        try:
+            document = json.loads(source.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValidationError("Council decision file must be valid UTF-8 JSON") from exc
+        if not isinstance(document, dict) or set(document) != {
+            "schema_version",
+            "session_id",
+            "decisions",
+        }:
+            raise ValidationError("Council decision document fields do not match schema version 1")
+        if document["schema_version"] != 1 or document["session_id"] != session_id:
+            raise ValidationError("Council decision session_id or schema version is invalid")
+        decisions = document["decisions"]
+        if not isinstance(decisions, list) or not decisions:
+            raise ValidationError("Council decision document must contain at least one decision")
+        decision_ids: set[str] = set()
+        for decision in decisions:
+            if not isinstance(decision, dict) or set(decision) != {
+                "decision_id",
+                "decision",
+                "rationale",
+            }:
+                raise ValidationError("Each council decision must contain id, decision, and rationale")
+            values = [decision["decision_id"], decision["decision"], decision["rationale"]]
+            if not all(isinstance(value, str) and value.strip() for value in values):
+                raise ValidationError("Council decision values must be non-empty strings")
+            if decision["decision_id"] in decision_ids:
+                raise ValidationError("Council decision IDs must be unique")
+            decision_ids.add(decision["decision_id"])
+
+        session = self.company.store.query_one(
+            "SELECT * FROM council_sessions WHERE id=?", (session_id,)
+        )
+        if session is None:
+            raise NotFoundError(f"Council session not found: {session_id}")
+        if session["status"] != "OPEN":
+            raise ValidationError("Council decisions can only be resolved in an open session")
+        unfinished = self.company.store.scalar(
+            "SELECT COUNT(*) FROM council_turns WHERE session_id=? AND status!='COMPLETED'",
+            (session_id,),
+        )
+        if unfinished:
+            raise ValidationError("Council session has unfinished executive responses")
+        unresolved = self._unresolved_decisions(session_id)
+        unresolved_sha256 = self._unresolved_sha256(unresolved)
+        through_turn = int(
+            self.company.store.scalar(
+                "SELECT COALESCE(MAX(turn_number), 0) FROM council_turns WHERE session_id=?",
+                (session_id,),
+            )
+        )
+        command_payload = {
+            "session_id": session_id,
+            "decision_document_sha256": sha256(
+                canonical_json(document).encode("utf-8")
+            ).hexdigest(),
+            "unresolved_decisions_sha256": unresolved_sha256,
+            "through_turn_number": through_turn,
+        }
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            artifact = contained_path(
+                self.company.root,
+                "var",
+                "council-room",
+                session_id,
+                "decisions",
+                f"decision-{command_payload['decision_document_sha256'][:16]}.json",
+            )
+            atomic_write_text(artifact, canonical_json(document) + "\n")
+            decision_sha = sha256_file(artifact)
+            evidence_id = new_id("evidence")
+            self.company.store.insert_row(
+                "evidence",
+                {
+                    "id": evidence_id,
+                    "idea_id": session["idea_id"],
+                    "venture_id": None,
+                    "work_order_id": None,
+                    "run_id": None,
+                    "external_ref": f"ceo-council-decision:{session_id}:{through_turn}",
+                    "kind": "CEO_COUNCIL_DECISION",
+                    "path": self.company._relative(artifact),
+                    "sha256": decision_sha,
+                    "trusted": 0,
+                    "payload_json": canonical_json(
+                        {
+                            "schema_version": 1,
+                            "session_id": session_id,
+                            "through_turn_number": through_turn,
+                            "decision_count": len(decisions),
+                            "unresolved_decisions_sha256": unresolved_sha256,
+                            "supports_scope_decisions": True,
+                            "supports_external_fact": False,
+                        }
+                    ),
+                    "created_at": utc_now(),
+                },
+                connection=connection,
+            )
+            event_payload = {
+                "evidence_id": evidence_id,
+                "decision_sha256": decision_sha,
+                "decision_count": len(decisions),
+                "through_turn_number": through_turn,
+                "unresolved_decisions_sha256": unresolved_sha256,
+            }
+            self.company.store.append_event(
+                "COUNCIL_DECISIONS_RESOLVED",
+                aggregate_type="CouncilSession",
+                aggregate_id=session_id,
+                correlation_id=session_id,
+                payload=event_payload,
+                connection=connection,
+            )
+            return {"session_id": session_id, **event_payload}
+
+        try:
+            return self.company.store.run_idempotent(
+                idempotency_key,
+                "resolve_interactive_council_decisions",
+                command_payload,
+                operation,
+            )
+        except IdempotencyConflict as exc:
+            raise ConflictError(str(exc)) from exc
 
     def close(self, session_id: str, *, idempotency_key: str) -> dict[str, Any]:
         payload = {"session_id": session_id}
@@ -730,6 +882,15 @@ class InteractiveCouncil:
             ).fetchone()[0]
             if unfinished:
                 raise ValidationError("Council session has unfinished executive responses")
+            unresolved = self._unresolved_decisions(session_id)
+            if unresolved:
+                resolution = self._latest_resolution(session_id)
+                if resolution is None or resolution.get(
+                    "unresolved_decisions_sha256"
+                ) != self._unresolved_sha256(unresolved):
+                    raise ValidationError(
+                        "Council session has unresolved executive decisions; record a CEO decision first"
+                    )
             now = utc_now()
             connection.execute(
                 "UPDATE council_sessions SET status='CLOSED', updated_at=? WHERE id=?",
@@ -752,6 +913,57 @@ class InteractiveCouncil:
             )
         except IdempotencyConflict as exc:
             raise ConflictError(str(exc)) from exc
+
+    def _unresolved_decisions(self, session_id: str) -> list[dict[str, Any]]:
+        rows = self.company.store.query_all(
+            """
+            SELECT t.turn_number, r.role, r.output_path, r.output_sha256
+            FROM council_turns t
+            JOIN council_role_runs r ON r.turn_id=t.id
+            JOIN (
+                SELECT turn_id, role, MAX(attempt) AS attempt
+                FROM council_role_runs GROUP BY turn_id, role
+            ) latest ON latest.turn_id=r.turn_id AND latest.role=r.role
+                     AND latest.attempt=r.attempt
+            WHERE t.session_id=? AND r.status='COMPLETED'
+            ORDER BY t.turn_number, r.role
+            """,
+            (session_id,),
+        )
+        unresolved: list[dict[str, Any]] = []
+        for row in rows:
+            if not row["output_path"]:
+                continue
+            path = self.company._absolute(row["output_path"])
+            if sha256_file(path) != row["output_sha256"]:
+                raise ValidationError("Executive decision source failed its hash binding")
+            response = json.loads(path.read_text(encoding="utf-8"))
+            for index, item in enumerate(response.get("unresolved_decisions", [])):
+                unresolved.append(
+                    {
+                        "ref": f"turn-{int(row['turn_number'])}:{row['role']}:{index}",
+                        "turn_number": int(row["turn_number"]),
+                        "role": row["role"],
+                        "item": item,
+                        "source_sha256": row["output_sha256"],
+                    }
+                )
+        return unresolved
+
+    @staticmethod
+    def _unresolved_sha256(unresolved: list[dict[str, Any]]) -> str:
+        return sha256(canonical_json(unresolved).encode("utf-8")).hexdigest()
+
+    def _latest_resolution(self, session_id: str) -> dict[str, Any] | None:
+        row = self.company.store.query_one(
+            """
+            SELECT payload_json FROM events
+            WHERE event_type='COUNCIL_DECISIONS_RESOLVED' AND aggregate_id=?
+            ORDER BY sequence DESC LIMIT 1
+            """,
+            (session_id,),
+        )
+        return None if row is None else json.loads(row["payload_json"])
 
     def assert_external_fact_supported(self, evidence_id: str) -> None:
         evidence = self.company.store.get_row("evidence", evidence_id)
