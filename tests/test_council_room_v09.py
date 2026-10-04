@@ -83,6 +83,28 @@ def write_message(path: Path, text: str) -> Path:
     return path
 
 
+def write_decisions(path: Path, session_id: str) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_id": session_id,
+                "decisions": [
+                    {
+                        "decision_id": "scope-v1",
+                        "decision": "합성 로컬 메모 제품만 개발한다.",
+                        "rationale": "CEO가 첫 제품 범위를 명시적으로 선택했다.",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+        newline="\n",
+    )
+    return path
+
+
 def test_two_turns_route_exact_roles_and_freeze_shared_input(council, tmp_path):
     company, idea, room, runner = council
     opened = room.open(idea.id, idempotency_key="open-1")
@@ -217,6 +239,58 @@ def test_ceo_external_fact_is_preserved_but_cannot_be_trusted_fact(council, tmp_
     assert payload["supports_external_fact"] is False
     with pytest.raises(ValidationError, match="external fact"):
         room.assert_external_fact_supported(evidence["id"])
+
+
+def test_unresolved_executive_decisions_block_close_until_ceo_resolution_is_recorded(
+    council, tmp_path
+):
+    company, idea, room, _runner = council
+    session_id = room.open(idea.id, idempotency_key="open-resolution")["session_id"]
+    room.turn(
+        session_id,
+        message_file=write_message(tmp_path / "scope.txt", "제품 범위를 논의하자."),
+        idempotency_key="turn-resolution",
+    )
+
+    with pytest.raises(ValidationError, match="unresolved executive decisions"):
+        room.close(session_id, idempotency_key="close-before-resolution")
+
+    decision_file = write_decisions(tmp_path / "decisions.json", session_id)
+    resolved = room.resolve_decisions(
+        session_id,
+        decision_file=decision_file,
+        idempotency_key="resolve-decisions",
+    )
+    closed = room.close(session_id, idempotency_key="close-after-resolution")
+
+    assert resolved["decision_count"] == 1
+    assert closed["status"] == "CLOSED"
+    evidence = company.store.query_one(
+        "SELECT * FROM evidence WHERE kind='CEO_COUNCIL_DECISION'"
+    )
+    assert evidence is not None
+    assert evidence["sha256"] == resolved["decision_sha256"]
+    assert json.loads(evidence["payload_json"])["session_id"] == session_id
+    event = company.store.query_one(
+        "SELECT * FROM events WHERE event_type='COUNCIL_DECISIONS_RESOLVED'"
+    )
+    assert event is not None
+    assert json.loads(event["payload_json"])["evidence_id"] == evidence["id"]
+
+
+def test_council_decision_resolution_rejects_wrong_session(council, tmp_path):
+    _company, idea, room, _runner = council
+    session_id = room.open(idea.id, idempotency_key="open-wrong-resolution")[
+        "session_id"
+    ]
+    decision_file = write_decisions(tmp_path / "wrong.json", "another-session")
+
+    with pytest.raises(ValidationError, match="session_id"):
+        room.resolve_decisions(
+            session_id,
+            decision_file=decision_file,
+            idempotency_key="wrong-resolution",
+        )
 
 
 def test_turn_rejects_more_or_fewer_than_three_role_routes(council):

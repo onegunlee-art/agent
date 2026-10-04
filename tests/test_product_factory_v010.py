@@ -118,6 +118,29 @@ def factory(tmp_path: Path):
             message_file=message_path,
             idempotency_key=f"turn-{number}",
         )
+    decisions = tmp_path / "decisions.json"
+    decisions.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_id": session["session_id"],
+                "decisions": [
+                    {
+                        "decision_id": "synthetic-product-scope",
+                        "decision": "합성 로컬 메모 제품 범위를 채택한다.",
+                        "rationale": "제품 팩토리 수용 테스트 범위를 확정한다.",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    room.resolve_decisions(
+        session["session_id"],
+        decision_file=decisions,
+        idempotency_key="resolve",
+    )
     room.close(session["session_id"], idempotency_key="close")
     try:
         yield company, ProductFactory(company), session["session_id"]
