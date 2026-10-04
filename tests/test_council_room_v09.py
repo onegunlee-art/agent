@@ -251,6 +251,8 @@ def test_subscription_runner_uses_read_only_separate_cli_processes_and_safe_env(
             schema = json.loads(schema_path.read_text(encoding="utf-8"))
             assert schema["properties"]["schema_version"]["type"] == "integer"
             assert schema["properties"]["role"]["type"] == "string"
+            assert schema["properties"]["questions"]["maxItems"] == 6
+            assert schema["properties"]["contribution"]["properties"]["details"]["maxItems"] == 12
             output_path = Path(command[command.index("--output-last-message") + 1])
             output_path.write_text(json.dumps(response), encoding="utf-8")
             stdout = json.dumps(
