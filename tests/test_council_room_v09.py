@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 
 import pytest
 
+import company_os.council_room as council_room_module
 from company_os.application import CompanyOS
 from company_os.council_room import (
     ExecutiveOutcome,
@@ -334,6 +337,60 @@ def test_prior_message_and_role_output_hashes_are_checked_before_reuse(council, 
         )
 
 
+def test_current_frozen_input_is_verified_before_retry_claim_or_provider_call(
+    council, tmp_path
+):
+    company, idea, room, runner = council
+    runner.fail_once.add((1, "cpo"))
+    session_id = room.open(idea.id, idempotency_key="open-current-input-tamper")[
+        "session_id"
+    ]
+    room.turn(
+        session_id,
+        message_file=write_message(tmp_path / "original.txt", "원래 CEO 메시지다."),
+        idempotency_key="turn-current-input-tamper",
+    )
+    turn = company.store.query_one(
+        "SELECT * FROM council_turns WHERE session_id=?", (session_id,)
+    )
+    frozen_path = company._absolute(turn["frozen_input_path"])
+    tampered = json.loads(frozen_path.read_text(encoding="utf-8"))
+    tampered["ceo_message"] = "변조된 CEO 메시지다."
+    frozen_path.write_text(
+        json.dumps(tampered, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    call_count = len(runner.calls)
+    run_count = company.store.scalar(
+        "SELECT COUNT(*) FROM council_role_runs WHERE turn_id=?", (turn["id"],)
+    )
+    event_count = company.store.scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_type='CouncilRoleRun'"
+    )
+
+    with pytest.raises(ValidationError, match="Frozen council input failed its hash binding"):
+        room.retry(
+            session_id,
+            turn_number=1,
+            role="cpo",
+            idempotency_key="retry-current-input-tamper",
+        )
+
+    assert len(runner.calls) == call_count
+    assert company.store.scalar(
+        "SELECT COUNT(*) FROM council_role_runs WHERE turn_id=?", (turn["id"],)
+    ) == run_count
+    assert company.store.scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_type='CouncilRoleRun'"
+    ) == event_count
+    completed = company.store.query_all(
+        "SELECT role FROM council_role_runs WHERE turn_id=? AND status='COMPLETED'",
+        (turn["id"],),
+    )
+    assert {row["role"] for row in completed} == {"cto", "cmo"}
+
+
 def test_ceo_external_fact_is_preserved_but_cannot_be_trusted_fact(council, tmp_path):
     company, idea, room, _runner = council
     session_id = room.open(idea.id, idempotency_key="open-3")["session_id"]
@@ -535,8 +592,51 @@ def test_process_runner_kills_child_tree_on_keyboard_interrupt(monkeypatch, tmp_
         )
 
     assert process.calls == 2
-    if __import__("os").name == "nt":
+    if os.name == "nt":
         assert killed == [["taskkill", "/PID", "4321", "/T", "/F"]]
+    else:
+        assert killed == [(4321, signal.SIGKILL)]
+
+
+def test_process_runner_kills_posix_process_group_on_keyboard_interrupt(
+    monkeypatch, tmp_path
+):
+    class InterruptedProcess:
+        pid = 8765
+        returncode = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def communicate(self, *, input=None, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise KeyboardInterrupt()
+            return "", ""
+
+    class PosixOS:
+        name = "posix"
+
+        @staticmethod
+        def killpg(pid, sig):
+            killed.append((pid, sig))
+
+    process = InterruptedProcess()
+    killed = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(council_room_module, "os", PosixOS)
+
+    with pytest.raises(KeyboardInterrupt):
+        SubscriptionExecutiveRunner._run_process(
+            ["synthetic-cli"],
+            cwd=tmp_path,
+            environment={},
+            timeout=10,
+            input_text="prompt",
+        )
+
+    assert process.calls == 2
+    assert killed == [(8765, signal.SIGKILL)]
 
 
 def test_keyboard_interrupt_records_failed_role_and_does_not_start_next_role(
@@ -563,7 +663,8 @@ def test_keyboard_interrupt_records_failed_role_and_does_not_start_next_role(
 def test_default_codex_resolution_prefers_current_work_install_over_stale_path(
     tmp_path, monkeypatch
 ):
-    current = tmp_path / ".codex" / ".sandbox-bin" / "codex.exe"
+    executable = "codex.exe" if os.name == "nt" else "codex"
+    current = tmp_path / ".codex" / ".sandbox-bin" / executable
     current.parent.mkdir(parents=True)
     current.write_bytes(b"synthetic executable")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
