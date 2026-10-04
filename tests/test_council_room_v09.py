@@ -581,6 +581,12 @@ def test_process_runner_kills_child_tree_on_keyboard_interrupt(monkeypatch, tmp_
         lambda command, **kwargs: killed.append(command)
         or subprocess.CompletedProcess(command, 0, "", ""),
     )
+    if os.name != "nt":
+        monkeypatch.setattr(
+            council_room_module.os,
+            "killpg",
+            lambda pid, sig: killed.append((pid, sig)),
+        )
 
     with pytest.raises(KeyboardInterrupt):
         SubscriptionExecutiveRunner._run_process(
