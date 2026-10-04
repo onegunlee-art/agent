@@ -67,7 +67,7 @@ class RecordingRunner:
 def council(tmp_path: Path):
     company = CompanyOS(tmp_path, db_path=tmp_path / "ledger.sqlite3").initialize()
     idea = company.create_idea(
-        "Build a local product through an executive conversation.",
+        "Build a synthetic local product through an executive conversation.",
         idempotency_key="idea-v09",
     )
     runner = RecordingRunner(company)

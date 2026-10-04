@@ -107,7 +107,7 @@ def valid_definition() -> dict:
 @pytest.fixture
 def factory(tmp_path: Path):
     company = CompanyOS(tmp_path, db_path=tmp_path / "ledger.sqlite3").initialize()
-    idea = company.create_idea("Build a local memo tool.", idempotency_key="idea")
+    idea = company.create_idea("Build a synthetic local memo tool.", idempotency_key="idea")
     room = InteractiveCouncil(company, runner=DeterministicExecutives())
     session = room.open(idea.id, idempotency_key="open")
     for number, message in enumerate(("로컬 메모 도구가 필요해.", "완료 표시도 필요해."), 1):
