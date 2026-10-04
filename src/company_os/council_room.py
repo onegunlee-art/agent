@@ -638,7 +638,15 @@ class InteractiveCouncil:
         if turn is None:
             raise NotFoundError(f"Council turn not found: {session_id}/{turn_number}")
         latest = self._latest_role_run(turn["id"], normalized_role)
-        if latest is None or latest["status"] not in RETRYABLE_STATUSES:
+        expired_execution = (
+            latest is not None
+            and latest["status"] == "EXECUTING"
+            and datetime.now(timezone.utc)
+            > datetime.fromisoformat(latest["lease_expires_at"])
+        )
+        if latest is None or (
+            latest["status"] not in RETRYABLE_STATUSES and not expired_execution
+        ):
             raise ConflictError("Only an unfinished executive role can be retried")
         payload = {
             "session_id": session_id,
