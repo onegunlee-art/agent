@@ -164,6 +164,38 @@ def test_retry_preserves_completed_roles_and_does_not_duplicate_ceo_statement(
         )
 
 
+def test_retry_reclaims_an_interrupted_expired_role_attempt(council, tmp_path):
+    company, idea, room, runner = council
+    runner.fail_once.add((1, "cpo"))
+    session_id = room.open(idea.id, idempotency_key="open-expired")["session_id"]
+    room.turn(
+        session_id,
+        message_file=write_message(tmp_path / "expired.txt", "중단 복구를 시험한다."),
+        idempotency_key="turn-expired",
+    )
+    with company.store.transaction() as connection:
+        row = connection.execute(
+            "SELECT id FROM council_role_runs WHERE role='cpo' ORDER BY attempt DESC LIMIT 1"
+        ).fetchone()
+        connection.execute(
+            "UPDATE council_role_runs SET status='EXECUTING', lease_expires_at=? WHERE id=?",
+            ("2000-01-01T00:00:00+00:00", row["id"]),
+        )
+
+    result = room.retry(
+        session_id,
+        turn_number=1,
+        role="cpo",
+        idempotency_key="retry-expired",
+    )
+
+    assert result["status"] == "COMPLETED"
+    attempts = company.store.query_all(
+        "SELECT status FROM council_role_runs WHERE role='cpo' ORDER BY attempt"
+    )
+    assert [row["status"] for row in attempts] == ["EXPIRED", "COMPLETED"]
+
+
 def test_ceo_external_fact_is_preserved_but_cannot_be_trusted_fact(council, tmp_path):
     company, idea, room, _runner = council
     session_id = room.open(idea.id, idempotency_key="open-3")["session_id"]
